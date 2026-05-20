@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Обновлятор 1c linux
+Comment=Групповое обновление баз 1С на Linux
+Exec=updater1clinux
+Icon=io.github.kerim1c.updater1clinux
+Type=Application
+Categories=Development;Utility;
+StartupNotify=true
+Terminal=false

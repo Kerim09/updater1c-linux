@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.pyo
+*.bak*
+*.log
+*.tmp
+*.tar.gz
+*.zip
+*.7z
+dist/
+build/
+.cache/
+.env
