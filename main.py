@@ -1449,6 +1449,115 @@ def update_program_dir(settings: Settings, program: str) -> Path:
 
 
 
+
+def is_uuid_value(value: str) -> bool:
+    value = (value or "").strip()
+    return bool(re.fullmatch(
+        r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+        value
+    ))
+
+
+def release_version_from_text(value: str) -> str:
+    """Достаёт номер релиза конфигурации из строки/пути.
+
+    UUID из update-api не является номером релиза. Номер релиза должен быть
+    похож на 3.0.192.20 или 3_0_192_20.
+    """
+    text = str(value or "").strip()
+    if not text or is_uuid_value(text):
+        return ""
+
+    text = text.replace("\\", "/")
+    parts = re.split(r"[/\s]+", text)
+
+    # Сначала проверяем последние части пути: 1c/Accounting/3_0_197_22
+    for part in reversed(parts):
+        part = part.strip(" ._-")
+        cand = part.replace("_", ".")
+        if is_valid_config_release(cand):
+            return cand
+
+    # Потом ищем внутри имени файла/строки
+    for m in re.finditer(r"(?<!\d)(\d+[._]\d+[._]\d+(?:[._]\d+)?)(?!\d)", text):
+        cand = m.group(1).replace("_", ".")
+        if is_valid_config_release(cand):
+            return cand
+
+    return ""
+
+
+def update_item_release_version(item, fallback: str = "") -> str:
+    """Возвращает нормальный номер релиза из элемента API/метаданных.
+
+    Никогда не возвращает UUID. UUID можно использовать только как внутренний id API,
+    но не как релиз, не как версию в карточке и не как имя шага автообновления.
+    """
+    keys = [
+        "versionNumber",
+        "releaseVersion",
+        "release_version",
+        "version",
+        "newVersion",
+        "targetVersion",
+        "targetVersionNumber",
+        "templatePath",
+        "updateTemplatePath",
+        "updateFileName",
+        "fileName",
+        "name",
+        "title",
+    ]
+
+    values = []
+
+    if isinstance(item, dict):
+        for k in keys:
+            if k in item:
+                values.append(item.get(k))
+
+        for nested_key in ("programVersion", "versionInfo", "release", "update"):
+            nested = item.get(nested_key)
+            if isinstance(nested, dict):
+                for k in keys:
+                    if k in nested:
+                        values.append(nested.get(k))
+    else:
+        values.append(item)
+
+    values.append(fallback)
+
+    for v in values:
+        if v is None:
+            continue
+        ver = release_version_from_text(str(v))
+        if ver:
+            return ver
+
+    return ""
+
+
+def release_display_to_folder(value: str) -> str:
+    ver = release_version_from_text(value)
+    return version_to_update_folder(ver) if ver else update_release_folder(value, value)
+
+
+def release_version_for_downloaded_folder(folder: Path, fallback: str = "") -> str:
+    """Определяет отображаемый релиз для уже скачанной папки."""
+    ver = read_release_version_from_mft(folder).replace("_", ".")
+    if is_valid_config_release(ver):
+        return ver
+
+    ver = release_version_from_text(folder.name)
+    if ver:
+        return ver
+
+    ver = release_version_from_text(fallback)
+    if ver:
+        return ver
+
+    return ""
+
 def read_release_version_from_mft(folder: Path) -> str:
     mft = folder / '1cv8.mft'
     if not mft.exists():
@@ -1497,12 +1606,13 @@ def load_latest_update_info(program_dir: Path) -> dict:
     return {}
 
 
-def find_downloaded_update_steps(settings: Settings, program: str, current_version: str = '') -> List[Tuple[str, Path, Path]]:
-    """Возвращает последовательность скачанных релизов: (версия/папка, файл .cfu/.cf, папка).
 
-    Сначала используем latest_update_info.json и upgradeSequence, чтобы сохранять порядок API.
-    Если метаданных нет — сканируем папки и сортируем по версии.
-    Поддерживает и новый плоский layout, и старый layout .../1c/Accounting/<release>.
+def find_downloaded_update_steps(settings: Settings, program: str, current_version: str = '') -> List[Tuple[str, Path, Path]]:
+    """Возвращает последовательность скачанных релизов: (релиз, файл .cfu/.cf, папка).
+
+    Важно: upgradeSequence из update-api может содержать UUID. UUID нельзя
+    использовать как номер релиза. Для отображения и фильтрации берём версию
+    из templatePath/updateFileName/1cv8.mft/имени папки.
     """
     root = update_program_dir(settings, program)
     if not root.exists():
@@ -1510,41 +1620,100 @@ def find_downloaded_update_steps(settings: Settings, program: str, current_versi
 
     info = load_latest_update_info(root)
     seq = []
+    data_list = []
+
     if isinstance(info, dict):
         seq = (info.get('info') or {}).get('upgradeSequence') or info.get('upgradeSequence') or []
+        data_list = info.get('files') or info.get('configurationUpdateDataList') or []
 
     result = []
     used = set()
 
-    def add_release(ver):
-        folder_name = update_release_folder(str(ver), str(ver))
-        candidates = [root / folder_name]
-        # Старый layout: Accounting/3.0.185.19_to_.../1c/Accounting/3_0_197_22
-        candidates.extend([p for p in root.rglob(folder_name) if p.is_dir() and '_archives' not in p.parts and '_metadata' not in p.parts])
+    def add_folder(folder: Path, fallback: str = '') -> bool:
+        if not folder.exists() or not folder.is_dir():
+            return False
+
+        key = str(folder.resolve())
+        if key in used:
+            return False
+
+        f = find_update_file_in_dir(folder)
+        if not f:
+            return False
+
+        rel_ver = release_version_for_downloaded_folder(folder, fallback)
+        if not rel_ver:
+            # Не берём UUID как релиз. Такие папки надо перескачать/переименовать.
+            if is_uuid_value(folder.name) or is_uuid_value(str(fallback)):
+                return False
+            rel_ver = folder.name.replace('_', '.')
+
+        if not is_valid_config_release(rel_ver):
+            return False
+
+        used.add(key)
+        result.append((rel_ver, f, folder))
+        return True
+
+    def add_release(ver: str) -> bool:
+        rel_ver = release_version_from_text(ver)
+        if not rel_ver:
+            return False
+
+        folder_name = version_to_update_folder(rel_ver)
+        candidates = [root / folder_name, root / rel_ver]
+
+        # Поддержка старых/разных layout
+        candidates.extend([
+            p for p in root.rglob(folder_name)
+            if p.is_dir() and '_archives' not in p.parts and '_metadata' not in p.parts
+        ])
+        candidates.extend([
+            p for p in root.rglob(rel_ver)
+            if p.is_dir() and '_archives' not in p.parts and '_metadata' not in p.parts
+        ])
+
         for folder in candidates:
-            key = str(folder.resolve()) if folder.exists() else str(folder)
-            if key in used:
-                continue
-            f = find_update_file_in_dir(folder)
-            if f:
-                used.add(key)
-                result.append((folder_name, f, folder))
+            if add_folder(folder, rel_ver):
                 return True
         return False
 
-    for ver in seq:
-        add_release(ver)
+    # 1. Сначала берём версии из файловых данных API, там чаще всего есть templatePath.
+    if isinstance(data_list, list):
+        for n, item in enumerate(data_list):
+            fallback = seq[n] if n < len(seq) else ''
+            rel_ver = update_item_release_version(item, str(fallback))
+            if rel_ver:
+                add_release(rel_ver)
 
+    # 2. Потом пробуем upgradeSequence, но только если там реальные версии, а не UUID.
+    for item in seq:
+        rel_ver = update_item_release_version(item, str(item))
+        if rel_ver:
+            add_release(rel_ver)
+
+    # 3. Если нашли по метаданным — возвращаем в порядке API/метаданных.
     if result:
         return result
 
+    # 4. Fallback: сканируем папки. UUID-папки не показываем как релизы,
+    # но если внутри есть 1cv8.mft с нормальной версией — используем её.
     dirs = []
-    for p in root.iterdir():
-        if p.is_dir() and not p.name.startswith('_'):
-            f = find_update_file_in_dir(p)
-            if f:
-                dirs.append((p.name, f, p))
-    dirs.sort(key=lambda x: version_key(x[0].replace('_', '.')))
+    for folder in root.iterdir():
+        if not folder.is_dir() or folder.name.startswith('_'):
+            continue
+
+        f = find_update_file_in_dir(folder)
+        if not f:
+            continue
+
+        rel_ver = release_version_for_downloaded_folder(folder, '')
+        if not rel_ver:
+            continue
+
+        dirs.append((rel_ver, f, folder))
+
+    dirs.sort(key=lambda x: version_key(x[0]))
     return dirs
 
 
@@ -1634,7 +1803,8 @@ def normalize_extracted_update_tree(worker, program_dir: Path, extracted_root: P
     # Если в корне сразу есть 1cv8.cfu/1cv8.cf — оставляем папку как папку релиза.
     direct = find_update_file_in_dir(extracted_root)
     if direct and direct.parent == extracted_root:
-        rel_name = update_release_folder(fallback_release or extracted_root.name, extracted_root.name)
+        release_version = read_release_version_from_mft(extracted_root).replace('_', '.') or release_version_from_text(fallback_release) or release_version_from_text(extracted_root.name)
+        rel_name = version_to_update_folder(release_version) if release_version else update_release_folder(fallback_release or extracted_root.name, extracted_root.name)
         final_dir = program_dir / rel_name
         if extracted_root.resolve() != final_dir.resolve():
             if final_dir.exists():
@@ -7612,7 +7782,8 @@ class MainWindow(QMainWindow):
 
             template_path = item.get('templatePath') or ''
             fallback_release = seq[n-1] if n-1 < len(seq) else Path(fname).stem
-            release_dir_name = update_release_folder(template_path, version_to_update_folder(str(fallback_release)))
+            release_version = update_item_release_version(item, str(fallback_release) or template_path or fname)
+            release_dir_name = version_to_update_folder(release_version) if release_version else update_release_folder(template_path, version_to_update_folder(str(fallback_release)))
             extract_dir = program_dir / release_dir_name
 
             raw_name = f'{release_dir_name}_{safe_name(fname)}'
@@ -7624,6 +7795,7 @@ class MainWindow(QMainWindow):
             worker.log(f'Скачивание {n}/{len(data_list)}: {url}')
             worker.log(f'Имя файла: {fname}')
             worker.log(f'Папка шаблона из API: {template_path}')
+            worker.log(f'Версия релиза: {release_version or "<не определена>"}')
             worker.log(f'Папка релиза: {extract_dir}')
             api.download_file(url, dest, worker)
 
