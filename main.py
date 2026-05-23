@@ -152,6 +152,7 @@ class AppConfig:
 
         for b in self.bases:
             normalize_base(b)
+            b.config_version = sanitize_config_version(b.config_version)
             b.update_program_name = sanitize_update_program_name(b.update_program_name)
             if not _looks_like_config_name(b.config_name):
                 b.config_name = ""
@@ -1219,6 +1220,28 @@ def sanitize_update_program_name(value: str) -> str:
     return value if is_valid_update_program_name(value) else ""
 
 
+
+def is_valid_config_release(value: str) -> bool:
+    """Релиз конфигурации 1С должен быть похож на 3.0.193.19 или 2.1.8.2.
+
+    UUID, GUID, пустые строки и произвольные идентификаторы нельзя использовать
+    как версию конфигурации, иначе подбор обновлений уходит не туда.
+    """
+    value = (value or "").strip()
+    if not value:
+        return False
+
+    if re.fullmatch(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", value):
+        return False
+
+    return bool(re.fullmatch(r"\d+\.\d+\.\d+(?:\.\d+)?", value))
+
+
+def sanitize_config_version(value: str) -> str:
+    value = (value or "").strip()
+    return value if is_valid_config_release(value) else ""
+
+
 def parse_metadata_probe_output(path: Path) -> Tuple[str, str, str]:
     """Читает результат внешней обработки.
 
@@ -1360,11 +1383,14 @@ def parse_any_metadata_probe_output(out_file: Path, worker=None) -> Tuple[str, s
 def normalize_detected_metadata(name: str, synonym: str, version: str) -> Tuple[str, str, str]:
     name = (name or "").strip()
     synonym = (synonym or "").strip()
-    version = (version or "").strip()
+    version = sanitize_config_version(version)
+
     if not _looks_like_config_name(name):
         name = ""
+
     if synonym.lower() in {"ru", "en", "de", "fr"}:
         synonym = ""
+
     return name, synonym, version
 
 
@@ -4743,7 +4769,10 @@ def app_icon_path() -> str:
         here / 'resources' / 'icons' / 'io.github.kerim1c.updater1clinux.svg',
         here / 'resources' / 'icons' / 'io.github.kerim1c.updater1clinux.png',
         Path.home() / '.local/share/icons/hicolor/scalable/apps/io.github.kerim1c.updater1clinux.svg',
+        Path.home() / '.local/share/icons/hicolor/256x256/apps/io.github.kerim1c.updater1clinux.png',
         Path('/usr/share/icons/hicolor/scalable/apps/io.github.kerim1c.updater1clinux.svg'),
+        Path('/usr/share/icons/hicolor/256x256/apps/io.github.kerim1c.updater1clinux.png'),
+        Path('/usr/share/pixmaps/io.github.kerim1c.updater1clinux.png'),
     ]
     for c in candidates:
         if c.exists():
@@ -4753,7 +4782,7 @@ def app_icon_path() -> str:
 
 class MainWindow(QMainWindow):
     def __init__(self):
-        super().__init__(); self.setWindowTitle('Обновлятор 1c linux'); self.resize(1320, 820);
+        super().__init__(); self.setWindowTitle('Обновлятор 1C Linux'); self.resize(1320, 820);
         self.setStyleSheet("""
             QMainWindow {
                 background: #f7f8fa;
@@ -7999,7 +8028,8 @@ class MainWindow(QMainWindow):
 
 def main():
     app = QApplication(sys.argv)
-    app.setApplicationName('Обновлятор 1c linux')
+    app.setApplicationName('io.github.kerim1c.updater1clinux')
+    app.setApplicationDisplayName('Обновлятор 1C Linux')
     app.setDesktopFileName('io.github.kerim1c.updater1clinux')
     icon_path = app_icon_path()
     if icon_path:

@@ -27,4 +27,4 @@ fi
 export QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-xcb}"
 export QT_NO_USE_PORTAL="${QT_NO_USE_PORTAL:-1}"
 
-exec "$PY" "$APP_DIR/main.py" "$@"
+exec -a io.github.kerim1c.updater1clinux "$PY" "$APP_DIR/main.py" "$@"
