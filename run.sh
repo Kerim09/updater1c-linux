@@ -22,4 +22,9 @@ else
   "$PY" -m pip install PySide6 requests
 fi
 
+# На Ubuntu/GNOME/Wayland PySide6 иногда падает на xdg-desktop-portal:
+# qt.qpa.services: Failed to register with host portal
+export QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-xcb}"
+export QT_NO_USE_PORTAL="${QT_NO_USE_PORTAL:-1}"
+
 exec "$PY" "$APP_DIR/main.py" "$@"
