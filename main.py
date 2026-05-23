@@ -27,7 +27,7 @@ from PySide6.QtGui import QIcon, QAction, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QStyle,
     QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QFormLayout,
-    QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
+    QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QInputDialog, QListWidgetItem, QListWidget,
     QMainWindow, QMenu, QMessageBox, QPushButton, QPlainTextEdit, QTabWidget,
     QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget
 )
@@ -2321,24 +2321,53 @@ class BaseDialog(QDialog):
     def show_platform_menu(self):
         self.refresh_platform_versions()
         menu = QMenu(self)
+
         any8_action = menu.addAction('8.* — любая платформа 8')
         any8_action.triggered.connect(lambda: self.platform_version.setCurrentText('8.*'))
+
         family83_action = menu.addAction('8.3 — любая платформа 8.3')
         family83_action.triggered.connect(lambda: self.platform_version.setCurrentText('8.3'))
+
         family85_action = menu.addAction('8.5 — любая платформа 8.5')
         family85_action.triggered.connect(lambda: self.platform_version.setCurrentText('8.5'))
 
         menu.addSeparator()
+
+        online_menu = menu.addMenu('Доступные на releases.1c.ru')
+        loaded_online = False
+
+        try:
+            parent = self.parent()
+            settings = getattr(getattr(parent, 'app_config', None), 'settings', None)
+            if settings:
+                client = OneCReleasesPlatformClient(settings.its_login, settings.its_password)
+                versions = client.platform_versions()
+                for ver in versions[:80]:
+                    act = online_menu.addAction(ver)
+                    act.triggered.connect(lambda checked=False, v=ver: self.platform_version.setCurrentText(v))
+                loaded_online = bool(versions)
+        except Exception as e:
+            a = online_menu.addAction(f'Ошибка загрузки releases.1c.ru: {e}')
+            a.setEnabled(False)
+
+        if not loaded_online:
+            a = online_menu.addAction('Версии с сайта не загружены')
+            a.setEnabled(False)
+
+        menu.addSeparator()
+        installed_menu = menu.addMenu('Установленные локально')
+
         platforms = find_platforms()
         if not platforms:
-            a = menu.addAction('Установленные платформы не найдены')
+            a = installed_menu.addAction('Установленные платформы не найдены')
             a.setEnabled(False)
         else:
             for ver, exe in platforms.items():
-                act = menu.addAction(f'{ver}  —  {exe}')
+                act = installed_menu.addAction(f'{ver}  —  {exe}')
                 act.triggered.connect(lambda checked=False, v=ver: self.platform_version.setCurrentText(v))
 
         menu.exec(self.platform_select_btn.mapToGlobal(self.platform_select_btn.rect().bottomLeft()))
+
 
     def update_platform_tooltip(self):
         version = self.platform_version.currentText().strip()
@@ -2919,65 +2948,1185 @@ class AutoUpdateDialog(QDialog):
         }
 
 
-class PlatformDownloadChoiceDialog(QDialog):
-    def __init__(self, parent, candidates: List[dict], requested_version: str = ''):
-        super().__init__(parent)
-        self.setWindowTitle('Выбор дистрибутивов платформы 1С')
-        self.resize(860, 520)
-        self.candidates = candidates or []
-        self.checks = []
 
-        self.version = make_line(requested_version)
-        self.version.setPlaceholderText('Например 8.3.27.2130 или рекомендованная версия из API')
 
-        info = QLabel('Отметь дистрибутивы, которые вернул update-api. Если API вернул только один distributionUin, будет доступен только рекомендованный дистрибутив. Ниже можно также отметить желаемые типы — они сохранятся в отчет, а скачивание сработает, когда API вернет соответствующие distributionUin.')
-        info.setWordWrap(True)
 
-        cand_box = QGroupBox('Доступные distributionUin из update-api')
-        cand_layout = QVBoxLayout(cand_box)
-        if not self.candidates:
-            lbl = QLabel('API не вернул список дистрибутивов.')
-            cand_layout.addWidget(lbl)
+
+
+class OneCReleasesPlatformClient:
+    """
+    Клиент releases.1c.ru по логике v8platform/oneget:
+
+    1. Авторизация:
+       POST https://login.1c.ru/rest/public/ticket/get
+       GET  https://login.1c.ru/ticket/auth?token=...
+
+    2. Платформа:
+       project = Platform83
+
+    3. Версии:
+       GET https://releases.1c.ru/project/Platform83
+
+    4. Файлы версии:
+       GET /version_files?nick=Platform83&ver=8.x.x.x
+       внутри ссылки /version_file...
+
+    5. Прямые ссылки:
+       GET /version_file...
+       внутри блока downloadDist ссылки на реальные файлы.
+    """
+
+    BASE_URL = 'https://releases.1c.ru'
+    LOGIN_URL = 'https://login.1c.ru'
+    PROJECT_NICK = 'Platform83'
+
+    def __init__(self, login: str = '', password: str = ''):
+        import requests
+        self.login = (login or '').strip()
+        self.password = password or ''
+        self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 updater1c-linux oneget-compatible',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        })
+        self._authenticated = False
+        self._project_html = ''
+        self._version_links = {}
+
+    def _require_credentials(self):
+        if not self.login or not self.password:
+            raise RuntimeError(
+                'Не заполнены логин/пароль ИТС/users.v8.1c.ru.\n'
+                'Откройте «Настройки программы» → «ИТС», заполните логин и пароль, '
+                'нажмите «Сохранить настройки».'
+            )
+
+    def _abs(self, url: str) -> str:
+        if not url:
+            return url
+        if url.startswith('http://') or url.startswith('https://'):
+            return url
+        if url.startswith('/'):
+            return self.BASE_URL + url
+        return self.BASE_URL + '/' + url
+
+    def _auth_ticket_url(self, service_url: str) -> str:
+        import json
+
+        self._require_credentials()
+
+        payload = {
+            'login': self.login,
+            'password': self.password,
+            'serviceNick': service_url,
+        }
+
+        r = self.session.post(
+            self.LOGIN_URL + '/rest/public/ticket/get',
+            auth=(self.login, self.password),
+            headers={'Content-Type': 'application/json'},
+            data=json.dumps(payload, ensure_ascii=False).encode('utf-8'),
+            timeout=120,
+            allow_redirects=True,
+        )
+
+        if r.status_code != 200:
+            raise RuntimeError(
+                f'Ошибка получения ticket login.1c.ru: HTTP {r.status_code}\n'
+                f'{r.text[:1500]}'
+            )
+
+        try:
+            data = r.json()
+        except Exception:
+            data = json.loads(r.text)
+
+        ticket = data.get('ticket') or data.get('Ticket')
+        if not ticket:
+            raise RuntimeError(f'login.1c.ru не вернул ticket: {data}')
+
+        return self.LOGIN_URL + '/ticket/auth?token=' + ticket
+
+
+    def _login_by_ticket(self, service_url: str):
+        ticket_url = self._auth_ticket_url(service_url)
+
+        rr = self.session.get(
+            ticket_url,
+            auth=(self.login, self.password),
+            timeout=120,
+            allow_redirects=True,
+        )
+
+        if rr.status_code >= 400:
+            raise RuntimeError(
+                f'Не удалось применить ticket: HTTP {rr.status_code}\n'
+                f'{rr.text[:1500]}'
+            )
+
+        self._authenticated = True
+
+        # Важное отличие: после ticket/auth явно активируем releases security_check.
+        # Иначе releases.1c.ru может снова вернуть страницу login с HTTP 200.
+        if service_url.startswith(self.BASE_URL):
+            try:
+                self._activate_releases_service(self.BASE_URL + '/public/security_check')
+            except Exception:
+                pass
+
+        return rr
+
+
+    def _activate_releases_service(self, service_url: str = ''):
+        """
+        После ticket/auth releases.1c.ru может всё равно требовать security_check.
+        Поэтому явно открываем /public/security_check, чтобы получить cookie releases.
+        """
+        service_url = service_url or (self.BASE_URL + '/public/security_check')
+
+        rr = self.session.get(
+            service_url,
+            auth=(self.login, self.password),
+            timeout=120,
+            allow_redirects=True,
+        )
+
+        return rr
+
+    def _response_is_login_page(self, response, body_text: str = '') -> bool:
+        final_url = (getattr(response, 'url', '') or '').lower()
+        low = (body_text or '').lower()
+
+        return (
+            'login.1c.ru/login' in final_url
+            or ('login.1c.ru' in final_url and 'ticket/auth' not in final_url)
+            or 'login.1c.ru/login' in low
+            or 'service=https%3a%2f%2freleases.1c.ru%2fpublic%2fsecurity_check' in low
+            or ('логин' in low and 'пароль' in low and 'releases.1c.ru' not in low)
+        )
+
+    def _ticket_url_for_service(self, service_url: str) -> str:
+        return self._auth_ticket_url(service_url)
+
+    def _try_ticket_login(self, service_url: str, use_basic_on_auth: bool = True) -> str:
+        ticket_url = self._ticket_url_for_service(service_url)
+
+        if use_basic_on_auth:
+            rr = self.session.get(
+                ticket_url,
+                auth=(self.login, self.password),
+                timeout=120,
+                allow_redirects=True,
+            )
         else:
-            for i, c in enumerate(self.candidates):
-                title = c.get('distributionName') or c.get('title') or c.get('name') or 'Дистрибутив платформы'
-                ver = c.get('platformVersion') or c.get('version') or requested_version
-                dtype = c.get('distributionType') or c.get('type') or c.get('os') or ''
-                size = c.get('size') or ''
-                text = f'{ver} — {title}'
-                if dtype: text += f' — {dtype}'
-                if size: text += f' — {size} байт'
-                text += f' — UIN: {c.get("distributionUin")}'
-                chk = QCheckBox(text)
-                chk.setChecked(i == 0 or bool(c.get('recommended')))
-                self.checks.append((chk, c))
-                cand_layout.addWidget(chk)
+            rr = self.session.get(
+                ticket_url,
+                timeout=120,
+                allow_redirects=True,
+            )
 
-        req_box = QGroupBox('Желаемые типы дистрибутивов')
-        req_layout = QVBoxLayout(req_box)
-        self.want_linux_platform = QCheckBox('Технологическая платформа Linux x86_64')
-        self.want_win_thin = QCheckBox('Тонкий клиент Windows')
-        self.want_macos_thin = QCheckBox('Тонкий клиент macOS')
-        self.want_linux_platform.setChecked(True)
-        for b in [self.want_linux_platform, self.want_win_thin, self.want_macos_thin]:
-            req_layout.addWidget(b)
+        if rr.status_code >= 400:
+            return f'{service_url}: ticket/auth HTTP {rr.status_code}'
 
-        ok = QPushButton('Скачать выбранное')
+        return f'{service_url}: auth_final={rr.url}'
+
+    def _probe_releases_access(self) -> tuple:
+        test_url = self.BASE_URL + '/project/Platform83'
+
+        r = self.session.get(
+            test_url,
+            auth=(self.login, self.password),
+            timeout=120,
+            allow_redirects=True,
+        )
+
+        text = r.text or ''
+        ok = (
+            r.status_code == 200
+            and not self._response_is_login_page(r, text)
+            and (
+                'version_files' in text.lower()
+                or 'platform83' in text.lower()
+                or re.search(r'8\\.3\\.\\d+\\.\\d+', text)
+                or re.search(r'8\\.5\\.\\d+\\.\\d+', text)
+            )
+        )
+
+        return ok, r.url, len(text), text[:500]
+
+    def _ensure_auth(self):
+        if self._authenticated:
+            return
+
+        self._require_credentials()
+
+        attempts = []
+
+        service_candidates = [
+            self.BASE_URL,
+            self.BASE_URL + '/',
+            self.BASE_URL + '/public/security_check',
+            'releases.1c.ru',
+            'releases.1c.ru/public/security_check',
+        ]
+
+        for service in service_candidates:
+            for use_basic in [True, False]:
+                try:
+                    msg = self._try_ticket_login(service, use_basic_on_auth=use_basic)
+                    attempts.append(f'{msg}; basic_on_auth={use_basic}')
+
+                    ok, final_url, length, head = self._probe_releases_access()
+                    attempts.append(f'probe: ok={ok}; final_url={final_url}; len={length}')
+
+                    if ok:
+                        self._authenticated = True
+                        return
+
+                except Exception as e:
+                    attempts.append(f'{service}; basic_on_auth={use_basic}; error={e}')
+
+        try:
+            APP_DIR.mkdir(parents=True, exist_ok=True)
+            (APP_DIR / 'platform_auth_debug.json').write_text(
+                json.dumps({'attempts': attempts}, ensure_ascii=False, indent=2),
+                encoding='utf-8'
+            )
+        except Exception:
+            pass
+
+        raise RuntimeError(
+            'Не удалось авторизоваться на releases.1c.ru через ticket login.\\n'
+            'Все варианты ticket вернули страницу login или не дали доступ к проекту Platform83.\\n\\n'
+            'Диагностика сохранена: ' + str(APP_DIR / 'platform_auth_debug.json')
+        )
+
+
+    def _get(self, url: str, stream: bool = False):
+        self._ensure_auth()
+
+        url_abs = self._abs(url)
+
+        def do_request():
+            return self.session.get(
+                url_abs,
+                auth=(self.login, self.password),
+                timeout=180,
+                allow_redirects=True,
+                stream=stream,
+            )
+
+        r = do_request()
+
+        need_reauth = False
+
+        if r.status_code == 401:
+            need_reauth = True
+
+        if not stream and self._response_is_login_page(r, r.text or ''):
+            need_reauth = True
+
+        if stream and self._response_is_login_page(r, ''):
+            need_reauth = True
+
+        if need_reauth:
+            self._authenticated = False
+
+            # 1. Ticket для security_check.
+            self._login_by_ticket(self.BASE_URL + '/public/security_check')
+
+            # 2. Ticket для конкретного URL.
+            try:
+                self._login_by_ticket(url_abs)
+            except Exception:
+                pass
+
+            # 3. Еще раз активируем security_check и повторяем запрос.
+            self._activate_releases_service(self.BASE_URL + '/public/security_check')
+            r = do_request()
+
+        if not stream and self._response_is_login_page(r, r.text or ''):
+            raise RuntimeError(
+                'Авторизация ticket выполнена, но releases.1c.ru снова вернул страницу login.\n'
+                f'Запрошенный URL: {url_abs}\n'
+                f'Финальный URL: {r.url}\n\n'
+                'Проверьте, что логин/пароль ИТС именно от users.v8.1c.ru/portal.1c.ru, '
+                'а у учетной записи есть доступ к разделу releases.1c.ru.'
+            )
+
+        if r.status_code >= 400:
+            body = '' if stream else r.text[:1500]
+            raise RuntimeError(f'HTTP {r.status_code}: {url_abs}\n{body}')
+
+        if not stream:
+            r.encoding = r.encoding or r.apparent_encoding or 'utf-8'
+
+        return r
+
+
+    def _links(self, html_text: str):
+        import html as _html
+        from urllib.parse import urljoin
+
+        result = []
+
+        for m in re.finditer(r'<a\b[^>]*href=["\']([^"\']+)["\'][^>]*>(.*?)</a>', html_text or '', re.I | re.S):
+            href = _html.unescape(m.group(1))
+            body = m.group(2)
+            title = re.sub(r'<[^>]+>', ' ', body)
+            title = _html.unescape(re.sub(r'\s+', ' ', title)).strip()
+            result.append((urljoin(self.BASE_URL, href), title))
+
+        return result
+
+    def _project_page(self) -> str:
+        if self._project_html:
+            return self._project_html
+
+        r = self._get('/project/' + self.PROJECT_NICK)
+        self._project_html = r.text or ''
+        return self._project_html
+
+    def platform_versions(self) -> list:
+        """
+        Получить список версий платформы 1С по логике oneget.
+
+        oneget работает с проектом platform83 / Platform83 на releases.1c.ru.
+        На странице проекта ссылки/HTML могут отличаться, поэтому:
+        1) читаем /project/Platform83;
+        2) вытаскиваем версии из href/title;
+        3) если не нашли — читаем /total;
+        4) сохраняем ссылки версии, если в URL есть nick/platform83 и ver.
+        """
+        from urllib.parse import urlparse, parse_qs
+
+        pages = []
+
+        errors = []
+
+        for url in [
+            '/project/Platform83',
+            '/project/platform83',
+            '/total',
+        ]:
+            try:
+                html_text = self._get(url).text or ''
+                pages.append((url, html_text))
+            except Exception as e:
+                errors.append(f'{url}: {e}')
+
+        versions = {}
+        self._version_links = {}
+
+        for page_url, html_text in pages:
+            # 1. Сначала ссылки.
+            for href, title in self._links(html_text):
+                combined = href + ' ' + title
+                low = combined.lower()
+
+                is_platform = (
+                    'platform83' in low
+                    or 'технологическая платформа' in low
+                    or 'платформа 1с' in low
+                )
+
+                parsed = urlparse(href)
+                qs = parse_qs(parsed.query)
+
+                nick = ((qs.get('nick') or [''])[0] or '').lower()
+                ver_from_qs = (qs.get('ver') or [''])[0]
+
+                if nick in ('platform83', 'platform') or is_platform:
+                    candidates = []
+
+                    if re.match(r'^(?:8\.3|8\.5)\.\d+\.\d+$', ver_from_qs or ''):
+                        candidates.append(ver_from_qs)
+
+                    candidates += re.findall(r'\b(?:8\.3|8\.5)\.\d+\.\d+\b', combined)
+
+                    for v in candidates:
+                        versions[v] = True
+                        if '/version_files' in href or '/project/' in href or 'nick=' in href:
+                            self._version_links.setdefault(v, href)
+
+            # 2. Fallback: все версии прямо из текста страницы.
+            for v in re.findall(r'\b(?:8\.3|8\.5)\.\d+\.\d+\b', html_text):
+                versions[v] = True
+
+        result = sorted(versions.keys(), key=version_key, reverse=True)
+
+        try:
+            APP_DIR.mkdir(parents=True, exist_ok=True)
+            (APP_DIR / 'platform_versions_cache.json').write_text(
+                json.dumps({
+                    'versions': result,
+                    'links': self._version_links,
+                    'errors': errors,
+                }, ensure_ascii=False, indent=2),
+                encoding='utf-8'
+            )
+        except Exception:
+            pass
+
+        return result
+
+    def _version_files_url(self, version: str) -> str:
+        from urllib.parse import quote
+
+        version = (version or '').strip()
+
+        if not self._version_links:
+            try:
+                self.platform_versions()
+            except Exception:
+                pass
+
+        if version in self._version_links:
+            return self._version_links[version]
+
+        return f'/version_files?nick={self.PROJECT_NICK}&ver={quote(version)}'
+
+    def candidate_os(self, text: str) -> str:
+        low = (text or '').lower()
+
+        if 'windows' in low or 'ос windows' in low:
+            return 'Windows'
+        if 'macos' in low or 'mac os' in low or 'os x' in low or 'ос macos' in low:
+            return 'macOS'
+        if 'deb' in low:
+            return 'Linux (DEB-based)'
+        if 'rpm' in low:
+            return 'Linux (RPM-based)'
+        if 'linux' in low or 'ос linux' in low or 'tar.bz2' in low or 'tar.gz' in low:
+            return 'Linux'
+
+        return ''
+
+    def candidate_component(self, text: str) -> str:
+        low = (text or '').lower()
+
+        if 'сервер' in low or 'server' in low:
+            return 'Сервер'
+        if 'тонкий клиент' in low or 'thin-client' in low or 'thin client' in low:
+            return 'Тонкий клиент'
+        if 'клиент' in low or 'client' in low:
+            return 'Клиент'
+        if 'технологическая платформа' in low:
+            return 'Все компоненты платформы'
+
+        return 'Все компоненты платформы'
+
+    def candidate_arch(self, text: str) -> str:
+        low = (text or '').lower()
+
+        if 'эльбрус' in low or 'elbrus' in low:
+            return 'Эльбрус'
+        if 'arm' in low or 'aarch64' in low:
+            return 'ARM'
+        if '64-bit' in low or '64 бит' in low or 'x86_64' in low or 'amd64' in low or 'x64' in low:
+            return '64 бит'
+
+        return ''
+
+    def normalize_candidate(self, title: str, version_file_url: str, version: str) -> dict:
+        full_text = f'{title} {version_file_url}'
+
+        return {
+            'title': title or version_file_url,
+            'version': version,
+            'platformVersion': version,
+            'versionFileUrl': self._abs(version_file_url),
+            'os': self.candidate_os(full_text),
+            'component': self.candidate_component(full_text),
+            'architecture': self.candidate_arch(full_text),
+            'webServerClients': bool(re.search(r'веб[- ]?сервер|web[- ]?server', full_text, re.I)),
+            'source': 'releases.1c.ru',
+        }
+
+    def platform_files(self, version: str) -> list:
+        version = (version or '').strip()
+        if not version:
+            return []
+
+        url = self._version_files_url(version)
+        html_text = self._get(url).text or ''
+
+        candidates = []
+
+        # oneget: ProjectReleaseSelector = ".files-container .formLine a",
+        # а фильтр берет только href, начинающиеся с /version_file.
+        for href, title in self._links(html_text):
+            href_abs = self._abs(href)
+            path = href_abs.lower()
+
+            if '/version_file' not in path:
+                continue
+
+            text = f'{title} {href_abs}'.lower()
+
+            # Отсекаем мусорные ссылки: нужны дистрибутивы платформы/клиентов/сервера
+            if not any(x in text for x in [
+                'технологическая платформа',
+                'сервер',
+                'тонкий клиент',
+                'клиент',
+                'linux',
+                'windows',
+                'macos',
+                'deb',
+                'rpm',
+                'tar',
+                'zip',
+            ]):
+                continue
+
+            candidates.append(self.normalize_candidate(title, href_abs, version))
+
+        result = []
+        seen = set()
+
+        for c in candidates:
+            key = c.get('versionFileUrl') or c.get('title')
+            if key in seen:
+                continue
+
+            seen.add(key)
+            result.append(c)
+
+        result.sort(key=lambda c: (
+            c.get('os', ''),
+            c.get('component', ''),
+            c.get('architecture', ''),
+            c.get('title', ''),
+        ))
+
+        return result
+
+    def resolve_download_links(self, version_file_url: str) -> list:
+        html_text = self._get(version_file_url).text or ''
+
+        links = []
+
+        # oneget: ReleaseFilesSelector = ".downloadDist a".
+        # Без goquery берем все ссылки, но предпочитаем те, что рядом с downloadDist.
+        for href, title in self._links(html_text):
+            href_abs = self._abs(href)
+            low = href_abs.lower() + ' ' + (title or '').lower()
+
+            if any(x in low for x in [
+                'path=',
+                '.tar.gz',
+                '.tar.bz2',
+                '.tgz',
+                '.zip',
+                '.exe',
+                '.deb',
+                '.rpm',
+                '.dmg',
+                '.pkg',
+                'download',
+                'get_file',
+            ]):
+                links.append(href_abs)
+
+        # fallback: вытащить href из HTML-фрагментов downloadDist
+        if not links:
+            for block in re.findall(r'<[^>]*class=["\'][^"\']*downloadDist[^"\']*["\'][^>]*>.*?</[^>]+>', html_text, re.I | re.S):
+                for href, title in self._links(block):
+                    links.append(self._abs(href))
+
+        dedup = []
+        seen = set()
+
+        for u in links:
+            if u in seen:
+                continue
+
+            seen.add(u)
+            dedup.append(u)
+
+        return dedup
+
+    def filename_from_url_or_response(self, response, fallback_url: str, fallback_title: str = '') -> str:
+        from urllib.parse import unquote, urlparse, parse_qs
+
+        cd = response.headers.get('content-disposition') or response.headers.get('Content-Disposition') or ''
+        m = re.search(r'filename\*?=(?:UTF-8\'\')?["\']?([^"\';]+)', cd, re.I)
+        if m:
+            return unquote(m.group(1)).strip()
+
+        parsed = urlparse(fallback_url)
+        qs = parse_qs(parsed.query)
+
+        if qs.get('path'):
+            parts = re.split(r'[\\/]+', unquote(qs.get('path')[0]))
+            if parts and parts[-1]:
+                return parts[-1]
+
+        name = Path(unquote(parsed.path)).name
+        if name and '.' in name:
+            return name
+
+        return safe_name(fallback_title or 'platform_download.bin') + '.bin'
+
+    def download_url(self, url: str, dest_dir: Path, worker=None, fallback_title: str = '') -> Path:
+        dest_dir.mkdir(parents=True, exist_ok=True)
+
+        r = self._get(url, stream=True)
+
+        filename = self.filename_from_url_or_response(r, url, fallback_title)
+        dest = dest_dir / filename
+
+        total = int(r.headers.get('content-length') or 0)
+        done = 0
+        last_mb = -1
+
+        with dest.open('wb') as f:
+            for chunk in r.iter_content(chunk_size=1024 * 1024):
+                if not chunk:
+                    continue
+
+                f.write(chunk)
+                done += len(chunk)
+
+                if worker and total:
+                    mb = done // (1024 * 1024)
+                    if mb != last_mb:
+                        last_mb = mb
+                        worker.log(f'Скачано {mb} / {total // (1024 * 1024)} МБ')
+
+        if worker:
+            worker.log(f'Файл скачан: {dest}')
+
+        return dest
+
+
+class PlatformDownloadChoiceDialog(QDialog):
+    def __init__(self, parent=None, candidates: List[dict] = None, requested_version: str = ''):
+        super().__init__(parent)
+        self.setWindowTitle('Скачать платформу 1с')
+        self.resize(930, 650)
+
+        self.parent_window = parent
+        self.api_candidates = candidates or []
+        self.file_candidates = []
+        self.available_versions = []
+
+        try:
+            st = parent.app_config.settings
+            login = st.its_login
+            password = st.its_password
+            base_dir = st.platform_download_dir
+        except Exception:
+            login = ''
+            password = ''
+            base_dir = str(Path.home() / '1c-platforms')
+
+        self.releases_client = OneCReleasesPlatformClient(login, password)
+
+        self.version_label = QPushButton((requested_version or '').strip() or 'загрузить с releases.1c.ru')
+        self.version_label.setFlat(True)
+        self.version_label.setStyleSheet('color: #0645ad; text-decoration: underline; text-align: left;')
+        self.version_label.clicked.connect(self.choose_platform_version)
+
+        self.reload_btn = QPushButton('Обновить список версий')
+        self.reload_btn.clicked.connect(self.reload_versions)
+        self.reload_btn.hide()
+
+        self.component = QComboBox()
+        self.component.addItems([
+            'Все компоненты платформы',
+            'Сервер',
+            'Тонкий клиент',
+            'Клиент',
+        ])
+
+        self.os = QComboBox()
+        self.os.addItems([
+            'Windows',
+            'Linux',
+            'Linux (DEB-based)',
+            'Linux (RPM-based)',
+            'macOS',
+        ])
+
+        self.bit64 = QCheckBox('64 бит')
+        self.arm = QCheckBox('ARM')
+        self.elbrus = QCheckBox('Эльбрус')
+        self.web_clients = QCheckBox('Клиенты для веб-сервера')
+
+        self.default_filter = QPushButton('Фильтр по умолчанию')
+        self.default_filter.setFlat(True)
+        self.default_filter.setStyleSheet('color: #0645ad; text-decoration: underline; text-align: left;')
+        self.default_filter.clicked.connect(self.apply_default_filter)
+        self.default_filter.hide()
+
+        self.available = QListWidget()
+        self.available.setSelectionMode(QListWidget.ExtendedSelection)
+        self.available.itemDoubleClicked.connect(lambda *_: self.add_selected_to_queue())
+
+        self.queue = QListWidget()
+        self.queue.setSelectionMode(QListWidget.ExtendedSelection)
+
+        self.unpack = QCheckBox('Распаковать архив после скачивания')
+        self.delete_after_unpack = QCheckBox('Удалить архив после распаковки')
+        self.delete_after_unpack.setEnabled(False)
+        self.unpack.toggled.connect(self.delete_after_unpack.setEnabled)
+
+        self.download_dir = make_line(base_dir or str(Path.home() / '1c-platforms'))
+        self.browse_btn = QPushButton('...')
+        self.open_btn = QPushButton('Открыть')
+        self.download_btn = QPushButton('Скачать')
+        self.cancel_btn = QPushButton('Отмена')
+
+        self.browse_btn.clicked.connect(self.choose_dir)
+        self.open_btn.clicked.connect(self.open_dir)
+        self.download_btn.clicked.connect(self.accept)
+        self.cancel_btn.clicked.connect(self.reject)
+
+        for w in [self.component, self.os]:
+            w.currentIndexChanged.connect(self.rebuild_available)
+        for w in [self.bit64, self.arm, self.elbrus, self.web_clients]:
+            w.toggled.connect(self.rebuild_available)
+
+        self.available.keyPressEvent = self.available_key_press
+        self.queue.keyPressEvent = self.queue_key_press
+
+        self.status = QLabel('')
+        self.status.setWordWrap(True)
+
+        self.build_download_layout()
+
+        self.status.setText('Нажмите ссылку «загрузить с releases.1c.ru», чтобы получить список версий платформы.')
+        self.available.clear()
+        self.queue.clear()
+        self.component.setEnabled(False)
+        self.os.setEnabled(False)
+        self.bit64.setEnabled(False)
+        self.arm.setEnabled(False)
+        self.elbrus.setEnabled(False)
+        self.web_clients.setEnabled(False)
+
+    def build_download_layout(self):
+        form = QGridLayout()
+        form.addWidget(QLabel('Версия 1С:'), 0, 0)
+        form.addWidget(self.version_label, 0, 1, 1, 3)
+
+        form.addWidget(QLabel('Платформа:'), 1, 0)
+        form.addWidget(self.component, 1, 1)
+        form.addWidget(self.bit64, 1, 2)
+        form.addWidget(self.arm, 1, 3)
+        form.addWidget(self.elbrus, 1, 4)
+
+        form.addWidget(QLabel('ОС:'), 2, 0)
+        form.addWidget(self.os, 2, 1)
+        form.addWidget(self.web_clients, 2, 2, 1, 3)
+
+        dir_row = QHBoxLayout()
+        dir_row.addWidget(self.download_dir)
+        dir_row.addWidget(self.browse_btn)
+        dir_row.addWidget(self.open_btn)
+
+        dir_box = QGroupBox('Скачивать сюда')
+        dir_box.setLayout(dir_row)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch()
+        buttons.addWidget(self.cancel_btn)
+        buttons.addWidget(self.download_btn)
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(form)
+        layout.addWidget(self.status)
+
+        title1 = QLabel('Элементы для выбора (выбор двойным щелчком или нажатием Enter):')
+        title1.setStyleSheet('font-weight: bold; color: #5c4300;')
+        layout.addWidget(title1)
+        layout.addWidget(self.available, 1)
+
+        title2 = QLabel('Элементы для скачивания (используйте Delete для удаления):')
+        title2.setStyleSheet('font-weight: bold; color: #5c4300;')
+        layout.addWidget(title2)
+        layout.addWidget(self.queue, 1)
+
+        layout.addWidget(self.unpack)
+        layout.addWidget(self.delete_after_unpack)
+        layout.addWidget(dir_box)
+        layout.addLayout(buttons)
+
+    def apply_default_filter(self):
+        self.component.setCurrentText('Все компоненты платформы')
+        self.os.setCurrentText('Linux (DEB-based)')
+        self.bit64.setChecked(True)
+        self.arm.setChecked(False)
+        self.elbrus.setChecked(False)
+        self.web_clients.setChecked(False)
+        self.rebuild_available()
+
+    def reload_versions(self):
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            self.status.setText('Авторизация и получение списка версий с releases.1c.ru...')
+            QApplication.processEvents()
+
+            versions = self.releases_client.platform_versions()
+            self.available_versions = versions or []
+
+            if not self.available_versions:
+                self.status.setText('Сервис releases.1c.ru не вернул версии платформы.')
+                return
+
+            self.status.setText(f'Версий платформы получено: {len(self.available_versions)}')
+
+        except Exception as e:
+            self.available_versions = []
+            self.status.setText(f'Ошибка получения версий: {e}')
+            QMessageBox.warning(self, 'Ошибка releases.1c.ru', str(e))
+
+        finally:
+            QApplication.restoreOverrideCursor()
+
+    def choose_platform_version(self):
+        if not self.available_versions:
+            self.reload_versions()
+
+        if not self.available_versions:
+            return
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle('Выберите версию платформы 1с, которую нужно скачать')
+        dlg.resize(560, 430)
+
+        label = QLabel('Вот какие версии платформы 1с доступны сейчас на сайте:')
+        label.setStyleSheet('font-weight: bold; color: #5c4300;')
+
+        lst = QListWidget()
+        for v in self.available_versions:
+            text = str(v)
+            item = QListWidgetItem(text)
+            item.setData(Qt.UserRole, text.split()[0])
+            lst.addItem(item)
+
+        current = self.version_label.text().strip()
+        matches = lst.findItems(current, Qt.MatchExactly)
+        if matches:
+            lst.setCurrentItem(matches[0])
+        elif lst.count():
+            lst.setCurrentRow(0)
+
+        search = make_line()
+        search.setPlaceholderText('Ctrl + F (фильтр)')
+
+        ok = QPushButton('OK')
         cancel = QPushButton('Отмена')
-        ok.clicked.connect(self.accept); cancel.clicked.connect(self.reject)
-        buttons = QHBoxLayout(); buttons.addStretch(); buttons.addWidget(ok); buttons.addWidget(cancel)
 
-        form = QFormLayout(); form.addRow('Релиз платформы:', self.version)
-        layout = QVBoxLayout(self); layout.addWidget(info); layout.addLayout(form); layout.addWidget(cand_box); layout.addWidget(req_box); layout.addStretch(); layout.addLayout(buttons)
+        def do_filter(text):
+            text = text.strip().lower()
+            for i in range(lst.count()):
+                item = lst.item(i)
+                item.setHidden(text not in item.text().lower())
 
-    def get_values(self):
-        selected = [c for chk, c in self.checks if chk.isChecked()]
-        requested = []
-        if self.want_linux_platform.isChecked(): requested.append('Технологическая платформа Linux x86_64')
-        if self.want_win_thin.isChecked(): requested.append('Тонкий клиент Windows')
-        if self.want_macos_thin.isChecked(): requested.append('Тонкий клиент macOS')
-        return {'version': self.version.text().strip(), 'candidates': selected, 'requested_types': requested}
+        def accept_version():
+            item = lst.currentItem()
+            if not item:
+                return
 
+            version = item.data(Qt.UserRole) or item.text().split()[0]
+            self.version_label.setText(version)
+            dlg.accept()
+            self.load_files_for_current_version()
+
+        search.textChanged.connect(do_filter)
+        ok.clicked.connect(accept_version)
+        cancel.clicked.connect(dlg.reject)
+        lst.itemDoubleClicked.connect(lambda *_: accept_version())
+
+        buttons = QHBoxLayout()
+        buttons.addStretch()
+        buttons.addWidget(ok)
+        buttons.addWidget(cancel)
+
+        layout = QVBoxLayout(dlg)
+        layout.addWidget(label)
+        layout.addWidget(lst, 1)
+        layout.addWidget(search)
+        layout.addLayout(buttons)
+
+        dlg.exec()
+
+    def sync_platform_filter_controls(self):
+        old_component = self.component.currentText()
+        old_os = self.os.currentText()
+
+        components = []
+        os_values = []
+        arch_values = set()
+        has_web = False
+
+        for c in self.file_candidates:
+            title = self.candidate_title(c).lower()
+            comp = c.get('component') or ''
+            os_name = c.get('os') or ''
+            arch = c.get('architecture') or ''
+
+            if not comp:
+                if 'сервер' in title or 'server' in title:
+                    comp = 'Сервер'
+                elif 'тонкий клиент' in title or 'thin client' in title or 'thin-client' in title:
+                    comp = 'Тонкий клиент'
+                elif 'клиент' in title or 'client' in title:
+                    comp = 'Клиент'
+                else:
+                    comp = 'Все компоненты платформы'
+
+            if not os_name:
+                if 'windows' in title:
+                    os_name = 'Windows'
+                elif 'macos' in title or 'mac os' in title:
+                    os_name = 'macOS'
+                elif 'deb' in title:
+                    os_name = 'Linux (DEB-based)'
+                elif 'rpm' in title:
+                    os_name = 'Linux (RPM-based)'
+                elif 'linux' in title:
+                    os_name = 'Linux'
+
+            if not arch:
+                if 'эльбрус' in title or 'elbrus' in title:
+                    arch = 'Эльбрус'
+                elif 'arm' in title or 'aarch64' in title:
+                    arch = 'ARM'
+                elif '64' in title or 'x86_64' in title or 'amd64' in title:
+                    arch = '64 бит'
+
+            if comp and comp not in components:
+                components.append(comp)
+            if os_name and os_name not in os_values:
+                os_values.append(os_name)
+            if arch:
+                arch_values.add(arch)
+
+            if 'веб-сервер' in title or 'web-server' in title or 'web server' in title:
+                has_web = True
+
+            c['component'] = comp
+            c['os'] = os_name
+            c['architecture'] = arch
+            c['webServerClients'] = has_web if c.get('webServerClients') is None else c.get('webServerClients')
+
+        component_order = ['Все компоненты платформы', 'Сервер', 'Тонкий клиент', 'Клиент']
+        os_order = ['Windows', 'Linux', 'Linux (DEB-based)', 'Linux (RPM-based)', 'macOS']
+
+        ordered_components = [x for x in component_order if x in components or x == 'Все компоненты платформы']
+        for x in components:
+            if x not in ordered_components:
+                ordered_components.append(x)
+
+        ordered_os = [x for x in os_order if x in os_values]
+        for x in os_values:
+            if x not in ordered_os:
+                ordered_os.append(x)
+
+        self.component.blockSignals(True)
+        self.os.blockSignals(True)
+
+        self.component.clear()
+        self.component.addItems(ordered_components or ['Все компоненты платформы'])
+
+        self.os.clear()
+        self.os.addItems(ordered_os or os_order)
+
+        if old_component in ordered_components:
+            self.component.setCurrentText(old_component)
+        else:
+            self.component.setCurrentText(self.component.itemText(0))
+
+        if old_os in ordered_os:
+            self.os.setCurrentText(old_os)
+        elif self.os.count():
+            self.os.setCurrentText(self.os.itemText(0))
+
+        self.component.blockSignals(False)
+        self.os.blockSignals(False)
+
+        self.component.setEnabled(bool(self.file_candidates))
+        self.os.setEnabled(bool(self.file_candidates))
+
+        self.bit64.setEnabled('64 бит' in arch_values)
+        self.arm.setEnabled('ARM' in arch_values)
+        self.elbrus.setEnabled('Эльбрус' in arch_values)
+        self.web_clients.setEnabled(has_web)
+
+        if not self.bit64.isEnabled():
+            self.bit64.setChecked(False)
+        if not self.arm.isEnabled():
+            self.arm.setChecked(False)
+        if not self.elbrus.isEnabled():
+            self.elbrus.setChecked(False)
+        if not self.web_clients.isEnabled():
+            self.web_clients.setChecked(False)
+
+
+    def load_files_for_current_version(self):
+        version = self.version_label.text().strip()
+        if not version:
+            return
+
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            self.status.setText(f'Получаю список дистрибутивов платформы {version}...')
+            QApplication.processEvents()
+
+            files = self.releases_client.platform_files(version)
+            self.file_candidates = files or []
+
+            self.sync_platform_filter_controls()
+            self.rebuild_available()
+
+            self.status.setText(
+                f'Версия {version}: получено элементов {len(self.file_candidates)}, '
+                f'показано по текущему фильтру {self.available.count()}.'
+            )
+
+        except Exception as e:
+            self.file_candidates = []
+            self.available.clear()
+            self.queue.clear()
+            self.component.setEnabled(False)
+            self.os.setEnabled(False)
+            self.bit64.setEnabled(False)
+            self.arm.setEnabled(False)
+            self.elbrus.setEnabled(False)
+            self.web_clients.setEnabled(False)
+            self.status.setText(f'Не удалось получить список файлов для версии {version}: {e}')
+            QMessageBox.warning(self, 'Ошибка получения файлов платформы', str(e))
+        finally:
+            QApplication.restoreOverrideCursor()
+
+    def candidate_title(self, c: dict) -> str:
+        for k in ['title', 'name', 'distributionName', 'description', 'fileName']:
+            if c.get(k):
+                return str(c.get(k))
+        return json.dumps(c, ensure_ascii=False)[:220]
+
+    def passes_filter(self, c: dict) -> bool:
+        selected_comp = self.component.currentText()
+        selected_os = self.os.currentText()
+
+        comp = c.get('component') or 'Все компоненты платформы'
+        os_name = c.get('os') or ''
+        arch = c.get('architecture') or ''
+
+        if selected_comp != 'Все компоненты платформы' and comp != selected_comp:
+            return False
+
+        if selected_os == 'Linux':
+            if not os_name.startswith('Linux'):
+                return False
+        elif os_name != selected_os:
+            return False
+
+        allowed_arch = set()
+        if self.bit64.isChecked():
+            allowed_arch.add('64 бит')
+        if self.arm.isChecked():
+            allowed_arch.add('ARM')
+        if self.elbrus.isChecked():
+            allowed_arch.add('Эльбрус')
+
+        if allowed_arch and arch and arch not in allowed_arch:
+            return False
+
+        if not self.web_clients.isChecked() and c.get('webServerClients'):
+            return False
+
+        return True
+
+    def rebuild_available(self):
+        self.available.clear()
+
+        for c in self.file_candidates:
+            if not self.passes_filter(c):
+                continue
+
+            item = QListWidgetItem(self.candidate_title(c))
+            item.setData(Qt.UserRole, c)
+            item.setToolTip(json.dumps(c, ensure_ascii=False, indent=2))
+            self.available.addItem(item)
+
+    def add_selected_to_queue(self):
+        for item in self.available.selectedItems():
+            c = item.data(Qt.UserRole)
+            title = self.candidate_title(c)
+            url = c.get('downloadUrl') or title
+
+            exists = False
+            for i in range(self.queue.count()):
+                qc = self.queue.item(i).data(Qt.UserRole)
+                qurl = qc.get('downloadUrl') or self.queue.item(i).text()
+                if qurl == url:
+                    exists = True
+                    break
+
+            if exists:
+                continue
+
+            q = QListWidgetItem(title)
+            q.setData(Qt.UserRole, c)
+            q.setToolTip(json.dumps(c, ensure_ascii=False, indent=2))
+            self.queue.addItem(q)
+
+    def remove_selected_from_queue(self):
+        for item in self.queue.selectedItems():
+            self.queue.takeItem(self.queue.row(item))
+
+    def available_key_press(self, event):
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+            self.add_selected_to_queue()
+            return
+        QListWidget.keyPressEvent(self.available, event)
+
+    def queue_key_press(self, event):
+        if event.key() == Qt.Key_Delete:
+            self.remove_selected_from_queue()
+            return
+        QListWidget.keyPressEvent(self.queue, event)
+
+    def choose_dir(self):
+        path = QFileDialog.getExistingDirectory(
+            self,
+            'Выберите каталог скачивания',
+            self.download_dir.text().strip() or str(Path.home())
+        )
+        if path:
+            self.download_dir.setText(path)
+
+    def open_dir(self):
+        path = Path(self.download_dir.text().strip()).expanduser()
+        path.mkdir(parents=True, exist_ok=True)
+        subprocess.Popen(['xdg-open', str(path)])
+
+    def values(self):
+        selected = []
+        for i in range(self.queue.count()):
+            c = self.queue.item(i).data(Qt.UserRole)
+            if c:
+                selected.append(c)
+
+        if not selected:
+            for item in self.available.selectedItems():
+                c = item.data(Qt.UserRole)
+                if c:
+                    selected.append(c)
+
+        return {
+            'version': self.version_label.text().strip(),
+            'candidates': selected,
+            'requested_types': [],
+            'download_dir': self.download_dir.text().strip(),
+            'unpack': self.unpack.isChecked(),
+            'delete_after_unpack': self.delete_after_unpack.isChecked(),
+        }
 
 
 class ClearCacheDialog(QDialog):
@@ -3752,6 +4901,7 @@ class MainWindow(QMainWindow):
         self.btn_backup_native = QPushButton('Архив файлов/pg_dump')
         self.btn_backup_dt = QPushButton('Архив .dt')
         self.btn_download_updates = QPushButton('Скачать обновления')
+        self.btn_download_platform = QPushButton('Скачать платформу')
         self.btn_update = QPushButton('Установить обновления')
         self.btn_clear_cache = QPushButton('Очистить кэш')
         self.btn_cancel_operation = QPushButton('Отменить действие')
@@ -3771,16 +4921,17 @@ class MainWindow(QMainWindow):
         self.btn_edit.setIcon(st.standardIcon(QStyle.SP_FileDialogDetailedView))
         self.btn_check.setIcon(st.standardIcon(QStyle.SP_BrowserReload))
         self.btn_download_updates.setIcon(st.standardIcon(QStyle.SP_ArrowDown))
+        self.btn_download_platform.setIcon(st.standardIcon(QStyle.SP_DriveHDIcon))
         self.btn_update.setIcon(st.standardIcon(QStyle.SP_FileDialogContentsView))
 
-        for b in [self.btn_add, self.btn_sync_1c, self.btn_edit, self.btn_check, self.btn_download_updates, self.btn_update]:
+        for b in [self.btn_add, self.btn_sync_1c, self.btn_edit, self.btn_check, self.btn_download_updates, self.btn_download_platform, self.btn_update]:
             b.setIconSize(QSize(24, 24))
             b.setMinimumHeight(52)
             b.setMinimumWidth(145)
 
         self.operation_buttons = [
             self.btn_run, self.btn_designer, self.btn_check, self.btn_backup_native,
-            self.btn_backup_dt, self.btn_download_updates, self.btn_update,
+            self.btn_backup_dt, self.btn_download_updates, self.btn_download_platform, self.btn_update,
             self.btn_clear_cache,
             self.btn_add, self.btn_edit, self.btn_delete, self.btn_import,
             self.btn_check_all, self.btn_uncheck_all, self.btn_more
@@ -3801,6 +4952,7 @@ class MainWindow(QMainWindow):
             (self.btn_backup_native, self.backup_native_selected),
             (self.btn_backup_dt, self.backup_dt_selected),
             (self.btn_download_updates, self.download_updates_selected),
+            (self.btn_download_platform, self.download_platform_selected),
             (self.btn_update, self.auto_update_selected),
             (self.btn_clear_cache, self.clear_cache_selected),
             (self.btn_cancel_operation, self.cancel_current_operation),
@@ -3844,6 +4996,7 @@ class MainWindow(QMainWindow):
             self.btn_edit,
             self.btn_check,
             self.btn_download_updates,
+            self.btn_download_platform,
             self.btn_update
         ]:
             actions.addWidget(b)
@@ -6086,30 +7239,149 @@ class MainWindow(QMainWindow):
         candidates = collect_platform_candidates(info)
         return info, candidates
 
-    def download_platform_candidate(self, worker, api: OneCUpdateApi, settings: Settings, candidate: dict, requested_version: str = ''):
-        uin = candidate.get('distributionUin') or ''
-        if not uin:
-            worker.log(f'Пропуск кандидата без distributionUin: {candidate}')
-            return
-        data = api.get_platform_download_data(uin)
-        url = data.get('platformDistributionUrl')
-        if not url:
-            worker.log(f'ПРОПУСК: API не вернул platformDistributionUrl. Ответ: {data}')
-            return
+    def download_platform_candidate(self, worker, api: OneCUpdateApi, settings: Settings, candidate: dict, requested_version: str = '', unpack: bool = False, delete_after_unpack: bool = False):
+        title = (
+            candidate.get('title')
+            or candidate.get('name')
+            or candidate.get('distributionName')
+            or candidate.get('fileName')
+            or 'platform'
+        )
+
         ver = candidate.get('platformVersion') or candidate.get('version') or requested_version or 'platform'
-        title = candidate.get('distributionName') or candidate.get('title') or candidate.get('name') or 'distribution'
         out_dir = Path(settings.platform_download_dir) / safe_name(str(ver)) / safe_name(str(title))
         out_dir.mkdir(parents=True, exist_ok=True)
-        file_name = Path(url.split('?', 1)[0]).name or f'1c_platform_{safe_name(str(ver))}.zip'
-        dest = out_dir / file_name
-        (out_dir / 'platform_download_info.json').write_text(json.dumps({'candidate': candidate, 'download': data}, ensure_ascii=False, indent=2), encoding='utf-8')
-        worker.log(f'Скачивание платформы: {url}')
-        api.download_file(url, dest, worker)
-        if zipfile.is_zipfile(dest):
-            extract_dir = out_dir / 'extracted'
-            unzip_1c_zip(dest, extract_dir)
-            worker.log(f'Платформа распакована: {extract_dir}')
-        worker.log(f'Готово. Папка платформы: {out_dir}')
+
+        (out_dir / 'platform_download_info.json').write_text(
+            json.dumps({'candidate': candidate}, ensure_ascii=False, indent=2),
+            encoding='utf-8'
+        )
+
+        client = OneCReleasesPlatformClient(settings.its_login, settings.its_password)
+
+        direct_url = (
+            candidate.get('downloadUrl')
+            or candidate.get('url')
+            or candidate.get('platformDistributionUrl')
+        )
+
+        version_file_url = candidate.get('versionFileUrl')
+
+        dest = None
+
+        if direct_url:
+            worker.log(f'URL скачивания: {direct_url}')
+            dest = client.download_url(direct_url, out_dir, worker, str(title))
+
+        elif version_file_url:
+            worker.log(f'Страница файла релиза: {version_file_url}')
+            links = client.resolve_download_links(version_file_url)
+
+            if not links:
+                raise RuntimeError(
+                    'Не найдены прямые ссылки скачивания на странице файла релиза.\n'
+                    f'{version_file_url}'
+                )
+
+            worker.log(f'Найдено ссылок скачивания: {len(links)}')
+
+            last_error = None
+            for url in links:
+                try:
+                    worker.log(f'Пробую скачать: {url}')
+                    dest = client.download_url(url, out_dir, worker, str(title))
+                    break
+                except Exception as e:
+                    last_error = e
+                    worker.log(f'Не удалось скачать по ссылке: {e}')
+
+            if dest is None:
+                raise RuntimeError(f'Не удалось скачать файл. Последняя ошибка: {last_error}')
+
+        else:
+            if api is None:
+                raise RuntimeError('У элемента нет downloadUrl/versionFileUrl/platformDistributionUin.')
+
+            uin = (
+                candidate.get('platformDistributionUin')
+                or candidate.get('distributionUin')
+                or candidate.get('uin')
+                or candidate.get('id')
+            )
+
+            if not uin:
+                raise RuntimeError(f'У элемента нет platformDistributionUin: {candidate}')
+
+            data = api.get_platform_download_data(uin)
+            url = data.get('platformDistributionUrl') or data.get('url')
+            if not url:
+                worker.log(f'ПРОПУСК: API не вернул platformDistributionUrl. Ответ: {data}')
+                return None
+
+            (out_dir / 'platform_download_info.json').write_text(
+                json.dumps({'candidate': candidate, 'download': data}, ensure_ascii=False, indent=2),
+                encoding='utf-8'
+            )
+
+            filename = Path(url.split('?', 1)[0]).name or safe_name(str(title)) + '.bin'
+            dest = out_dir / filename
+            api.download_file(url, dest, worker)
+
+        if dest and unpack:
+            self.unpack_platform_archive(worker, dest, delete_after_unpack)
+
+        return dest
+
+    def unpack_platform_archive(self, worker, archive_path: Path, delete_after_unpack: bool = False):
+        archive_path = Path(archive_path)
+        name = archive_path.name.lower()
+
+        extract_dir_name = archive_path.name
+        for suffix in ['.tar.gz', '.tar.bz2', '.tgz', '.zip', '.tar']:
+            if extract_dir_name.lower().endswith(suffix):
+                extract_dir_name = extract_dir_name[:-len(suffix)]
+                break
+
+        extract_dir = archive_path.parent / safe_name(extract_dir_name)
+        extract_dir.mkdir(parents=True, exist_ok=True)
+
+        worker.log(f'Распаковка архива: {archive_path}')
+        worker.log(f'Каталог распаковки: {extract_dir}')
+
+        try:
+            import zipfile
+            import tarfile
+
+            if name.endswith('.zip'):
+                with zipfile.ZipFile(archive_path, 'r') as z:
+                    z.extractall(extract_dir)
+
+            elif name.endswith('.tar.gz') or name.endswith('.tgz'):
+                with tarfile.open(archive_path, 'r:gz') as t:
+                    t.extractall(extract_dir)
+
+            elif name.endswith('.tar.bz2'):
+                with tarfile.open(archive_path, 'r:bz2') as t:
+                    t.extractall(extract_dir)
+
+            elif name.endswith('.tar'):
+                with tarfile.open(archive_path, 'r:') as t:
+                    t.extractall(extract_dir)
+
+            else:
+                worker.log('Распаковка пропущена: тип архива не поддерживается этим способом.')
+                return
+
+            worker.log('Распаковка завершена.')
+
+            if delete_after_unpack:
+                archive_path.unlink(missing_ok=True)
+                worker.log(f'Архив удален после распаковки: {archive_path}')
+
+        except Exception as e:
+            worker.log(f'ОШИБКА распаковки: {e}')
+            raise
+
 
     def download_platform_for_base(self, worker, base: BaseItem, settings: Settings, selected_candidates: Optional[List[dict]] = None, requested_types: Optional[List[str]] = None, requested_version: str = ''):
         run_base = self.prepare_base(base)
@@ -6145,50 +7417,70 @@ class MainWindow(QMainWindow):
             self.download_platform_candidate(worker, api, settings, c, requested_version)
 
     def download_platform_selected(self):
-        targets = self.require_targets()
-        if targets is None:
-            return
-        s = self.app_config.settings
-        if not s.its_login or not s.its_password:
-            QMessageBox.warning(self, 'Нет ИТС', 'Заполни логин и пароль ИТС на вкладке Настройки программы.')
+        """
+        Кнопка «Скачать платформу» открывает форму.
+        Версии и элементы выбора загружаются внутри формы по клику на ссылку версии.
+        Выбор базы не требуется.
+        """
+        dlg = PlatformDownloadChoiceDialog(self, [], '')
+
+        if dlg.exec() != QDialog.Accepted:
             return
 
-        selected_candidates = None
-        requested_types = []
-        requested_version = ''
+        vals = dlg.values()
+        selected_candidates = vals.get('candidates') or []
 
-        # Для одной базы показываем форму выбора сразу, чтобы можно было выбрать релиз/дистрибутив.
-        if len(targets) == 1:
-            base = self.app_config.bases[targets[0]]
-            try:
-                info, candidates = self.get_platform_candidates_for_base(base, s)
-            except Exception as e:
-                QMessageBox.warning(self, 'Ошибка запроса платформы', str(e))
-                return
-            dlg = PlatformDownloadChoiceDialog(self, candidates, (info or {}).get('platformVersion') or api_platform_version(base))
-            if dlg.exec() != QDialog.Accepted:
-                return
-            vals = dlg.get_values()
-            selected_candidates = vals['candidates']
-            requested_types = vals['requested_types']
-            requested_version = vals['version']
-            if not selected_candidates:
-                QMessageBox.warning(self, 'Ничего не выбрано', 'Отметь хотя бы один distributionUin, который вернул update-api.')
-                return
+        download_dir = vals.get('download_dir', '').strip()
+        if download_dir:
+            self.app_config.settings.platform_download_dir = download_dir
+            self.app_config.save()
+
+        if not selected_candidates:
+            QMessageBox.information(
+                self,
+                'Ничего не выбрано',
+                'Выберите один или несколько элементов для скачивания двойным щелчком.'
+            )
+            return
+
+        requested_version = vals.get('version') or ''
+        unpack = bool(vals.get('unpack'))
+        delete_after_unpack = bool(vals.get('delete_after_unpack'))
 
         def work(worker):
-            Path(s.platform_download_dir).mkdir(parents=True, exist_ok=True)
-            worker.log(f'Баз для проверки/скачивания платформы: {len(targets)}')
-            for n, idx in enumerate(targets, 1):
-                base = self.app_config.bases[idx]
-                worker.log('')
-                worker.log(f'[{n}/{len(targets)}]')
-                try:
-                    self.download_platform_for_base(worker, base, s, selected_candidates if len(targets) == 1 else None, requested_types, requested_version)
-                except Exception as e:
-                    worker.log(f'ОШИБКА для базы {base.name}: {e}')
+            Path(self.app_config.settings.platform_download_dir).mkdir(parents=True, exist_ok=True)
 
-        self.start_worker(f'Скачивание платформы 1С: {self.target_label(targets)}', work)
+            worker.log('=== Скачивание платформы 1С ===')
+            worker.log('Источник: releases.1c.ru / Platform83')
+            worker.log('Выбор базы не требуется.')
+            worker.log(f'Версия платформы: {requested_version}')
+            worker.log(f'Каталог скачивания: {self.app_config.settings.platform_download_dir}')
+            worker.log(f'Распаковать после скачивания: {"да" if unpack else "нет"}')
+            worker.log(f'Удалить архив после распаковки: {"да" if delete_after_unpack else "нет"}')
+            worker.log(f'Элементов к скачиванию: {len(selected_candidates)}')
+
+            for n, candidate in enumerate(selected_candidates, 1):
+                title = candidate.get('title') or candidate.get('name') or candidate.get('fileName') or ''
+                worker.log('')
+                worker.log(f'[{n}/{len(selected_candidates)}] {title}')
+
+                try:
+                    self.download_platform_candidate(
+                        worker,
+                        None,
+                        self.app_config.settings,
+                        candidate,
+                        requested_version,
+                        unpack,
+                        delete_after_unpack
+                    )
+                except Exception as e:
+                    worker.log(f'ОШИБКА скачивания: {e}')
+
+            worker.log('')
+            worker.log('Операция скачивания платформы завершена.')
+
+        self.start_worker('Скачивание платформы 1С', work)
 
 
     def download_updates_for_base(self, worker, base: BaseItem, idx: int, settings: Settings):
