@@ -336,5 +336,12 @@ def install_ibases_v8i_guard() -> None:
 
 
 if __name__ == "__main__":
-    target = Path.home() / ".1cv8/1C/1CEStart/ibases.v8i"
+    candidates = [
+        Path.home() / ".1C/1cestart/ibases.v8i",
+        Path.home() / ".1cv8/1C/1CEStart/ibases.v8i",
+    ]
+
+    target = next((p for p in candidates if p.exists()), candidates[0])
+
+    print(f"TARGET={target}")
     print("REPAIRED=yes" if repair_file(target, make_backup=True) else "REPAIRED=no")
