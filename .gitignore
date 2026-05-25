@@ -15,3 +15,9 @@ legacy/broken-main-py-20260521/
 .venv/
 reports/
 legacy/broken-main-py-*/
+
+# Local backups/checkpoints
+backups/
+checkpoints/
+dist/
+*.before-*
