@@ -200,11 +200,49 @@ def install_ibases_v8i_guard() -> None:
 
     install_ibases_v8i_guard._installed = True
 
-    default_path = Path.home() / ".1cv8/1C/1CEStart/ibases.v8i"
     snapshots = {}
 
-    if default_path.exists():
-        snapshots[str(default_path)] = default_path.read_bytes()
+    def norm_path(path) -> str:
+        try:
+            return str(Path(path).expanduser().resolve())
+        except Exception:
+            return str(Path(path).expanduser())
+
+    def remember_snapshot(path) -> None:
+        try:
+            p = Path(path).expanduser()
+        except Exception:
+            return
+
+        if p.name != "ibases.v8i":
+            return
+
+        key = norm_path(p)
+        if key in snapshots:
+            return
+
+        try:
+            if p.exists():
+                snapshots[key] = p.read_bytes()
+        except Exception:
+            pass
+
+    # 1C на Linux встречается минимум в двух вариантах путей:
+    # ~/.1C/1cestart/ibases.v8i и ~/.1cv8/1C/1CEStart/ibases.v8i
+    candidate_paths = [
+        Path.home() / ".1C/1cestart/ibases.v8i",
+        Path.home() / ".1cv8/1C/1CEStart/ibases.v8i",
+    ]
+
+    for root in (Path.home() / ".1C", Path.home() / ".1cv8"):
+        try:
+            if root.exists():
+                candidate_paths.extend(root.rglob("ibases.v8i"))
+        except Exception:
+            pass
+
+    for candidate in candidate_paths:
+        remember_snapshot(candidate)
 
     original_write_text = Path.write_text
     original_write_bytes = Path.write_bytes
@@ -221,14 +259,16 @@ def install_ibases_v8i_guard() -> None:
 
     def after_write(path) -> None:
         if is_ibases(path):
-            repair_file(path, snapshots.get(str(Path(path).expanduser())), make_backup=True)
+            repair_file(path, snapshots.get(norm_path(path)), make_backup=True)
 
     def write_text_guard(self, *args, **kwargs):
+        remember_snapshot(self)
         result = original_write_text(self, *args, **kwargs)
         after_write(self)
         return result
 
     def write_bytes_guard(self, *args, **kwargs):
+        remember_snapshot(self)
         result = original_write_bytes(self, *args, **kwargs)
         after_write(self)
         return result
@@ -259,6 +299,9 @@ def install_ibases_v8i_guard() -> None:
             return result
 
     def open_guard(file, mode="r", *args, **kwargs):
+        if is_ibases(file) and any(x in mode for x in ("w", "a", "x", "+")):
+            remember_snapshot(file)
+
         file_obj = original_open(file, mode, *args, **kwargs)
 
         if is_ibases(file) and any(x in mode for x in ("w", "a", "x", "+")):
@@ -267,16 +310,19 @@ def install_ibases_v8i_guard() -> None:
         return file_obj
 
     def replace_guard(src, dst, *args, **kwargs):
+        remember_snapshot(dst)
         result = original_replace(src, dst, *args, **kwargs)
         after_write(dst)
         return result
 
     def rename_guard(src, dst, *args, **kwargs):
+        remember_snapshot(dst)
         result = original_rename(src, dst, *args, **kwargs)
         after_write(dst)
         return result
 
     def move_guard(src, dst, *args, **kwargs):
+        remember_snapshot(dst)
         result = original_move(src, dst, *args, **kwargs)
         after_write(dst)
         return result
