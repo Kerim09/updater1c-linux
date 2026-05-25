@@ -34,6 +34,8 @@ def normalize_update_program_code_1c(current_code, context=None):
     Бухгалтерия предприятия, редакция 3.0      -> Accounting
     Бухгалтерия предприятия КОРП, редакция 3.0 -> AccountingCorp
     """
+    import re
+
     current = (current_code or "").strip()
     context = context or {}
 
@@ -7808,13 +7810,16 @@ class MainWindow(QMainWindow):
                     'ПРОПУСК: не определена версия конфигурации даже после автоматической проверки.'
                 )
                 return
+        _old_update_program_code_1c = program
+        program = normalize_update_program_code_1c(program, context=locals())
+        if program != _old_update_program_code_1c:
+            worker.log(f'Код программы обновлений уточнен по конфигурации: {_old_update_program_code_1c} -> {program}')
+
         if not program:
-            _old_update_program_code_1c = program
-            program = normalize_update_program_code_1c(program, context=locals())
-            if program != _old_update_program_code_1c:
-                worker.log(f'Код программы обновлений уточнен по конфигурации: {_old_update_program_code_1c} -> {program}')
             worker.log('ПРОПУСК: не определён код программы обновлений 1С. Заполни поле «Код программы обновлений 1С» в свойствах базы. Для Бухгалтерии обычно: Accounting.')
             return
+
+        worker.log(f'Код программы обновлений: {program or "<не заполнен>"}')
 
         api = OneCUpdateApi(settings.its_login, settings.its_password)
         worker.log(f'Проверка обновлений через update-api: programName={program}, versionNumber={version}, updateType={api.UPDATE_TYPE_WORKING}')
