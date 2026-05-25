@@ -8281,9 +8281,9 @@ class MainWindow(QMainWindow):
 
 def main():
     app = QApplication(sys.argv)
-    # Цветной структурированный лог Qt: обертка старого поля журнала.
-    import structured_log_qt_auto
-    structured_log_qt_auto.install_auto_structured_log()
+    # Цветной лог без замены layout: безопасная подсветка старого поля журнала.
+    import structured_log_qt_inline
+    structured_log_qt_inline.install_inline_log_tools()
     app.setApplicationName('io.github.kerim1c.updater1clinux')
     app.setApplicationDisplayName('Обновлятор 1C Linux')
     app.setDesktopFileName('io.github.kerim1c.updater1clinux')
