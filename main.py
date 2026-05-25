@@ -25,6 +25,82 @@ import zipfile
 APP_ID = 'io.github.kerim1c.updater1clinux'
 APP_VERSION = '1.0'
 APP_NAME = 'Обновлятор 1c linux'
+
+
+def normalize_update_program_code_1c(current_code, context=None):
+    """
+    Уточняет код программы обновлений 1С по данным конфигурации.
+
+    Бухгалтерия предприятия, редакция 3.0      -> Accounting
+    Бухгалтерия предприятия КОРП, редакция 3.0 -> AccountingCorp
+    """
+    current = (current_code or "").strip()
+    context = context or {}
+
+    parts = []
+
+    def add_value(value, depth=0):
+        if value is None or depth > 4:
+            return
+
+        if isinstance(value, str):
+            parts.append(value)
+            return
+
+        if isinstance(value, bytes):
+            try:
+                parts.append(value.decode("utf-8", "ignore"))
+            except Exception:
+                pass
+            return
+
+        if isinstance(value, dict):
+            for k, v in value.items():
+                key = str(k).lower()
+                if (
+                    isinstance(v, str)
+                    or "config" in key
+                    or "conf" in key
+                    or "name" in key
+                    or "synonym" in key
+                    or "program" in key
+                    or "код" in key
+                    or "имя" in key
+                    or "синоним" in key
+                    or "конфигура" in key
+                ):
+                    add_value(v, depth + 1)
+            return
+
+        data = getattr(value, "__dict__", None)
+        if isinstance(data, dict):
+            add_value(data, depth + 1)
+
+    for value in context.values():
+        add_value(value)
+
+    haystack = " ".join(parts).lower()
+    compact = re.sub(r"[\s,_\-]+", "", haystack)
+    current_l = current.lower()
+
+    is_accounting = (
+        "бухгалтер" in haystack
+        or "бухгалтерия" in haystack
+        or "accounting" in haystack
+        or current_l.startswith("accounting")
+    )
+
+    is_corp = (
+        "корп" in haystack
+        or "corp" in haystack
+        or "бухгалтерияпредприятиякорп" in compact
+        or "accountingcorp" in compact
+    )
+
+    if is_accounting and is_corp:
+        return "AccountingCorp"
+
+    return current
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, asdict, fields
 from pathlib import Path
@@ -7733,6 +7809,10 @@ class MainWindow(QMainWindow):
                 )
                 return
         if not program:
+            _old_update_program_code_1c = program
+            program = normalize_update_program_code_1c(program, context=locals())
+            if program != _old_update_program_code_1c:
+                worker.log(f'Код программы обновлений уточнен по конфигурации: {_old_update_program_code_1c} -> {program}')
             worker.log('ПРОПУСК: не определён код программы обновлений 1С. Заполни поле «Код программы обновлений 1С» в свойствах базы. Для Бухгалтерии обычно: Accounting.')
             return
 
