@@ -1,3 +1,11 @@
+
+# Защита списка баз 1С: не даем приложению портить ~/.1cv8/1C/1CEStart/ibases.v8i
+try:
+    from ibases_v8i_guard import install_ibases_v8i_guard
+    install_ibases_v8i_guard()
+except Exception as _ibases_guard_error:
+    print(f'WARN: ibases.v8i guard disabled: {_ibases_guard_error}')
+
 import base64
 import json
 import hashlib
@@ -12,6 +20,7 @@ import tempfile
 import time
 import webbrowser
 import zipfile
+
 
 APP_ID = 'io.github.kerim1c.updater1clinux'
 APP_VERSION = '1.0'
@@ -7847,8 +7856,80 @@ class MainWindow(QMainWindow):
             worker.refresh_signal.emit()
 
 
+
+    def get_checked_base_indexes_for_operations(self):
+        """
+        Возвращает индексы баз, отмеченных галками в дереве.
+        Группы пропускаются: берем только элементы, у которых в Qt.UserRole лежит int.
+        """
+        indexes = []
+        seen = set()
+
+        def add_idx(idx):
+            if isinstance(idx, int) and 0 <= idx < len(self.app_config.bases) and idx not in seen:
+                seen.add(idx)
+                indexes.append(idx)
+
+        def walk(parent):
+            for i in range(parent.childCount()):
+                item = parent.child(i)
+
+                try:
+                    idx = item.data(0, Qt.UserRole)
+                except Exception:
+                    idx = None
+
+                try:
+                    is_checked = item.checkState(0) == Qt.Checked
+                except Exception:
+                    is_checked = False
+
+                if is_checked:
+                    add_idx(idx)
+
+                walk(item)
+
+        walk(self.tree.invisibleRootItem())
+        return indexes
+
+    def get_current_base_index_for_operations(self):
+        """
+        Возвращает индекс текущей выделенной базы.
+        Если выделена группа — это не база.
+        """
+        item = self.tree.currentItem()
+        if item is None:
+            return None
+
+        try:
+            idx = item.data(0, Qt.UserRole)
+        except Exception:
+            idx = None
+
+        if isinstance(idx, int) and 0 <= idx < len(self.app_config.bases):
+            return idx
+
+        return None
+
+    def get_operation_target_indexes(self):
+        """
+        Единое правило целей операции:
+        1. если есть отмеченные галками базы — работаем последовательно по ним;
+        2. если галок нет — работаем по текущей выделенной базе;
+        3. группы не обрабатываем.
+        """
+        checked = self.get_checked_base_indexes_for_operations()
+        if checked:
+            return checked
+
+        current = self.get_current_base_index_for_operations()
+        if current is not None:
+            return [current]
+
+        return []
+
     def download_updates_selected(self):
-        targets = self.require_targets()
+        targets = self.get_operation_target_indexes()
         if targets is None:
             return
 
@@ -8200,6 +8281,9 @@ class MainWindow(QMainWindow):
 
 def main():
     app = QApplication(sys.argv)
+    # Цветной структурированный лог Qt: обертка старого поля журнала.
+    import structured_log_qt_auto
+    structured_log_qt_auto.install_auto_structured_log()
     app.setApplicationName('io.github.kerim1c.updater1clinux')
     app.setApplicationDisplayName('Обновлятор 1C Linux')
     app.setDesktopFileName('io.github.kerim1c.updater1clinux')
