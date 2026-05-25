@@ -103,6 +103,102 @@ def normalize_update_program_code_1c(current_code, context=None):
         return "AccountingCorp"
 
     return current
+
+
+def extract_1c_release_string(value):
+    """Возвращает строку релиза вида 3.0.195.40 / 3.1.35.73 из значения."""
+    import re
+
+    if value is None:
+        return ""
+
+    if isinstance(value, bytes):
+        try:
+            value = value.decode("utf-8", "ignore")
+        except Exception:
+            return ""
+
+    s = str(value).strip()
+    m = re.search(r"\b\d+(?:\.\d+){2,4}\b", s)
+    return m.group(0) if m else ""
+
+
+def get_base_current_release_for_filename(base, fallback=None):
+    """
+    Берет текущий релиз конфигурации базы для имени .cf backup-файла.
+
+    Ищем в объекте базы разные возможные поля, потому что версия может быть
+    заполнена после проверки настроек/мини-дампа.
+    """
+    candidates = []
+
+    if fallback:
+        candidates.append(fallback)
+
+    for attr in (
+        "configuration_version",
+        "config_version",
+        "detected_config_version",
+        "detected_version",
+        "current_config_version",
+        "current_version",
+        "version",
+        "conf_version",
+    ):
+        try:
+            candidates.append(getattr(base, attr))
+        except Exception:
+            pass
+
+    data = getattr(base, "__dict__", None)
+    if isinstance(data, dict):
+        for key, value in data.items():
+            key_l = str(key).lower()
+            if (
+                "version" in key_l
+                or "версия" in key_l
+                or "release" in key_l
+                or "релиз" in key_l
+            ):
+                candidates.append(value)
+
+    if isinstance(base, dict):
+        for key, value in base.items():
+            key_l = str(key).lower()
+            if (
+                "version" in key_l
+                or "версия" in key_l
+                or "release" in key_l
+                or "релиз" in key_l
+            ):
+                candidates.append(value)
+
+    for value in candidates:
+        release = extract_1c_release_string(value)
+        if release:
+            return release
+
+    return ""
+
+
+def safe_release_for_filename(release):
+    """Безопасная часть имени файла для релиза. Точки в версии сохраняем."""
+    import re
+
+    release = (release or "").strip()
+    if not release:
+        return "unknown-release"
+
+    release = re.sub(r"[^0-9A-Za-zА-Яа-яЁё._-]+", "_", release)
+    release = re.sub(r"_+", "_", release).strip("._-")
+
+    return release or "unknown-release"
+
+
+def build_cf_backup_filename(base_name, release=None, stamp=None):
+    """Имя .cf backup: НаименованиеБазы_ТекущийРелиз_Дата.cf."""
+    return f"{safe_name(base_name)}_{safe_release_for_filename(release)}_{stamp or now_stamp()}.cf"
+
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, asdict, fields
 from pathlib import Path
@@ -7188,7 +7284,7 @@ class MainWindow(QMainWindow):
                         continue
                     out_dir = Path(self.app_config.settings.backup_dir) / safe_name(base.name)
                     out_dir.mkdir(parents=True, exist_ok=True)
-                    cf_file = out_dir / f'{safe_name(base.name)}_{now_stamp()}.cf'
+                    cf_file = out_dir / build_cf_backup_filename(base.name, get_base_current_release_for_filename(base, fallback=locals().get("version")), now_stamp())
                     log_file = Path(self.app_config.settings.reports_dir) / f'{safe_name(base.name)}_DumpCfg_{now_stamp()}.log'
                     args = build_1c_args(base, 'DESIGNER', platform, ['/DumpCfg', str(cf_file), '/Out', str(log_file)])
                     run_command(worker, args)
