@@ -282,7 +282,7 @@ Name[ru]=${APP_NAME}
 Comment=${APP_COMMENT}
 Comment[ru]=Обновление и обслуживание информационных баз 1С на Linux
 Exec=${BIN_PATH}
-Icon=${ICON_NAME}
+Icon=/opt/updater1c-linux/icons/updater1c.png
 Terminal=false
 StartupNotify=true
 Categories=Office;Development;Utility;
@@ -511,3 +511,48 @@ echo "Installer:"
 echo "$OUT"
 echo
 ls -lh "$OUT"
+
+
+# UPDATER1C_ORANGE_ICON_FIX
+# Гарантированно ставим правильную оранжевую иконку и правим desktop-файл.
+install_orange_icon_fix() {
+  APP_DIR="${APP_DIR:-/opt/updater1c-linux}"
+  ICON_DIR="$APP_DIR/icons"
+  ICON_PATH="$ICON_DIR/updater1c.png"
+  DESKTOP_PATH="/usr/share/applications/io.github.kerim1c.updater1clinux.desktop"
+
+  mkdir -p "$ICON_DIR"
+
+  if [ -f "./assets/updater1c.png" ]; then
+    cp -f "./assets/updater1c.png" "$ICON_PATH"
+  elif [ -f "./icons/updater1c.png" ]; then
+    cp -f "./icons/updater1c.png" "$ICON_PATH"
+  else
+    cat > "$ICON_PATH" <<'SVG'
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <defs>
+    <linearGradient id="g" x1="70" y1="70" x2="440" y2="440" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ffb21a"/>
+      <stop offset="1" stop-color="#f36b00"/>
+    </linearGradient>
+  </defs>
+  <rect x="48" y="48" width="416" height="416" rx="92" fill="url(#g)"/>
+  <path d="M399 103c-70 5-126 33-164 75h77v57H196c-7 18-11 38-11 59 0 27 6 52 18 74l-61 35c-18-32-28-69-28-109 0-36 9-71 24-101H91l31-55h55c52-65 131-103 222-106v71z" fill="#fff" opacity=".92"/>
+  <text x="256" y="315" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="125" font-weight="800" fill="#fff">1C</text>
+  <path d="M350 178c36 30 59 75 59 126 0 91-74 165-165 165-42 0-80-16-109-41l43-49c18 15 41 24 66 24 55 0 99-44 99-99 0-31-14-59-37-77l44-49z" fill="#fff" opacity=".88"/>
+</svg>
+SVG
+  fi
+
+  chmod 644 "$ICON_PATH"
+
+  if [ -f "$DESKTOP_PATH" ]; then
+    sed -i "s#^Icon=.*#Icon=$ICON_PATH#g" "$DESKTOP_PATH"
+  fi
+
+  update-desktop-database /usr/share/applications >/dev/null 2>&1 || true
+  gtk-update-icon-cache -f /usr/share/icons/hicolor >/dev/null 2>&1 || true
+}
+install_orange_icon_fix || true
+# /UPDATER1C_ORANGE_ICON_FIX
+
