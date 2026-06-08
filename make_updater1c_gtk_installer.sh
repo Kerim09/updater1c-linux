@@ -26,6 +26,14 @@ echo "== Copy GTK runtime files =="
 
 cp -f "$PROJECT_DIR/main_gtk.py" "$STAGE_DIR$APP_DIR/app/"
 
+if [ -d "$PROJECT_DIR/core" ]; then
+  cp -a "$PROJECT_DIR/core" "$STAGE_DIR$APP_DIR/app/"
+fi
+
+if [ -d "$PROJECT_DIR/gtk_app" ]; then
+  cp -a "$PROJECT_DIR/gtk_app" "$STAGE_DIR$APP_DIR/app/"
+fi
+
 # Кладем рядом текущие runtime-модули, которые могут понадобиться при переносе функций.
 for f in secret_store.py ibases_v8i_guard.py structured_log.py structured_log_qt_inline.py; do
   if [ -f "$PROJECT_DIR/$f" ]; then
