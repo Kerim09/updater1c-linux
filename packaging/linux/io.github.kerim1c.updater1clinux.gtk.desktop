@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Обновлятор 1С Linux GTK
+Comment=GTK-версия Обновлятора 1С для Astra Linux
+Exec=/opt/updater1c-linux/bin/updater1c-gtk-gui
+Icon=/opt/updater1c-linux/icons/updater1c.png
+Terminal=false
+Categories=Utility;Development;
+StartupNotify=true
+StartupWMClass=updater1c-linux-gtk
