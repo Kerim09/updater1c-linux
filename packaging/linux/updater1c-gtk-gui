@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -e
+
+APP_DIR="/opt/updater1c-linux/app"
+APP_MAIN="$APP_DIR/main_gtk.py"
+
+cd "$APP_DIR"
+
+export PYTHONPATH="$APP_DIR:${PYTHONPATH:-}"
+export GDK_BACKEND="${GDK_BACKEND:-x11}"
+
+exec python3 "$APP_MAIN" "$@"
