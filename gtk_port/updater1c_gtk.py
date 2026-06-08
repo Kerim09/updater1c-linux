@@ -3,7 +3,13 @@
 
 import json
 import os
+import shlex
+import shutil
 import subprocess
+import sys
+import time
+import tempfile
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import gi
@@ -14,6 +20,440 @@ from gi.repository import Gtk, Gdk, GLib
 APP_NAME = "Обновлятор 1C Linux"
 APP_VERSION = "1.1-gtk-preview"
 CONFIG_DIR = Path.home() / ".config" / "updater1c-linux"
+
+DEFAULT_1CESTART = "/opt/1cv8/common/1cestart"
+
+
+def save_json(path: Path, data: dict):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def safe_name(value: str) -> str:
+    import re
+    return re.sub(r"[^0-9A-Za-zА-Яа-яЁё_.-]+", "_", (value or "base").strip())
+
+
+def now_stamp() -> str:
+    return time.strftime("%Y-%m-%d_%H-%M-%S")
+
+
+def normalize_base_kind_and_connect(base: dict) -> tuple[str, str]:
+    kind = (base.get("kind") or "file").strip()
+    connect = (base.get("connect") or "").strip()
+
+    low = connect.lower()
+
+    def extract_quoted(key):
+        import re
+        m = re.search(rf'{key}\s*=\s*"([^"]*)"', connect, flags=re.I)
+        if m:
+            return m.group(1)
+        m = re.search(rf"{key}\s*=\s*([^;]+)", connect, flags=re.I)
+        return m.group(1).strip() if m else ""
+
+    if low.startswith("file="):
+        return "file", extract_quoted("File") or connect
+
+    if "srvr=" in low and "ref=" in low:
+        srv = extract_quoted("Srvr")
+        ref = extract_quoted("Ref")
+        return "server", f"{srv}\\{ref}" if srv and ref else connect
+
+    if low.startswith(("ws=", "wsurl=", "web=")):
+        url = extract_quoted("WS") or extract_quoted("Ws") or extract_quoted("WsUrl") or extract_quoted("Web")
+        return "web", url or connect.split("=", 1)[-1].strip('"; ')
+
+    if low.startswith(("http://", "https://")):
+        return "web", connect
+
+    return kind, connect
+
+
+def platform_search_roots():
+    return [
+        Path("/opt/1cv8/x86_64"),
+        Path("/opt/1cv8/i386"),
+        Path("/opt/1C/v8.3/x86_64"),
+        Path("/opt/1C/v8.3/i386"),
+        Path("/opt/1C/v8.5/x86_64"),
+        Path("/opt/1C/v8.5/i386"),
+    ]
+
+
+def version_key(version: str):
+    import re
+    nums = [int(x) for x in re.findall(r"\d+", version or "")]
+    return tuple(nums or [0])
+
+
+def find_platforms():
+    found = {}
+
+    def exe_if_exists(version_dir: Path, name: str):
+        exe = version_dir / name
+        return str(exe) if exe.is_file() and os.access(exe, os.X_OK) else ""
+
+    for root in platform_search_roots():
+        if not root.exists():
+            continue
+
+        for d in root.iterdir():
+            if not d.is_dir():
+                continue
+
+            for exe_name in ("1cv8", "1cv8c", "1cv8s", "1cestart"):
+                exe = exe_if_exists(d, exe_name)
+                if exe:
+                    found[d.name] = exe
+                    break
+
+    return dict(sorted(found.items(), key=lambda x: version_key(x[0]), reverse=True))
+
+
+def find_1cestart(configured=""):
+    candidates = [
+        configured,
+        DEFAULT_1CESTART,
+        "/opt/1C/v8.3/common/1cestart",
+        "/opt/1C/v8.5/common/1cestart",
+        shutil.which("1cestart") or "",
+    ]
+
+    for c in candidates:
+        if c and Path(c).exists() and os.access(c, os.X_OK):
+            return c
+
+    return ""
+
+
+def select_platform_exe_for_base(base: dict, settings: dict, mode: str):
+    version = (base.get("platform_version") or "8.*").strip()
+    client_mode = (base.get("client_mode") or "thin").strip().lower()
+
+    if version == "8.*":
+        launcher = find_1cestart(settings.get("one_c_common_path") or settings.get("one_c_start") or "")
+        if launcher:
+            return launcher
+
+    platforms = find_platforms()
+
+    selected = ""
+    if version in platforms:
+        selected = platforms[version]
+    else:
+        prefix = ""
+        if version in ("8.3", "8.5"):
+            prefix = version + "."
+        elif version.endswith(".*"):
+            prefix = version[:-2] + "."
+
+        if prefix:
+            matches = [(v, e) for v, e in platforms.items() if v.startswith(prefix)]
+            if matches:
+                matches.sort(key=lambda x: version_key(x[0]), reverse=True)
+                selected = matches[0][1]
+
+    if not selected:
+        configured = settings.get("selected_platform") or ""
+        if configured and Path(configured).exists():
+            selected = configured
+
+    if not selected and platforms:
+        selected = next(iter(platforms.values()))
+
+    if not selected:
+        return ""
+
+    version_dir = Path(selected).parent
+
+    if mode == "ENTERPRISE":
+        if client_mode in ("thick", "толстый"):
+            order = ["1cv8s", "1cv8", "1cv8c", "1cestart"]
+        else:
+            order = ["1cv8c", "1cv8", "1cv8s", "1cestart"]
+    else:
+        order = ["1cv8", "1cv8c", "1cv8s", "1cestart"]
+
+    for name in order:
+        exe = version_dir / name
+        if exe.exists() and os.access(exe, os.X_OK):
+            return str(exe)
+
+    return selected
+
+
+def build_1c_args(base: dict, settings: dict, mode: str):
+    exe = select_platform_exe_for_base(base, settings, mode)
+    if not exe:
+        raise RuntimeError("Платформа 1С не найдена. Проверьте настройки платформы.")
+
+    kind, connect = normalize_base_kind_and_connect(base)
+
+    args = [exe, mode]
+
+    if kind == "server":
+        args.append("/S" + connect)
+    elif kind == "web":
+        args.append("/WS" + connect)
+    else:
+        args.append("/F" + connect)
+
+    user = base.get("user") or ""
+    password = base.get("password") or ""
+    launch_parameters = base.get("launch_parameters") or ""
+
+    if user:
+        args.append("/N" + user)
+    if password:
+        args.append("/P" + password)
+    if launch_parameters:
+        args.extend(shlex.split(launch_parameters))
+
+    return args
+
+
+def command_to_text(args):
+    return " ".join(shlex.quote(str(x)) for x in args)
+
+
+def start_process_and_log(args, reports_dir: str, base_name: str, suffix: str = "launch"):
+    Path(reports_dir or str(Path.home() / "1c-update-reports")).mkdir(parents=True, exist_ok=True)
+    log_file = Path(reports_dir or str(Path.home() / "1c-update-reports")) / f"{safe_name(base_name)}_{suffix}_{now_stamp()}.log"
+
+    with log_file.open("w", encoding="utf-8", errors="replace") as f:
+        p = subprocess.Popen(args, stdout=f, stderr=subprocess.STDOUT)
+
+    return p.pid, log_file
+
+
+
+
+
+def run_command_capture(args, timeout=7200, env=None):
+    merged_env = os.environ.copy()
+    if env:
+        merged_env.update(env)
+
+    p = subprocess.run(
+        args,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        timeout=timeout,
+        env=merged_env,
+        check=False,
+    )
+    return p.returncode, p.stdout or ""
+
+
+def local_xml_name(tag: str) -> str:
+    tag = str(tag or "")
+    if "}" in tag:
+        return tag.rsplit("}", 1)[-1]
+    return tag
+
+
+def good_synonym_text(value: str) -> bool:
+    v = (value or "").strip()
+    if not v:
+        return False
+    return v.lower() not in {"ru", "en", "de", "fr", "language", "content"}
+
+
+def synonym_from_xml(elem) -> str:
+    for x in elem.iter():
+        if local_xml_name(x.tag).lower() == "content" and good_synonym_text(x.text or ""):
+            return (x.text or "").strip()
+
+    for x in elem.iter():
+        if good_synonym_text(x.text or ""):
+            return (x.text or "").strip()
+
+    return ""
+
+
+def parse_configuration_xml_file(xml_path: Path):
+    tree = ET.parse(str(xml_path))
+    root = tree.getroot()
+
+    best = None
+    for elem in root.iter():
+        if local_xml_name(elem.tag).lower() == "configuration":
+            best = elem
+            break
+
+    if best is None:
+        best = root
+
+    config_name = ""
+    config_version = ""
+    config_synonym = ""
+
+    for elem in best.iter():
+        lname = local_xml_name(elem.tag).lower()
+        value = (elem.text or "").strip()
+
+        if lname == "name" and not config_name and value:
+            config_name = value
+
+        if lname == "version" and not config_version and value:
+            config_version = value
+
+        if lname == "synonym" and not config_synonym:
+            config_synonym = synonym_from_xml(elem)
+
+    return config_name, config_synonym, config_version
+
+
+def find_configuration_xml(dump_dir: Path):
+    for name in ("Configuration.xml", "configuration.xml"):
+        found = list(dump_dir.rglob(name))
+        if found:
+            return found[0]
+
+    for f in dump_dir.rglob("*.xml"):
+        try:
+            head = f.read_text(encoding="utf-8", errors="ignore")[:10000].lower()
+            if "configuration" in head and "version" in head:
+                return f
+        except Exception:
+            pass
+
+    return None
+
+
+def detect_metadata_by_dump(base: dict, settings: dict, log_func):
+    kind, connect = normalize_base_kind_and_connect(base)
+
+    if kind == "web":
+        raise RuntimeError("Для web-базы DumpConfigToFiles напрямую не выполняется.")
+
+    platform = select_platform_exe_for_base(base, settings, "DESIGNER")
+    if not platform:
+        raise RuntimeError("Платформа 1С для DESIGNER не найдена.")
+
+    reports_dir = Path(settings.get("reports_dir") or "/mnt/DataStore/Updater1C/1c-update-reports")
+    reports_dir.mkdir(parents=True, exist_ok=True)
+
+    tmp_root = Path(tempfile.mkdtemp(prefix="u1c_gtk_metadata_dump_"))
+    dump_dir = tmp_root / "dump"
+    dump_dir.mkdir(parents=True, exist_ok=True)
+
+    list_file = tmp_root / "list.txt"
+    list_file.write_text("Configuration\n", encoding="utf-8")
+
+    out_file = reports_dir / f"{safe_name(base.get('name') or 'base')}_DumpConfigToFiles_{now_stamp()}.out"
+
+    args = build_1c_args(base, settings, "DESIGNER")
+    args.extend([
+        "/DisableStartupDialogs",
+        "/DisableStartupMessages",
+        "/DumpConfigToFiles",
+        str(dump_dir),
+        "-Format",
+        "Plain",
+        "-listFile",
+        str(list_file),
+        "/Out",
+        str(out_file),
+        "-NoTruncate",
+    ])
+
+    log_func("Пробую определить конфигурацию и версию через мини-дамп Configuration.xml...")
+    log_func("Выгружается только объект Configuration через -listFile, без полного дампа конфигурации.")
+    log_func("Команда:")
+    log_func(command_to_text(args))
+
+    rc, out = run_command_capture(args, timeout=7200)
+
+    if out.strip():
+        log_func(out.strip())
+
+    log_func(f"Код завершения: {rc}")
+    log_func(f"Лог проверки: {out_file}")
+    log_func(f"Каталог дампа: {dump_dir}")
+
+    if out_file.exists():
+        tail = out_file.read_text(encoding="utf-8", errors="replace")[-4000:]
+        if tail.strip():
+            log_func("Хвост лога:")
+            log_func(tail.strip())
+
+    xml_path = find_configuration_xml(dump_dir)
+    if not xml_path:
+        raise RuntimeError("Configuration.xml не найден после DumpConfigToFiles.")
+
+    name, synonym, version = parse_configuration_xml_file(xml_path)
+
+    if not name and not synonym and not version:
+        raise RuntimeError(f"Не удалось прочитать имя/синоним/версию из {xml_path}")
+
+    return {
+        "config_name": name,
+        "config_synonym": synonym,
+        "config_version": version,
+        "xml_path": str(xml_path),
+        "dump_dir": str(dump_dir),
+        "out_file": str(out_file),
+    }
+
+
+def combo_set_values(combo, values, current=""):
+    try:
+        combo.remove_all()
+    except Exception:
+        pass
+
+    values = [str(x) for x in values if str(x) != ""]
+    current = str(current or "")
+
+    if current and current not in values:
+        values.insert(0, current)
+
+    if not values:
+        values = [""]
+
+    for v in values:
+        combo.append_text(v)
+
+    try:
+        idx = values.index(current) if current in values else 0
+        combo.set_active(idx)
+    except Exception:
+        combo.set_active(0)
+
+
+def combo_get_text(combo):
+    try:
+        return combo.get_active_text() or ""
+    except Exception:
+        return ""
+
+
+def known_groups_from_bases(bases):
+    result = []
+    for b in bases or []:
+        g = (b.get("group") or "").strip()
+        if g and g not in result:
+            result.append(g)
+    for g in ["Мое", "МФ", "Арктобако", "Перетрубция"]:
+        if g not in result:
+            result.append(g)
+    return result
+
+
+def known_platform_versions(settings=None, current=""):
+    result = ["8.3", "8.*", "auto"]
+    try:
+        for v in find_platforms().keys():
+            if v not in result:
+                result.append(v)
+    except Exception:
+        pass
+    if current and current not in result:
+        result.insert(0, current)
+    return result
 
 
 def load_json(path: Path, fallback):
@@ -40,7 +480,15 @@ def find_config_file():
 class Ui:
     @staticmethod
     def label(text):
-        w = Gtk.Label(label=text)
+        w = Gtk.Label()
+        text = str(text or "")
+        if "<b>" in text or "</b>" in text or "<small>" in text or "</small>" in text:
+            try:
+                w.set_markup(text)
+            except Exception:
+                w.set_text(text)
+        else:
+            w.set_text(text)
         w.set_xalign(0)
         return w
 
@@ -71,10 +519,85 @@ class Ui:
         return c
 
 
+
+class LaunchParamsDialog(Gtk.Dialog):
+    def __init__(self, parent, current_text=""):
+        super().__init__(
+            title="Параметры запуска 1С — Обновлятор 1C Linux",
+            transient_for=parent,
+            flags=0,
+        )
+        self.set_default_size(620, 420)
+        self.add_button("OK", Gtk.ResponseType.OK)
+        self.add_button("Отмена", Gtk.ResponseType.CANCEL)
+
+        box = self.get_content_area()
+        main = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        main.set_border_width(12)
+        box.add(main)
+
+        main.pack_start(Ui.label("<b>Дополнительные параметры запуска</b>"), False, False, 0)
+
+        self.text = Gtk.TextView()
+        self.text.set_monospace(True)
+        self.text.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        self.text.get_buffer().set_text(current_text or "")
+
+        sw = Gtk.ScrolledWindow()
+        sw.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        sw.add(self.text)
+        main.pack_start(sw, True, True, 0)
+
+        buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        main.pack_start(buttons, False, False, 0)
+
+        presets = [
+            ("Отключить диалоги", "/DisableStartupDialogs"),
+            ("Отключить сообщения запуска", "/DisableStartupMessages"),
+            ("Не обрезать лог", "-NoTruncate"),
+            ("Разрешить динамическое обновление", "-Dynamic+"),
+            ("Запретить динамическое обновление", "-Dynamic-"),
+            ("Ключ /C", "/C "),
+        ]
+
+        for title, value in presets:
+            b = Gtk.Button(label=title)
+            b.connect("clicked", lambda _b, v=value: self.append_param(v))
+            buttons.pack_start(b, False, False, 0)
+
+        self.show_all()
+
+    def append_param(self, value):
+        buf = self.text.get_buffer()
+        start, end = buf.get_bounds()
+        cur = buf.get_text(start, end, True).strip()
+        if cur:
+            cur += " "
+        cur += value
+        buf.set_text(cur)
+
+    def get_text(self):
+        buf = self.text.get_buffer()
+        start, end = buf.get_bounds()
+        return buf.get_text(start, end, True).strip()
+
+
 class BaseDialog(Gtk.Dialog):
-    def __init__(self, parent, title="Добавление базы — Обновлятор 1C Linux", base=None):
+    def __init__(
+        self,
+        parent,
+        title="Добавление базы — Обновлятор 1C Linux",
+        base=None,
+        groups=None,
+        settings=None,
+    ):
         super().__init__(title=title, transient_for=parent, flags=0)
-        self.set_default_size(520, 660)
+        self.set_default_size(620, 720)
+        self.parent_window = parent
+        self.base = dict(base or {})
+        self.groups = groups or []
+        self.settings = settings or {}
+
         self.add_button("OK", Gtk.ResponseType.OK)
         self.add_button("Отмена", Gtk.ResponseType.CANCEL)
 
@@ -85,44 +608,74 @@ class BaseDialog(Gtk.Dialog):
         grid.set_border_width(12)
         box.add(grid)
 
-        base = base or {}
-
         self.action = Ui.combo([
             "Добавить существующую информационную базу",
             "Создать новую пустую базу без конфигурации",
             "Создать новую базу из шаблона 1С",
             "Создать группу",
         ])
-        self.name = Ui.entry(base.get("name", "Новая база"))
-        self.group = Ui.combo(["", "Мое", "МФ", "Арктобако", "Перетрубция"])
+
+        self.name = Ui.entry(self.base.get("name", "Новая база"))
+
+        self.group = Ui.combo([])
+        combo_set_values(self.group, self.groups, self.base.get("group") or "")
+
         self.kind = Ui.combo(["file", "server", "web"])
-        self.connect = Ui.entry(base.get("connect", ""))
-        self.template = Ui.entry("")
-        self.user = Ui.entry(base.get("user", ""))
+        combo_set_values(self.kind, ["file", "server", "web"], self.base.get("kind") or "file")
+
+        kind, connect = normalize_base_kind_and_connect(self.base)
+        self.connect = Ui.entry(connect or self.base.get("connect", ""))
+
+        self.template = Ui.entry(self.base.get("template", ""))
+        self.user = Ui.entry(self.base.get("user", ""))
+
         self.password = Ui.entry("")
         self.password.set_visibility(False)
-        self.platform = Ui.combo(["8.3", "8.*", "auto"])
+
+        if self.base.get("password_saved") or self.base.get("password_secret_id"):
+            self.password.set_placeholder_text("Пароль сохранен в системном хранилище")
+        elif self.base.get("password"):
+            self.password.set_placeholder_text("Пароль задан")
+        else:
+            self.password.set_placeholder_text("")
+
+        self.platform = Ui.combo([])
+        combo_set_values(
+            self.platform,
+            known_platform_versions(self.settings, self.base.get("platform_version") or "8.3"),
+            self.base.get("platform_version") or "8.3",
+        )
+
         self.client_mode = Ui.combo(["Тонкий клиент", "Толстый клиент"])
-        self.launch_params = Ui.entry(base.get("launch_parameters", ""))
-        self.config_name = Ui.entry(base.get("config_name", ""))
-        self.config_synonym = Ui.entry(base.get("config_synonym", ""))
-        self.config_version = Ui.entry(base.get("config_version", ""))
-        self.update_code = Ui.entry(base.get("update_program_name", ""))
+        client_mode = self.base.get("client_mode") or "thin"
+        client_caption = "Толстый клиент" if client_mode in ("thick", "Толстый клиент") else "Тонкий клиент"
+        combo_set_values(self.client_mode, ["Тонкий клиент", "Толстый клиент"], client_caption)
+
+        self.launch_params = Ui.entry(self.base.get("launch_parameters", ""))
+
+        self.config_name = Ui.entry(self.base.get("config_name", "") or self.base.get("configuration", ""))
+        self.config_synonym = Ui.entry(self.base.get("config_synonym", "") or self.base.get("synonym", ""))
+        self.config_version = Ui.entry(self.base.get("config_version", "") or self.base.get("version", ""))
+        self.update_code = Ui.entry(self.base.get("update_program_name", "") or self.base.get("update_code", ""))
+
         self.comment = Gtk.TextView()
         self.comment.set_size_request(-1, 90)
+        comment_text = self.base.get("comment", "")
+        if comment_text:
+            self.comment.get_buffer().set_text(comment_text)
 
         rows = [
             ("Действие:", self.action),
             ("Имя базы:", self.name),
             ("Группа:", self.group),
             ("Тип:", self.kind),
-            ("Путь / server\\base / URL:", self._entry_with_button(self.connect)),
-            ("Шаблон 1С (.dt/.cf/папка):", self._entry_with_button(self.template)),
+            ("Путь / server\\base / URL:", self._entry_with_button(self.connect, self.on_browse_connect)),
+            ("Шаблон 1С (.dt/.cf/папка):", self._entry_with_button(self.template, self.on_browse_template)),
             ("Пользователь:", self.user),
             ("Пароль:", self.password),
-            ("Версия платформы:", self._combo_with_button(self.platform)),
+            ("Версия платформы:", self._combo_with_button(self.platform, self.on_find_platform_versions)),
             ("Режим запуска:", self.client_mode),
-            ("Параметры запуска:", self._entry_with_button(self.launch_params)),
+            ("Параметры запуска:", self._entry_with_button(self.launch_params, self.on_launch_params_builder)),
             ("Конфигурация:", self.config_name),
             ("Синоним:", self.config_synonym),
             ("Версия конфигурации:", self.config_version),
@@ -136,17 +689,94 @@ class BaseDialog(Gtk.Dialog):
 
         self.show_all()
 
-    def _entry_with_button(self, entry):
+    def _entry_with_button(self, entry, handler=None):
         box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         box.pack_start(entry, True, True, 0)
-        box.pack_start(Gtk.Button(label="..."), False, False, 0)
+        btn = Gtk.Button(label="...")
+        if handler:
+            btn.connect("clicked", handler)
+        box.pack_start(btn, False, False, 0)
         return box
 
-    def _combo_with_button(self, combo):
+    def _combo_with_button(self, combo, handler=None):
         box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         box.pack_start(combo, True, True, 0)
-        box.pack_start(Gtk.Button(label="..."), False, False, 0)
+        btn = Gtk.Button(label="...")
+        if handler:
+            btn.connect("clicked", handler)
+        box.pack_start(btn, False, False, 0)
         return box
+
+    def on_browse_connect(self, *_):
+        dlg = Gtk.FileChooserDialog(
+            title="Выберите папку файловой базы или файл 1Cv8.1CD",
+            transient_for=self,
+            action=Gtk.FileChooserAction.SELECT_FOLDER,
+        )
+        dlg.add_button("Отмена", Gtk.ResponseType.CANCEL)
+        dlg.add_button("Выбрать", Gtk.ResponseType.OK)
+        if dlg.run() == Gtk.ResponseType.OK:
+            self.connect.set_text(dlg.get_filename() or "")
+        dlg.destroy()
+
+    def on_browse_template(self, *_):
+        dlg = Gtk.FileChooserDialog(
+            title="Выберите шаблон/файл",
+            transient_for=self,
+            action=Gtk.FileChooserAction.OPEN,
+        )
+        dlg.add_button("Отмена", Gtk.ResponseType.CANCEL)
+        dlg.add_button("Выбрать", Gtk.ResponseType.OK)
+        if dlg.run() == Gtk.ResponseType.OK:
+            self.template.set_text(dlg.get_filename() or "")
+        dlg.destroy()
+
+    def on_find_platform_versions(self, *_):
+        current = combo_get_text(self.platform)
+        combo_set_values(self.platform, known_platform_versions(self.settings, current), current)
+
+    def on_launch_params_builder(self, *_):
+        dlg = LaunchParamsDialog(self, self.launch_params.get_text())
+        if dlg.run() == Gtk.ResponseType.OK:
+            self.launch_params.set_text(dlg.get_text())
+        dlg.destroy()
+
+    def get_data(self):
+        comment_buf = self.comment.get_buffer()
+        start, end = comment_buf.get_bounds()
+        comment = comment_buf.get_text(start, end, True)
+
+        client_caption = combo_get_text(self.client_mode)
+        client_mode = "thick" if client_caption == "Толстый клиент" else "thin"
+
+        result = dict(self.base)
+        result.update({
+            "name": self.name.get_text().strip(),
+            "group": combo_get_text(self.group).strip(),
+            "kind": combo_get_text(self.kind).strip() or "file",
+            "connect": self.connect.get_text().strip(),
+            "template": self.template.get_text().strip(),
+            "user": self.user.get_text().strip(),
+            "platform_version": combo_get_text(self.platform).strip() or "8.3",
+            "client_mode": client_mode,
+            "launch_parameters": self.launch_params.get_text().strip(),
+            "config_name": self.config_name.get_text().strip(),
+            "config_synonym": self.config_synonym.get_text().strip(),
+            "config_version": self.config_version.get_text().strip(),
+            "update_program_name": self.update_code.get_text().strip(),
+            "comment": comment,
+        })
+
+        # Пароль сохраняем только если пользователь реально что-то ввел.
+        entered_password = self.password.get_text()
+        if entered_password:
+            result["password"] = entered_password
+            result["password_saved"] = False
+            result["password_secret_id"] = ""
+
+        return result
+
+
 
 
 class AutoUpdateDialog(Gtk.Dialog):
@@ -219,6 +849,9 @@ class PlatformDownloadDialog(Gtk.Dialog):
         main.pack_start(grid, False, False, 0)
 
         self.version_link = Gtk.Button(label="загрузить с releases.1c.ru")
+        self.version_link.connect("clicked", self.on_open_releases)
+        self.version_link.connect("clicked", self.on_open_releases)
+        self.version_link.connect("clicked", self.on_open_releases)
         self.component = Ui.combo(["Все компоненты платформы", "Сервер", "Тонкий клиент", "Клиент"])
         self.os_combo = Ui.combo(["Windows", "Linux", "macOS"])
         self.bit64 = Ui.check("64 бит")
@@ -262,6 +895,21 @@ class PlatformDownloadDialog(Gtk.Dialog):
         main.pack_start(dir_box, False, False, 0)
 
         self.show_all()
+
+
+    def on_open_releases(self, *_):
+        try:
+            subprocess.Popen(["xdg-open", "https://releases.1c.ru/"])
+        except Exception:
+            pass
+
+        try:
+            store = self.available.get_model()
+            store.clear()
+            store.append(["Открыт сайт releases.1c.ru. Автоматическая загрузка списка будет подключена следующим этапом."])
+        except Exception:
+            pass
+
 
     def _add_text_column(self, tree, title, column):
         renderer = Gtk.CellRendererText()
@@ -389,6 +1037,10 @@ class MainWindow(Gtk.Window):
         self.base_user = Ui.entry("")
         self.base_password = Ui.entry("")
         self.base_password.set_visibility(False)
+        self.loading_creds = False
+        self.current_base_index = None
+        self.base_user.connect("changed", self.on_credentials_changed)
+        self.base_password.connect("changed", self.on_credentials_changed)
 
         creds.attach(Ui.label("Пользователь:"), 0, 0, 1, 1)
         creds.attach(self.base_user, 1, 0, 1, 1)
@@ -402,7 +1054,7 @@ class MainWindow(Gtk.Window):
         buttons = [
             ("📁  Добавить базу", self.on_add_base),
             ("▤  Свойства", self.on_edit_base),
-            ("🔄  Проверить настройки", self.on_stub),
+            ("🔄  Проверить настройки", self.on_check_selected_base_real),
             ("▼  Скачать обновления", self.on_stub),
             ("◻  Скачать платформу", self.on_download_platform),
             ("🔍  Установить обновления", self.on_auto_update),
@@ -413,9 +1065,10 @@ class MainWindow(Gtk.Window):
             actions.pack_start(b, False, False, 0)
 
         columns = ["", "База", "Тип", "Конфигурация", "Версия", "Путь / сервер", "Платформа", "DB"]
-        self.base_store = Gtk.TreeStore(bool, str, str, str, str, str, str, str)
+        self.base_store = Gtk.TreeStore(bool, str, str, str, str, str, str, str, int)
         self.base_tree = Gtk.TreeView(model=self.base_store)
         self.base_tree.get_selection().set_mode(Gtk.SelectionMode.SINGLE)
+        self.base_tree.get_selection().connect("changed", self.on_base_selection_changed)
         self.base_tree.connect("button-press-event", self.on_base_tree_button_press)
         self.base_tree.connect("row-activated", self.on_base_row_activated)
         self._build_base_columns(columns)
@@ -483,8 +1136,13 @@ class MainWindow(Gtk.Window):
             }
 
         for group, items in groups.items():
-            parent = self.base_store.append(None, [False, group, "", "", "", "", "", ""])
+            parent = self.base_store.append(None, [False, group, "", "", "", "", "", "", -1])
             for b in items:
+                try:
+                    idx = self.bases.index(b)
+                except Exception:
+                    idx = -1
+
                 self.base_store.append(parent, [
                     False,
                     b.get("name", ""),
@@ -494,6 +1152,7 @@ class MainWindow(Gtk.Window):
                     b.get("connect", ""),
                     b.get("platform_version", "8.3"),
                     b.get("db_type", ""),
+                    idx,
                 ])
             self.base_tree.expand_row(self.base_store.get_path(parent), False)
 
@@ -586,6 +1245,13 @@ class MainWindow(Gtk.Window):
         if tree_iter is None:
             return None
 
+        try:
+            idx = int(self.base_store[tree_iter][8])
+        except Exception:
+            idx = -1
+
+        base = self.bases[idx] if 0 <= idx < len(self.bases) else None
+
         return {
             "checked": bool(self.base_store[tree_iter][0]),
             "name": self.base_store[tree_iter][1],
@@ -595,8 +1261,175 @@ class MainWindow(Gtk.Window):
             "connect": self.base_store[tree_iter][5],
             "platform": self.base_store[tree_iter][6],
             "db": self.base_store[tree_iter][7],
+            "index": idx,
+            "base": base,
             "is_group": self.base_store.iter_has_child(tree_iter),
         }
+
+
+    def on_base_selection_changed(self, selection):
+        self.load_selected_credentials()
+
+    def load_selected_credentials(self):
+        vals = self.selected_base_values()
+        self.loading_creds = True
+
+        if not vals or vals.get("is_group") or not vals.get("base"):
+            self.current_base_index = None
+            self.base_user.set_text("")
+            self.base_password.set_text("")
+            self.loading_creds = False
+            return
+
+        idx = vals.get("index")
+        base = vals.get("base") or {}
+
+        self.current_base_index = idx
+        self.base_user.set_text(base.get("user") or "")
+        self.base_password.set_text(base.get("password") or "")
+        self.loading_creds = False
+
+    def on_credentials_changed(self, *_):
+        if self.loading_creds:
+            return
+        if self.current_base_index is None:
+            return
+        if not (0 <= self.current_base_index < len(self.bases)):
+            return
+
+        self.bases[self.current_base_index]["user"] = self.base_user.get_text()
+        self.bases[self.current_base_index]["password"] = self.base_password.get_text()
+        self.config["bases"] = self.bases
+        save_json(self.config_path, self.config)
+
+    def current_base_dict(self):
+        vals = self.selected_base_values()
+        if not vals or vals.get("is_group"):
+            return None
+
+        base = vals.get("base")
+        if base is None:
+            base = {
+                "name": vals.get("name") or "",
+                "kind": vals.get("kind") or "file",
+                "connect": vals.get("connect") or "",
+                "platform_version": vals.get("platform") or "8.*",
+                "db_type": vals.get("db") or "",
+            }
+
+        # Берем актуальные логин/пароль с формы.
+        base = dict(base)
+        base["user"] = self.base_user.get_text()
+        base["password"] = self.base_password.get_text()
+        return base
+
+    def require_current_base_dict(self):
+        base = self.current_base_dict()
+        if not base:
+            dlg = Gtk.MessageDialog(
+                transient_for=self,
+                flags=0,
+                message_type=Gtk.MessageType.INFO,
+                buttons=Gtk.ButtonsType.OK,
+                text="Не выбрана база",
+            )
+            dlg.format_secondary_text("Выберите строку информационной базы, а не группу.")
+            dlg.run()
+            dlg.destroy()
+            return None
+        return base
+
+    def run_base_mode(self, mode: str):
+        base = self.require_current_base_dict()
+        if not base:
+            return
+
+        try:
+            args = build_1c_args(base, self.settings, mode)
+            reports_dir = self.settings.get("reports_dir") or "/mnt/DataStore/Updater1C/1c-update-reports"
+            pid, log_file = start_process_and_log(
+                args,
+                reports_dir=reports_dir,
+                base_name=base.get("name") or "base",
+                suffix=mode.lower(),
+            )
+
+            self._append_log("Запуск: " + command_to_text(args))
+            self._append_log(f"PID={pid}")
+            self._append_log(f"Лог запуска: {log_file}")
+
+        except Exception as e:
+            self._append_log(f"ОШИБКА запуска {mode}: {type(e).__name__}: {e}")
+
+
+    def on_check_selected_base_real(self, *_):
+        vals = self.selected_base_values()
+        base = self.require_current_base_dict()
+        if not base:
+            return
+
+        self._append_log(f"--- Проверка базы: {base.get('name', '')} ---")
+
+        kind, connect = normalize_base_kind_and_connect(base)
+        self._append_log(f"Тип: {kind}")
+        self._append_log(f"Подключение: {connect}")
+        self._append_log("Метод определения конфигурации: DumpConfigToFiles Configuration.xml")
+
+        try:
+            if kind == "file":
+                db_path = Path(connect)
+
+                if db_path.is_file() and db_path.name.lower() == "1cv8.1cd":
+                    self._append_log(f"Файл базы найден: {db_path}")
+                    base["connect"] = str(db_path.parent)
+                elif db_path.is_dir() and (db_path / "1Cv8.1CD").exists():
+                    self._append_log(f"Файловая база найдена: {db_path / '1Cv8.1CD'}")
+                else:
+                    self._append_log(f"ОШИБКА: файловая база не найдена: {connect}")
+                    return
+
+            result = detect_metadata_by_dump(base, self.settings, self._append_log)
+
+            name = result.get("config_name") or ""
+            synonym = result.get("config_synonym") or ""
+            version = result.get("config_version") or ""
+
+            self._append_log(f"Определено: {name} / {synonym} / {version}")
+
+            idx = vals.get("index", -1) if vals else -1
+            if 0 <= idx < len(self.bases):
+                self.bases[idx]["config_name"] = name
+                self.bases[idx]["config_synonym"] = synonym
+                self.bases[idx]["config_version"] = version
+
+                if not self.bases[idx].get("update_program_name"):
+                    hay = (name + " " + synonym).lower()
+                    if "бухгалтер" in hay or "accounting" in hay:
+                        self.bases[idx]["update_program_name"] = "Accounting"
+                    elif "документооборот" in hay:
+                        self.bases[idx]["update_program_name"] = "Document"
+                    elif "зарплата" in hay or "зуп" in hay:
+                        self.bases[idx]["update_program_name"] = "HRM"
+
+                self.config["bases"] = self.bases
+                save_json(self.config_path, self.config)
+                self._load_bases_tree()
+
+            self._append_log(f"Текущая версия конфигурации: {version or '-'}")
+            self._append_log(f"Код программы обновлений: {base.get('update_program_name') or '-'}")
+            self._append_log("Проверка настроек: завершено")
+
+        except Exception as e:
+            self._append_log(f"ОШИБКА проверки: {type(e).__name__}: {e}")
+
+
+
+    def on_run_base_real(self, *_):
+        self.run_base_mode("ENTERPRISE")
+
+    def on_designer_base_real(self, *_):
+        self.run_base_mode("DESIGNER")
+
 
     def on_base_row_activated(self, tree, path, column):
         """Двойной клик по базе — запуск.
@@ -611,7 +1444,7 @@ class MainWindow(Gtk.Window):
             else:
                 self.base_tree.expand_row(path, False)
             return
-        self.on_run_base_stub()
+        self.on_run_base_real()
 
     def on_base_tree_button_press(self, tree, event):
         """Правая кнопка мыши: выделить строку под курсором и открыть контекстное меню."""
@@ -642,10 +1475,10 @@ class MainWindow(Gtk.Window):
             menu.append(Gtk.SeparatorMenuItem())
 
         items = [
-            ("Запустить", self.on_run_base_stub),
-            ("Конфигуратор", self.on_designer_base_stub),
+            ("Запустить", self.on_run_base_real),
+            ("Конфигуратор", self.on_designer_base_real),
             ("Свойства", self.on_edit_base),
-            ("Проверить настройки", self.on_stub),
+            ("Проверить настройки", self.on_check_selected_base_real),
             ("Скачать обновления", self.on_stub),
             ("Скачать платформу", self.on_download_platform),
             ("Установить обновления", self.on_auto_update),
@@ -905,13 +1738,54 @@ class MainWindow(Gtk.Window):
         self._append_log("GTK preview: обработчик будет подключен на следующем этапе переноса логики.")
 
     def on_add_base(self, *_):
-        dlg = BaseDialog(self, "Добавление базы — Обновлятор 1C Linux")
-        dlg.run()
+        dlg = BaseDialog(
+            self,
+            "Добавление базы — Обновлятор 1C Linux",
+            base={},
+            groups=known_groups_from_bases(self.bases),
+            settings=self.settings,
+        )
+        response = dlg.run()
+        if response == Gtk.ResponseType.OK:
+            new_base = dlg.get_data()
+            self.bases.append(new_base)
+            self.config["bases"] = self.bases
+            save_json(self.config_path, self.config)
+            self._load_bases_tree()
+            self._append_log(f"База добавлена: {new_base.get('name', '')}")
         dlg.destroy()
 
     def on_edit_base(self, *_):
-        dlg = BaseDialog(self, "Свойства базы — Обновлятор 1C Linux", base={"name": "Conversion", "group": "Мое"})
-        dlg.run()
+        vals = self.selected_base_values()
+        if not vals or vals.get("is_group"):
+            self.require_current_base_dict()
+            return
+
+        idx = vals.get("index", -1)
+        base = vals.get("base") or self.current_base_dict() or {}
+
+        dlg = BaseDialog(
+            self,
+            "Свойства базы — Обновлятор 1C Linux",
+            base=base,
+            groups=known_groups_from_bases(self.bases),
+            settings=self.settings,
+        )
+        response = dlg.run()
+        if response == Gtk.ResponseType.OK:
+            new_base = dlg.get_data()
+
+            if 0 <= idx < len(self.bases):
+                self.bases[idx] = new_base
+            else:
+                self.bases.append(new_base)
+
+            self.config["bases"] = self.bases
+            save_json(self.config_path, self.config)
+
+            self._load_bases_tree()
+            self._append_log(f"Свойства базы сохранены: {new_base.get('name', '')}")
+
         dlg.destroy()
 
     def on_auto_update(self, *_):
