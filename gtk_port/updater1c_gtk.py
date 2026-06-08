@@ -347,6 +347,15 @@ class MainWindow(Gtk.Window):
             color: #111827;
         }
 
+        treeview check,
+        treeview checkbutton,
+        treeview cell check {
+            margin: 0px;
+            padding: 0px;
+            min-width: 16px;
+            min-height: 16px;
+        }
+
         button {
             background: #ffffff;
             border: 1px solid #d9dde3;
@@ -431,10 +440,19 @@ class MainWindow(Gtk.Window):
     def _build_base_columns(self, titles):
         renderer_toggle = Gtk.CellRendererToggle()
         renderer_toggle.set_property("activatable", True)
+        renderer_toggle.set_property("xalign", 0.5)
+        renderer_toggle.set_property("yalign", 0.5)
+        renderer_toggle.set_property("xpad", 0)
+        renderer_toggle.set_property("ypad", 0)
         renderer_toggle.connect("toggled", self.on_base_toggle)
+
         col_toggle = Gtk.TreeViewColumn("", renderer_toggle, active=0)
         col_toggle.set_resizable(False)
-        col_toggle.set_fixed_width(54)
+        col_toggle.set_sizing(Gtk.TreeViewColumnSizing.FIXED)
+        col_toggle.set_fixed_width(64)
+        col_toggle.set_min_width(64)
+        col_toggle.set_max_width(64)
+        col_toggle.set_alignment(0.5)
         self.base_tree.append_column(col_toggle)
 
         for i, title in enumerate(titles[1:], 1):
