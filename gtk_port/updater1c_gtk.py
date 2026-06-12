@@ -981,7 +981,7 @@ class BaseDialog(Gtk.Dialog):
         self.template = Ui.entry(self.base.get("template", ""))
         self.user = Ui.entry(self.base.get("user", ""))
 
-        self.password = Ui.entry("")
+        self.password = Ui.entry(parent.get_base_password(base) if base and hasattr(parent, "get_base_password") else "")
         self.password.set_visibility(False)
 
         if self.base.get("password_saved") or self.base.get("password_secret_id"):
@@ -2911,6 +2911,34 @@ def filename_from_version_file_url(page_url: str) -> str:
 
 
 
+
+def archive_output_folder_name(path_value) -> str:
+    name = Path(path_value).name
+    lower = name.lower()
+
+    archive_suffixes = (
+        ".tar.gz",
+        ".tar.xz",
+        ".tar.bz2",
+        ".tbz2",
+        ".tgz",
+        ".txz",
+        ".zip",
+        ".rar",
+        ".7z",
+        ".tar",
+        ".gz",
+        ".bz2",
+        ".xz",
+    )
+
+    for suffix in archive_suffixes:
+        if lower.endswith(suffix):
+            return name[:-len(suffix)]
+
+    return Path(name).stem
+
+
 def unpack_platform_archive(archive: Path, unpack_dir: Path, log_func=None):
     import shutil
     import subprocess
@@ -3479,7 +3507,7 @@ class PlatformDownloadDialog(Gtk.Dialog):
                             # Если архив после распаковки удаляем, итоговая папка будет называться точно как архив.
                             # Если архив оставляем, добавляем _unpacked, потому файл и папка с одним именем рядом невозможны.
                             temp_unpack_dir = archive.parent / (archive.name + "_unpack_tmp")
-                            final_unpack_dir = archive.parent / archive.name if delete_after else archive.parent / (archive.name + "_unpacked")
+                            final_unpack_dir = archive.parent / archive_output_folder_name(archive)
 
                             result_dir = unpack_platform_archive(archive, temp_unpack_dir, log)
 
@@ -3522,9 +3550,101 @@ class PlatformDownloadDialog(Gtk.Dialog):
         path.mkdir(parents=True, exist_ok=True)
         subprocess.Popen(["xdg-open", str(path)])
 
+
+def get_updater_app_icon_path():
+    from pathlib import Path
+
+    candidates = [
+        Path("/opt/updater1c-linux/icons/updater1c-linux.png"),
+        Path(__file__).resolve().parents[1] / "icons" / "updater1c-linux.png",
+        Path("/usr/share/icons/hicolor/512x512/apps/updater1c-linux.png"),
+        Path("/usr/share/icons/hicolor/256x256/apps/updater1c-linux.png"),
+        Path("/usr/share/pixmaps/updater1c-linux.png"),
+    ]
+
+    for path in candidates:
+        try:
+            if path.exists() and path.is_file():
+                return str(path)
+        except Exception:
+            pass
+
+    return ""
+
+
+def system_libgcc_path_for_1c() -> str:
+    candidates = [
+        Path("/usr/lib/x86_64-linux-gnu/libgcc_s.so.1"),
+        Path("/lib/x86_64-linux-gnu/libgcc_s.so.1"),
+    ]
+
+    for path in candidates:
+        try:
+            if path.exists() and path.is_file():
+                return str(path)
+        except Exception:
+            pass
+
+    return ""
+
+
+def install_global_1c_libgcc_preload():
+    """Исправление запуска 1С на новых Linux.
+
+    Платформа 1С кладет рядом со своими бинарниками старую libgcc_s.so.1.
+    На новых Ubuntu/Astra системные библиотеки могут требовать GCC_12/GCC_13,
+    из-за чего 1cv8/1cv8c падает:
+      libgcc_s.so.1: version `GCC_12.0.0' not found
+
+    Поэтому для всех дочерних процессов Обновлятора подставляем системную libgcc.
+    Это действует на любые версии 1С, которые запускаются из приложения.
+    """
+    import os
+
+    libgcc = system_libgcc_path_for_1c()
+
+    if not libgcc:
+        return ""
+
+    old_preload = os.environ.get("LD_PRELOAD", "").strip()
+    parts = [x for x in old_preload.split() if x]
+
+    if libgcc not in parts:
+        os.environ["LD_PRELOAD"] = " ".join([libgcc] + parts)
+
+    return os.environ.get("LD_PRELOAD", "")
+
+
 class MainWindow(Gtk.Window):
     def __init__(self):
         super().__init__(title=APP_NAME)
+
+        self._base_password_runtime_cache = {}
+        self._last_launch_guard = {"key": "", "time": 0.0}
+
+        try:
+            self._global_1c_ld_preload = install_global_1c_libgcc_preload()
+        except Exception:
+            self._global_1c_ld_preload = ""
+
+        try:
+            from gi.repository import GLib as _GLib
+            _GLib.set_application_name("Обновлятор 1C Linux")
+            _GLib.set_prgname("updater1c-linux")
+        except Exception:
+            pass
+
+        try:
+            self.set_wmclass("updater1c-linux", "updater1c-linux")
+        except Exception:
+            pass
+
+        try:
+            icon_path = get_updater_app_icon_path()
+            if icon_path:
+                self.set_icon_from_file(icon_path)
+        except Exception:
+            pass
         self.set_default_size(1320, 820)
         self.set_position(Gtk.WindowPosition.CENTER)
 
@@ -3635,6 +3755,8 @@ class MainWindow(Gtk.Window):
         self.base_user = Ui.entry("")
         self.base_password = Ui.entry("")
         self.base_password.set_visibility(False)
+        self.base_user.connect("changed", self.on_base_credentials_changed)
+        self.base_password.connect("changed", self.on_base_credentials_changed)
         self.loading_creds = False
         self.current_base_index = None
         self.base_user.connect("changed", self.on_credentials_changed)
@@ -3666,9 +3788,17 @@ class MainWindow(Gtk.Window):
         self.base_store = Gtk.TreeStore(bool, str, str, str, str, str, str, str, int)
         self.base_tree = Gtk.TreeView(model=self.base_store)
         self.base_tree.get_selection().set_mode(Gtk.SelectionMode.SINGLE)
+        self.base_tree.set_reorderable(True)
         self.base_tree.get_selection().connect("changed", self.on_base_selection_changed)
+        self.base_tree.connect("button-press-event", self.on_base_tree_double_click_press)
         self.base_tree.connect("button-press-event", self.on_base_tree_button_press)
         self.base_tree.connect("row-activated", self.on_base_row_activated)
+
+        self._loading_bases_tree = False
+        self._tree_save_scheduled = False
+        self.base_store.connect("row-inserted", self.on_base_tree_structure_changed)
+        self.base_store.connect("row-deleted", self.on_base_tree_structure_changed)
+        self.base_store.connect("rows-reordered", self.on_base_tree_structure_changed)
         self._build_base_columns(columns)
         tab.pack_start(self._scrolled(self.base_tree), True, True, 0)
 
@@ -3684,6 +3814,16 @@ class MainWindow(Gtk.Window):
 
         bottom.pack_start(b1, False, False, 0)
         bottom.pack_start(b2, False, False, 0)
+
+        move_up = Ui.button("🔵 ▲")
+        move_down = Ui.button("🔵 ▼")
+        move_up.set_tooltip_text("Переместить выбранную базу/группу выше")
+        move_down.set_tooltip_text("Переместить выбранную базу/группу ниже")
+        move_up.connect("clicked", self.on_move_selected_base_up)
+        move_down.connect("clicked", self.on_move_selected_base_down)
+        bottom.pack_start(move_up, False, False, 0)
+        bottom.pack_start(move_down, False, False, 0)
+
         bottom.pack_end(b3, False, False, 0)
 
         self._load_bases_tree()
@@ -3714,46 +3854,264 @@ class MainWindow(Gtk.Window):
                 col.set_expand(True)
             self.base_tree.append_column(col)
 
+
     def _load_bases_tree(self):
+        self._loading_bases_tree = True
         self.base_store.clear()
 
-        groups = {}
-        for b in self.bases:
-            group = b.get("group") or "Без группы"
-            groups.setdefault(group, []).append(b)
+        def append_group(parent_iter, name):
+            return self.base_store.append(parent_iter, [
+                False, str(name), "", "", "", "", "", "", -1
+            ])
 
-        if not groups:
-            groups = {
-                "Мое": [
-                    {"name": "AccountingBase", "kind": "file", "connect": "/mnt/Data/bases/AccountingBase", "platform_version": "8.3"},
-                    {"name": "Conversion", "kind": "file", "config_synonym": "Конвертация данных, редакция 2.1", "config_version": "2.1.8.2", "connect": "/mnt/Data/bases/Conversion", "platform_version": "8.3"},
-                ],
-                "МФ": [],
-                "Арктобако": [],
-                "Перетрубция": [],
-            }
+        def append_base(parent_iter, b, idx):
+            self.base_store.append(parent_iter, [
+                False,
+                b.get("name", ""),
+                b.get("kind", ""),
+                b.get("config_synonym") or b.get("config_name", ""),
+                b.get("config_version", ""),
+                b.get("connect", ""),
+                b.get("platform_version", "8.3"),
+                b.get("db_type", ""),
+                int(idx),
+            ])
 
-        for group, items in groups.items():
-            parent = self.base_store.append(None, [False, group, "", "", "", "", "", "", -1])
-            for b in items:
+        groups_cache = {}
+
+        def get_group_iter(path_value):
+            parts = [x.strip() for x in str(path_value or "Без группы").split("/") if x.strip()]
+            if not parts:
+                parts = ["Без группы"]
+
+            parent = None
+            current_path = []
+
+            for part in parts:
+                current_path.append(part)
+                key = "/".join(current_path)
+
+                if key not in groups_cache:
+                    groups_cache[key] = append_group(parent, part)
+
+                parent = groups_cache[key]
+
+            return parent
+
+        if self.bases:
+            for idx, b in enumerate(self.bases):
+                if not isinstance(b, dict):
+                    continue
+
+                group = b.get("group") or "Без группы"
+                parent = get_group_iter(group)
+                append_base(parent, b, idx)
+        else:
+            demo = [
+                {"name": "AccountingBase", "kind": "file", "connect": "/mnt/Data/bases/AccountingBase", "platform_version": "8.3", "group": "Мое"},
+                {"name": "Conversion", "kind": "file", "config_synonym": "Конвертация данных, редакция 2.1", "config_version": "2.1.8.2", "connect": "/mnt/Data/bases/Conversion", "platform_version": "8.3", "group": "Мое"},
+            ]
+
+            self.bases = demo
+
+            for idx, b in enumerate(self.bases):
+                parent = get_group_iter(b.get("group") or "Мое")
+                append_base(parent, b, idx)
+
+        def expand_all(parent=None):
+            child = self.base_store.iter_children(parent)
+            while child is not None:
                 try:
-                    idx = self.bases.index(b)
+                    if self.base_store.iter_has_child(child):
+                        self.base_tree.expand_row(self.base_store.get_path(child), False)
+                        expand_all(child)
                 except Exception:
-                    idx = -1
+                    pass
+                child = self.base_store.iter_next(child)
 
-                self.base_store.append(parent, [
-                    False,
-                    b.get("name", ""),
-                    b.get("kind", ""),
-                    b.get("config_synonym") or b.get("config_name", ""),
-                    b.get("config_version", ""),
-                    b.get("connect", ""),
-                    b.get("platform_version", "8.3"),
-                    b.get("db_type", ""),
-                    idx,
-                ])
-            self.base_tree.expand_row(self.base_store.get_path(parent), False)
+        expand_all()
 
+        self._loading_bases_tree = False
+        self.update_bases_status()
+
+
+    def is_group_iter(self, tree_iter):
+        if tree_iter is None:
+            return False
+
+        try:
+            idx = int(self.base_store[tree_iter][8])
+            return idx < 0
+        except Exception:
+            return False
+
+    def iter_parent(self, tree_iter):
+        try:
+            return self.base_store.iter_parent(tree_iter)
+        except Exception:
+            return None
+
+    def iter_previous_sibling(self, tree_iter):
+        parent = self.iter_parent(tree_iter)
+        child = self.base_store.iter_children(parent)
+        previous = None
+
+        while child is not None:
+            if self.base_store.get_path(child) == self.base_store.get_path(tree_iter):
+                return previous
+
+            previous = child
+            child = self.base_store.iter_next(child)
+
+        return None
+
+    def iter_next_sibling(self, tree_iter):
+        try:
+            return self.base_store.iter_next(tree_iter)
+        except Exception:
+            return None
+
+    def select_iter_and_scroll(self, tree_iter):
+        try:
+            path = self.base_store.get_path(tree_iter)
+            self.base_tree.get_selection().select_path(path)
+            self.base_tree.scroll_to_cell(path, None, True, 0.5, 0.0)
+        except Exception:
+            pass
+
+    def on_move_selected_base_up(self, *_):
+        tree_iter = self.selected_base_iter()
+
+        if tree_iter is None:
+            return
+
+        previous = self.iter_previous_sibling(tree_iter)
+
+        if previous is None:
+            self._append_log("Перемещение вверх невозможно: строка уже первая на своем уровне.")
+            return
+
+        self.base_store.move_before(tree_iter, previous)
+        self.select_iter_and_scroll(tree_iter)
+        self.save_bases_order_from_tree()
+        self._append_log("Порядок баз сохранен после перемещения вверх.")
+
+    def on_move_selected_base_down(self, *_):
+        tree_iter = self.selected_base_iter()
+
+        if tree_iter is None:
+            return
+
+        next_iter = self.iter_next_sibling(tree_iter)
+
+        if next_iter is None:
+            self._append_log("Перемещение вниз невозможно: строка уже последняя на своем уровне.")
+            return
+
+        self.base_store.move_after(tree_iter, next_iter)
+        self.select_iter_and_scroll(tree_iter)
+        self.save_bases_order_from_tree()
+        self._append_log("Порядок баз сохранен после перемещения вниз.")
+
+    def on_base_tree_structure_changed(self, *args):
+        if getattr(self, "_loading_bases_tree", False):
+            return False
+
+        if getattr(self, "_tree_save_scheduled", False):
+            return False
+
+        self._tree_save_scheduled = True
+
+        def do_save():
+            self._tree_save_scheduled = False
+            try:
+                self.save_bases_order_from_tree()
+            except Exception as e:
+                self._append_log(f"Не удалось сохранить порядок после перемещения: {type(e).__name__}: {e}")
+            return False
+
+        GLib.timeout_add(350, do_save)
+        return False
+
+    def group_path_for_iter(self, tree_iter):
+        parts = []
+        parent = self.iter_parent(tree_iter)
+
+        while parent is not None:
+            try:
+                name = str(self.base_store[parent][1] or "").strip()
+                if name:
+                    parts.append(name)
+            except Exception:
+                pass
+
+            parent = self.iter_parent(parent)
+
+        parts.reverse()
+
+        return "/".join(parts) if parts else "Без группы"
+
+    def row_to_base_dict(self, tree_iter, new_index):
+        old_index = -1
+
+        try:
+            old_index = int(self.base_store[tree_iter][8])
+        except Exception:
+            old_index = -1
+
+        if old_index >= 0 and old_index < len(self.bases):
+            item = dict(self.bases[old_index])
+        else:
+            item = {}
+
+        item["name"] = str(self.base_store[tree_iter][1] or "")
+        item["kind"] = str(self.base_store[tree_iter][2] or "")
+        item["config_synonym"] = str(self.base_store[tree_iter][3] or "")
+        item["config_version"] = str(self.base_store[tree_iter][4] or "")
+        item["connect"] = str(self.base_store[tree_iter][5] or "")
+        item["platform_version"] = str(self.base_store[tree_iter][6] or "")
+        item["db_type"] = str(self.base_store[tree_iter][7] or "")
+        item["group"] = self.group_path_for_iter(tree_iter)
+
+        try:
+            self.base_store[tree_iter][8] = int(new_index)
+        except Exception:
+            pass
+
+        return item
+
+    def collect_bases_from_tree(self, parent_iter=None, result=None):
+        if result is None:
+            result = []
+
+        child = self.base_store.iter_children(parent_iter)
+
+        while child is not None:
+            if self.is_group_iter(child):
+                self.collect_bases_from_tree(child, result)
+            else:
+                result.append(self.row_to_base_dict(child, len(result)))
+
+            child = self.base_store.iter_next(child)
+
+        return result
+
+    def backup_config_before_reorder(self):
+        try:
+            src = Path(self.config_path)
+            if src.exists():
+                dst = src.with_suffix(src.suffix + ".before_tree_reorder_backup")
+                if not dst.exists():
+                    dst.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+        except Exception:
+            pass
+
+    def save_bases_order_from_tree(self):
+        self.backup_config_before_reorder()
+        self.bases = self.collect_bases_from_tree()
+        self.config["bases"] = self.bases
+        save_json(self.config_path, self.config)
+        self.update_bases_status()
 
     def on_base_toggle(self, renderer, path_string):
         """Переключение галочки в дереве баз.
@@ -3838,17 +4196,17 @@ class MainWindow(Gtk.Window):
             return None
         return tree_iter
 
+
     def selected_base_values(self):
         tree_iter = self.selected_base_iter()
         if tree_iter is None:
             return None
 
+        idx = -1
         try:
             idx = int(self.base_store[tree_iter][8])
         except Exception:
             idx = -1
-
-        base = self.bases[idx] if 0 <= idx < len(self.bases) else None
 
         return {
             "checked": bool(self.base_store[tree_iter][0]),
@@ -3860,13 +4218,9 @@ class MainWindow(Gtk.Window):
             "platform": self.base_store[tree_iter][6],
             "db": self.base_store[tree_iter][7],
             "index": idx,
-            "base": base,
-            "is_group": self.base_store.iter_has_child(tree_iter),
+            "is_group": self.is_group_iter(tree_iter),
         }
 
-
-    def on_base_selection_changed(self, selection):
-        self.load_selected_credentials()
 
     def load_selected_credentials(self):
         vals = self.selected_base_values()
@@ -4029,20 +4383,92 @@ class MainWindow(Gtk.Window):
         self.run_base_mode("DESIGNER")
 
 
+
+
+
     def on_base_row_activated(self, tree, path, column):
-        """Двойной клик по базе — запуск.
-        Для GTK-preview пока вызываем тот же обработчик, что и кнопка Запустить.
+        """Двойной клик / Enter по строке базы.
+
+        База: запуск 1С.
+        Группа: свернуть/развернуть.
         """
-        vals = self.selected_base_values()
-        if not vals:
-            return
-        if vals.get("is_group"):
-            if self.base_tree.row_expanded(path):
-                self.base_tree.collapse_row(path)
-            else:
-                self.base_tree.expand_row(path, False)
-            return
-        self.on_run_base_real()
+        try:
+            tree.grab_focus()
+            tree.get_selection().select_path(path)
+            tree.set_cursor(path, column, False)
+        except Exception:
+            pass
+
+        try:
+            vals = self.selected_base_values()
+
+            if not vals:
+                self._append_log("Двойной клик: база не выбрана.")
+                return
+
+            if vals.get("is_group"):
+                if self.base_tree.row_expanded(path):
+                    self.base_tree.collapse_row(path)
+                else:
+                    self.base_tree.expand_row(path, False)
+                return
+
+            self._append_log(f"Двойной клик: запуск базы {vals.get('name') or '-'}")
+            self.launch_selected_base("ENTERPRISE")
+
+        except Exception as e:
+            self._append_log(f"Ошибка запуска по двойному клику: {type(e).__name__}: {e}")
+            try:
+                dlg = Gtk.MessageDialog(
+                    transient_for=self,
+                    flags=0,
+                    message_type=Gtk.MessageType.ERROR,
+                    buttons=Gtk.ButtonsType.OK,
+                    text="Не удалось запустить базу",
+                )
+                dlg.format_secondary_text(f"{type(e).__name__}: {e}")
+                dlg.run()
+                dlg.destroy()
+            except Exception:
+                pass
+
+
+    def on_base_tree_double_click_press(self, tree, event):
+        """Fallback-обработчик двойного клика мышью.
+
+        Нужен потому, что Gtk.TreeView row-activated иногда перестает срабатывать
+        после включения reorderable/drag-and-drop.
+        """
+        try:
+            if event.button != 1:
+                return False
+
+            if event.type != Gdk.EventType._2BUTTON_PRESS:
+                return False
+
+            hit = tree.get_path_at_pos(int(event.x), int(event.y))
+
+            if not hit:
+                return False
+
+            path, column, cell_x, cell_y = hit
+
+            try:
+                tree.grab_focus()
+                tree.get_selection().select_path(path)
+                tree.set_cursor(path, column, False)
+            except Exception:
+                pass
+
+            self.on_base_row_activated(tree, path, column)
+            return True
+
+        except Exception as e:
+            try:
+                self._append_log(f"Ошибка обработки двойного клика: {type(e).__name__}: {e}")
+            except Exception:
+                pass
+            return False
 
     def on_base_tree_button_press(self, tree, event):
         """Правая кнопка мыши: выделить строку под курсором и открыть контекстное меню."""
@@ -4132,15 +4558,896 @@ class MainWindow(Gtk.Window):
     def on_sync_1c_stub(self, *_):
         self._append_log("GTK preview: синхронизация со списком баз 1С будет подключена после переноса логики из Qt.")
 
-    def on_run_base_stub(self, *_):
+
+
+    def resolve_1c_executable(self, vals=None, designer=False, prefer_thin=True):
+        """Подобрать исполняемый файл 1С.
+
+        Для web-баз важно запускать 1cv8c напрямую.
+        /opt/1cv8/common/1cestart часто открывает список баз и игнорирует прямой /WS.
+        """
+        import shutil
+
+        vals = vals or self.selected_base_values() or {}
+        base = self.selected_base_config(vals)
+
+        if prefer_thin:
+            preferred_names = ["1cv8c", "1cv8"]
+        elif designer:
+            preferred_names = ["1cv8", "1cv8c"]
+        else:
+            preferred_names = ["1cv8c", "1cv8"]
+
+        raw_candidates = [
+            base.get("platform_path"),
+            base.get("platform_exe"),
+            self.settings.get("selected_platform"),
+            self.settings.get("one_c_start"),
+        ]
+
+        # Если указан конкретный путь к 1cv8/1cv8c — используем его.
+        # 1cestart как прямой запуск web-базы не берем, если prefer_thin=True.
+        for value in raw_candidates:
+            if not value:
+                continue
+
+            value = str(value).strip()
+
+            if "/" not in value:
+                continue
+
+            path = Path(value).expanduser()
+
+            if not path.exists() or not path.is_file():
+                continue
+
+            if prefer_thin and path.name.lower() == "1cestart":
+                continue
+
+            return str(path)
+
+        platform_value = str(
+            base.get("platform_version")
+            or base.get("platform")
+            or vals.get("platform")
+            or self.settings.get("platform_version")
+            or ""
+        ).strip()
+
+        roots = [
+            Path("/opt/1cv8/x86_64"),
+            Path("/opt/1cv8/i386"),
+            Path("/opt/1C/v8.3/x86_64"),
+            Path("/opt/1C/v8.3/i386"),
+            Path("/opt/1C/v8.5/x86_64"),
+            Path("/opt/1C/v8.5/i386"),
+        ]
+
+        version_dirs = []
+
+        for root in roots:
+            if not root.exists():
+                continue
+
+            if platform_value and platform_value not in ("auto", "8.*"):
+                version_dirs.extend(sorted(root.glob(platform_value + "*"), reverse=True))
+
+            version_dirs.extend(sorted([x for x in root.iterdir() if x.is_dir()], reverse=True))
+
+        seen_dirs = []
+
+        for d in version_dirs:
+            if d in seen_dirs:
+                continue
+
+            seen_dirs.append(d)
+
+            for exe_name in preferred_names:
+                exe = d / exe_name
+                if exe.exists() and exe.is_file():
+                    return str(exe)
+
+        for exe_name in preferred_names:
+            found = shutil.which(exe_name)
+            if found:
+                return found
+
+        # Последний fallback только если ничего другого не нашли.
+        common = Path("/opt/1cv8/common/1cestart")
+        if common.exists() and not prefer_thin:
+            return str(common)
+
+        return ""
+
+
+
+
+    def quote_1c_conn_value(self, value):
+        value = str(value or "")
+        value = value.replace("\\", "\\\\")
+        value = value.replace('"', '\\"')
+        return f'"{value}"'
+
+    def find_direct_1cv8c(self, platform_value=""):
+        """Найти именно 1cv8c, не 1cestart."""
+        import shutil
+
+        platform_value = str(platform_value or "").strip()
+
+        roots = [
+            Path("/opt/1cv8/x86_64"),
+            Path("/opt/1cv8/i386"),
+            Path("/opt/1C/v8.3/x86_64"),
+            Path("/opt/1C/v8.3/i386"),
+            Path("/opt/1C/v8.5/x86_64"),
+            Path("/opt/1C/v8.5/i386"),
+        ]
+
+        version_dirs = []
+
+        for root in roots:
+            if not root.exists():
+                continue
+
+            if platform_value and platform_value not in ("auto", "8.*"):
+                version_dirs.extend(sorted(root.glob(platform_value + "*"), reverse=True))
+
+            version_dirs.extend(sorted([x for x in root.iterdir() if x.is_dir()], reverse=True))
+
+        seen = set()
+
+        for d in version_dirs:
+            key = str(d)
+            if key in seen:
+                continue
+
+            seen.add(key)
+
+            exe = d / "1cv8c"
+            if exe.exists() and exe.is_file():
+                return str(exe)
+
+        found = shutil.which("1cv8c")
+        if found:
+            return found
+
+        return ""
+
+
+
+
+
+    def resolve_web_1c_executable(self, vals=None, base=None):
+        """Для web-базы нужен прямой тонкий клиент 1cv8c, не 1cv8 и не 1cestart.
+
+        Для платформы 8.3 в этом окружении предпочитаем 8.3.27.1786,
+        потому web-сервер опубликован на ней.
+        """
+        vals = vals or self.selected_base_values() or {}
+        base = base or self.selected_base_config(vals) or {}
+
+        platform_value = str(
+            vals.get("platform")
+            or base.get("platform_version")
+            or base.get("platform")
+            or ""
+        ).strip()
+
+        explicit_candidates = []
+
+        # Если в базе указан точный путь к 1cv8c — он важнее.
+        for key in ("platform_path", "platform_exe"):
+            value = str(base.get(key) or "").strip()
+            if value:
+                explicit_candidates.append(Path(value).expanduser())
+
+        # Для web 8.3 принудительно предпочитаем 8.3.27.1786.
+        if platform_value == "8.3" or platform_value.startswith("8.3"):
+            explicit_candidates.append(Path("/opt/1cv8/x86_64/8.3.27.1786/1cv8c"))
+
+        if platform_value and platform_value not in ("8.3", "8.5", "auto", "8.*"):
+            explicit_candidates.extend([
+                Path("/opt/1cv8/x86_64") / platform_value / "1cv8c",
+                Path("/opt/1C/v8.3/x86_64") / platform_value / "1cv8c",
+                Path("/opt/1C/v8.5/x86_64") / platform_value / "1cv8c",
+            ])
+
+        for exe in explicit_candidates:
+            try:
+                if exe.exists() and exe.is_file() and exe.name == "1cv8c":
+                    return str(exe)
+            except Exception:
+                pass
+
+        roots = [
+            Path("/opt/1cv8/x86_64"),
+            Path("/opt/1C/v8.3/x86_64"),
+            Path("/opt/1C/v8.5/x86_64"),
+            Path("/opt/1cv8/i386"),
+            Path("/opt/1C/v8.3/i386"),
+            Path("/opt/1C/v8.5/i386"),
+        ]
+
+        version_dirs = []
+
+        for root in roots:
+            if not root.exists():
+                continue
+
+            for d in root.iterdir():
+                if not d.is_dir():
+                    continue
+
+                if platform_value in ("8.3", "8.5"):
+                    if not d.name.startswith(platform_value + "."):
+                        continue
+                elif platform_value and platform_value not in ("auto", "8.*"):
+                    if not d.name.startswith(platform_value):
+                        continue
+
+                version_dirs.append(d)
+
+        # Не выбираем 1cv8. Только 1cv8c.
+        for d in sorted(version_dirs):
+            exe = d / "1cv8c"
+            if exe.exists() and exe.is_file():
+                return str(exe)
+
+        return ""
+
+
+
+    def selected_base_index(self):
         vals = self.selected_base_values()
-        name = vals.get("name") if vals else "-"
-        self._append_log(f"GTK preview: запуск базы будет подключен позже. База: {name}")
+
+        if not vals or vals.get("is_group"):
+            return -1
+
+        name = str(vals.get("name") or "")
+        connect = str(vals.get("connect") or "")
+
+        for i, item in enumerate(self.bases or []):
+            if not isinstance(item, dict):
+                continue
+
+            if str(item.get("name") or "") == name and str(item.get("connect") or "") == connect:
+                return i
+
+        try:
+            idx = int(vals.get("index", -1))
+            if 0 <= idx < len(self.bases):
+                return idx
+        except Exception:
+            pass
+
+        try:
+            tree_iter = self.selected_base_iter()
+            if tree_iter is not None:
+                idx = int(self.base_store[tree_iter][8])
+                if 0 <= idx < len(self.bases):
+                    return idx
+        except Exception:
+            pass
+
+        return -1
+
+    def selected_base_config(self, vals=None):
+        vals = vals or self.selected_base_values()
+
+        if not vals or vals.get("is_group"):
+            return {}
+
+        name = str(vals.get("name") or "")
+        connect = str(vals.get("connect") or "")
+
+        for item in self.bases or []:
+            if not isinstance(item, dict):
+                continue
+
+            if str(item.get("name") or "") == name and str(item.get("connect") or "") == connect:
+                return item
+
+        idx = self.selected_base_index()
+
+        if idx >= 0 and idx < len(self.bases):
+            item = self.bases[idx]
+            if isinstance(item, dict):
+                return item
+
+        return {
+            "name": name,
+            "kind": vals.get("kind") or "",
+            "connect": connect,
+            "platform_version": vals.get("platform") or "",
+        }
+
+    def keyring_service_name(self):
+        return "updater1c-linux"
+
+    def base_secret_id(self, base):
+        import hashlib
+
+        base = base or {}
+
+        raw = "|".join([
+            str(base.get("name") or ""),
+            str(base.get("connect") or ""),
+            str(base.get("kind") or ""),
+        ])
+
+        digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+        return f"base-password-{digest}"
+
+    def keyring_get_password(self, secret_id):
+        if not secret_id:
+            return ""
+
+        cache = getattr(self, "_base_password_runtime_cache", {})
+        if secret_id in cache:
+            return cache.get(secret_id) or ""
+
+        try:
+            import keyring
+
+            value = keyring.get_password(self.keyring_service_name(), secret_id) or ""
+
+            if value:
+                self._base_password_runtime_cache[secret_id] = value
+
+            return value
+
+        except Exception as e:
+            try:
+                self._append_log(f"Keyring: не удалось прочитать пароль: {type(e).__name__}: {e}")
+            except Exception:
+                pass
+            return ""
+
+    def keyring_set_password(self, secret_id, password):
+        if not secret_id:
+            return False
+
+        if not hasattr(self, "_base_password_runtime_cache"):
+            self._base_password_runtime_cache = {}
+
+        self._base_password_runtime_cache[secret_id] = password or ""
+
+        try:
+            import keyring
+
+            if password:
+                keyring.set_password(self.keyring_service_name(), secret_id, password)
+            else:
+                try:
+                    keyring.delete_password(self.keyring_service_name(), secret_id)
+                except Exception:
+                    pass
+
+            return True
+
+        except Exception as e:
+            try:
+                self._append_log(f"Keyring: пароль сохранен только в памяти текущей сессии: {type(e).__name__}: {e}")
+            except Exception:
+                pass
+            return False
+
+    def save_config_safe(self):
+        try:
+            self.config["bases"] = self.bases
+            save_json(self.config_path, self.config)
+            return True
+        except Exception as e:
+            try:
+                self._append_log(f"Не удалось сохранить настройки: {type(e).__name__}: {e}")
+            except Exception:
+                pass
+            return False
+
+    def get_base_password(self, base):
+        base = base or {}
+
+        secret_id = str(base.get("password_secret_id") or "")
+
+        if secret_id:
+            value = self.keyring_get_password(secret_id)
+            if value:
+                return value
+
+        old_plain = str(base.get("password") or base.get("pwd") or base.get("pass") or "")
+
+        if old_plain:
+            secret_id = self.base_secret_id(base)
+            self.keyring_set_password(secret_id, old_plain)
+
+            base["password_secret_id"] = secret_id
+            base["password_saved"] = True
+
+            for key in ("password", "pwd", "pass"):
+                base.pop(key, None)
+
+            self.save_config_safe()
+            return old_plain
+
+        return ""
+
+    def set_base_password(self, base, password):
+        base = base or {}
+
+        secret_id = str(base.get("password_secret_id") or "") or self.base_secret_id(base)
+
+        self.keyring_set_password(secret_id, password)
+
+        base["password_secret_id"] = secret_id
+        base["password_saved"] = bool(password)
+
+        for key in ("password", "pwd", "pass"):
+            base.pop(key, None)
+
+        return True
+
+    def get_base_user_text(self):
+        try:
+            return str(self.base_user.get_text() or "").strip()
+        except Exception:
+            return ""
+
+    def get_base_password_text(self):
+        try:
+            return str(self.base_password.get_text() or "")
+        except Exception:
+            return ""
+
+    def on_base_selection_changed(self, *_):
+        if getattr(self, "_loading_base_credentials", False):
+            return
+
+        vals = self.selected_base_values()
+
+        self._loading_base_credentials = True
+
+        try:
+            if not vals or vals.get("is_group"):
+                self.base_user.set_text("")
+                self.base_password.set_text("")
+                return
+
+            base = self.selected_base_config(vals)
+
+            user = str(
+                base.get("user")
+                or base.get("username")
+                or base.get("login")
+                or ""
+            )
+
+            password = self.get_base_password(base)
+
+            self.base_user.set_text(user)
+            self.base_password.set_text(password)
+
+        finally:
+            self._loading_base_credentials = False
+
+    def on_base_credentials_changed(self, *_):
+        if getattr(self, "_loading_base_credentials", False):
+            return
+
+        vals = self.selected_base_values()
+
+        if not vals or vals.get("is_group"):
+            return
+
+        self.save_current_credentials_to_selected_base(silent=True)
+
+    def save_current_credentials_to_selected_base(self, silent=False):
+        vals = self.selected_base_values()
+
+        if not vals or vals.get("is_group"):
+            return False
+
+        idx = self.selected_base_index()
+
+        if idx < 0 or idx >= len(self.bases):
+            if not silent:
+                self._append_log("Не удалось сохранить логин/пароль: выбранная база не найдена.")
+            return False
+
+        base = self.bases[idx]
+
+        if not isinstance(base, dict):
+            return False
+
+        user = self.get_base_user_text()
+        password = self.get_base_password_text()
+
+        base["user"] = user
+        base["login"] = user
+        base["username"] = user
+
+        self.set_base_password(base, password)
+        self.save_config_safe()
+
+        if not silent:
+            self._append_log(f"Логин сохранен, пароль сохранен в системном хранилище: {base.get('name') or vals.get('name')}")
+
+        return True
+
+    def get_launch_credentials_for_selected_base(self, base):
+        base = base or {}
+
+        form_user = self.get_base_user_text()
+        form_password = self.get_base_password_text()
+
+        user = form_user or str(
+            base.get("user")
+            or base.get("username")
+            or base.get("login")
+            or ""
+        ).strip()
+
+        password = form_password or self.get_base_password(base)
+
+        return user, password
+
+    def normalize_base_dialog_response_buttons(self, dlg):
+        """Гарантирует, что OK/Отмена закрывают модальное окно.
+
+        Некоторые текущие кнопки могли быть созданы как обычные Gtk.Button,
+        без response-id. Поэтому вручную привязываем их к dlg.response().
+        """
+        def walk(widget):
+            result = []
+
+            try:
+                children = widget.get_children()
+            except Exception:
+                children = []
+
+            for child in children:
+                result.append(child)
+                result.extend(walk(child))
+
+            return result
+
+        for child in walk(dlg):
+            try:
+                if not isinstance(child, Gtk.Button):
+                    continue
+
+                label = str(child.get_label() or "").replace("_", "").strip().lower()
+
+                if label in ("ok", "ок"):
+                    child.connect("clicked", lambda *_: dlg.response(Gtk.ResponseType.OK))
+
+                if label in ("отмена", "cancel"):
+                    child.connect("clicked", lambda *_: dlg.response(Gtk.ResponseType.CANCEL))
+
+            except Exception:
+                pass
+
+        try:
+            dlg.set_default_response(Gtk.ResponseType.OK)
+        except Exception:
+            pass
+
+    def select_base_by_name_connect(self, name, connect):
+        name = str(name or "")
+        connect = str(connect or "")
+
+        def walk(parent=None):
+            child = self.base_store.iter_children(parent)
+
+            while child is not None:
+                try:
+                    row_name = str(self.base_store[child][1] or "")
+                    row_connect = str(self.base_store[child][5] or "")
+
+                    if not self.is_group_iter(child) and row_name == name and row_connect == connect:
+                        path = self.base_store.get_path(child)
+                        self.base_tree.get_selection().select_path(path)
+                        self.base_tree.scroll_to_cell(path, None, True, 0.4, 0.0)
+                        return True
+
+                    if self.base_store.iter_has_child(child):
+                        if walk(child):
+                            return True
+
+                except Exception:
+                    pass
+
+                child = self.base_store.iter_next(child)
+
+            return False
+
+        return walk(None)
+
+
+    def on_edit_base(self, *_):
+        vals = self.selected_base_values()
+
+        if not vals or vals.get("is_group"):
+            self._append_log("Для свойств выбери конкретную базу, а не группу.")
+            return
+
+        # Перед открытием свойств фиксируем текущие верхние поля в выбранной базе.
+        self.save_current_credentials_to_selected_base(silent=True)
+
+        idx = self.selected_base_index()
+
+        if idx < 0 or idx >= len(self.bases):
+            self._append_log("Не удалось открыть свойства: база не найдена.")
+            return
+
+        base = self.bases[idx]
+
+        if not isinstance(base, dict):
+            self._append_log("Не удалось открыть свойства: некорректная запись базы.")
+            return
+
+        old_name = str(base.get("name") or vals.get("name") or "")
+        old_connect = str(base.get("connect") or vals.get("connect") or "")
+
+        dlg = BaseDialog(self, "Свойства базы — Обновлятор 1C Linux", base=base)
+
+        # Явно подставляем актуальные значения из верхней формы / keyring.
+        try:
+            dlg.user.set_text(self.get_base_user_text() or str(base.get("user") or base.get("login") or ""))
+        except Exception:
+            pass
+
+        try:
+            dlg.password.set_text(self.get_base_password_text() or self.get_base_password(base))
+        except Exception:
+            pass
+
+        self.normalize_base_dialog_response_buttons(dlg)
+
+        resp = dlg.run()
+
+        if resp == Gtk.ResponseType.OK:
+            try:
+                base["name"] = dlg.name.get_text().strip()
+                base["group"] = combo_text(dlg.group) or base.get("group") or "Без группы"
+                base["kind"] = combo_text(dlg.kind) or base.get("kind") or "file"
+                base["connect"] = dlg.connect.get_text().strip()
+                base["user"] = dlg.user.get_text().strip()
+                base["login"] = base["user"]
+                base["username"] = base["user"]
+                base["platform_version"] = combo_text(dlg.platform) or base.get("platform_version") or "8.3"
+                base["launch_parameters"] = dlg.launch_params.get_text().strip()
+                base["config_name"] = dlg.config_name.get_text().strip()
+                base["config_synonym"] = dlg.config_synonym.get_text().strip()
+                base["config_version"] = dlg.config_version.get_text().strip()
+                base["update_program_name"] = dlg.update_code.get_text().strip()
+
+                if hasattr(dlg, "comment"):
+                    try:
+                        buf = dlg.comment.get_buffer()
+                        start, end = buf.get_bounds()
+                        base["comment"] = buf.get_text(start, end, True)
+                    except Exception:
+                        pass
+
+                self.set_base_password(base, dlg.password.get_text())
+                self.save_config_safe()
+
+                new_name = str(base.get("name") or old_name)
+                new_connect = str(base.get("connect") or old_connect)
+
+                dlg.destroy()
+
+                self._load_bases_tree()
+                self.select_base_by_name_connect(new_name, new_connect)
+
+                self._loading_base_credentials = True
+                try:
+                    self.base_user.set_text(str(base.get("user") or ""))
+                    self.base_password.set_text(self.get_base_password(base))
+                finally:
+                    self._loading_base_credentials = False
+
+                self._append_log(f"Свойства базы сохранены, пароль сохранен в системном хранилище: {new_name}")
+                return
+
+            except Exception as e:
+                try:
+                    dlg.destroy()
+                except Exception:
+                    pass
+                self._append_log(f"Не удалось сохранить свойства базы: {type(e).__name__}: {e}")
+                return
+
+        # Cancel/закрытие крестиком: ничего не сохраняем.
+        dlg.destroy()
+        self._append_log("Изменение свойств базы отменено.")
+
+    def build_1c_launch_args(self, mode="ENTERPRISE"):
+        import shlex
+
+        vals = self.selected_base_values()
+
+        if not vals or vals.get("is_group"):
+            raise RuntimeError("Выбрана не база, а группа или пустая строка.")
+
+        base = self.selected_base_config(vals)
+
+        name = vals.get("name") or base.get("name") or ""
+        kind = str(vals.get("kind") or base.get("kind") or "").lower()
+
+        # Для запуска берем путь/URL из строки дерева, потому после DnD индекс базы мог съехать.
+        connect = str(vals.get("connect") or base.get("connect") or "").strip()
+
+        if not connect:
+            raise RuntimeError(f"У базы '{name}' не заполнен путь / сервер / URL.")
+
+        lower_connect = connect.lower()
+        is_web = kind == "web" or lower_connect.startswith("http://") or lower_connect.startswith("https://")
+
+        if is_web:
+            exe = self.resolve_web_1c_executable(vals, base)
+        else:
+            exe = self.resolve_1c_executable(
+                vals,
+                designer=(mode.upper() == "DESIGNER"),
+                prefer_thin=(mode.upper() == "ENTERPRISE"),
+            )
+
+        if not exe:
+            raise RuntimeError("Не найден исполняемый файл 1С. Для web-базы нужен прямой 1cv8c.")
+
+        exe_name = Path(exe).name.lower()
+
+        if is_web and exe_name != "1cv8c":
+            raise RuntimeError(f"Для web-базы нужен 1cv8c, а выбран: {exe}")
+
+        args = [exe, mode.upper()]
+
+        user, password = self.get_launch_credentials_for_selected_base(base)
+
+        if is_web:
+            # Для 1С web-базы используем классический формат ключей:
+            # 1cv8c ENTERPRISE /WShttps://... /Nuser /Ppassword
+            args.append("/WS" + connect)
+
+            if user:
+                args.append("/N" + user)
+
+            if password:
+                args.append("/P" + password)
+
+        elif kind == "server" or ("\\" in connect and not connect.startswith("/")):
+            args.append("/S" + connect)
+
+            if user:
+                args.append("/N" + user)
+
+            if password:
+                args.append("/P" + password)
+
+        else:
+            args.append("/F" + connect)
+
+            if user:
+                args.append("/N" + user)
+
+            if password:
+                args.append("/P" + password)
+
+        launch_params = str(
+            base.get("launch_parameters")
+            or base.get("launch_params")
+            or ""
+        ).strip()
+
+        if launch_params:
+            try:
+                args.extend(shlex.split(launch_params))
+            except Exception:
+                args.append(launch_params)
+
+        return args
+
+
+
+    def launch_selected_base(self, mode="ENTERPRISE"):
+        import os
+        import re
+        import time
+        import subprocess
+        from pathlib import Path
+
+        vals = self.selected_base_values()
+
+        if not vals:
+            self._append_log("Не выбрана база для запуска.")
+            return
+
+        if vals.get("is_group"):
+            self._append_log("Выбрана группа. Для запуска выбери конкретную базу.")
+            return
+
+        launch_key = f"{vals.get('name') or ''}|{vals.get('connect') or ''}|{mode}"
+
+        guard = getattr(self, "_last_launch_guard", {"key": "", "time": 0.0})
+        now = time.monotonic()
+
+        if guard.get("key") == launch_key and now - float(guard.get("time") or 0) < 1.5:
+            self._append_log("Повторный запуск проигнорирован: защита от двойного события.")
+            return
+
+        self._last_launch_guard = {"key": launch_key, "time": now}
+
+        try:
+            self.save_current_credentials_to_selected_base(silent=True)
+        except Exception as e:
+            self._append_log(f"Предупреждение: не удалось сохранить логин/пароль перед запуском: {type(e).__name__}: {e}")
+
+        name = vals.get("name") or "-"
+        args = self.build_1c_launch_args(mode)
+
+        safe_args = []
+        user_filled = False
+        password_filled = False
+
+        for arg in args:
+            s = str(arg)
+
+            if s.startswith("/N") and len(s) > 2:
+                user_filled = True
+
+            if s.startswith("/P") and len(s) > 2:
+                password_filled = True
+                s = "/P***"
+
+            if "Pwd=" in s:
+                password_filled = True
+                s = re.sub(r'Pwd="[^"]*"', 'Pwd="***"', s)
+
+            safe_args.append(s)
+
+        try:
+            env = self.onec_launch_env()
+        except Exception:
+            env = os.environ.copy()
+
+        command_text = " ".join(str(x) for x in safe_args)
+
+        self._append_log("")
+        self._append_log(f"=== Запуск 1С: {name} ===")
+        self._append_log("Команда: " + command_text)
+        self._append_log(f"Пользователь передан: {'да' if user_filled else 'нет'}; пароль передан: {'да' if password_filled else 'нет'}")
+
+        if env.get("LD_PRELOAD"):
+            self._append_log("LD_PRELOAD: " + env.get("LD_PRELOAD", ""))
+
+        try:
+            Path("/tmp/updater1c_last_launch_command.txt").write_text(
+                "SAFE_COMMAND=" + command_text + "\\n"
+                + "ARGS_REPR=" + repr(args) + "\\n"
+                + "USER_FILLED=" + str(user_filled) + "\\n"
+                + "PASSWORD_FILLED=" + str(password_filled) + "\\n"
+                + "LD_PRELOAD=" + str(env.get("LD_PRELOAD", "")) + "\\n",
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+
+        subprocess.Popen(args, close_fds=True, env=env)
+        self._append_log("Процесс 1С запущен.")
+
+    def on_run_base_stub(self, *_):
+        try:
+            self.launch_selected_base("ENTERPRISE")
+        except Exception as e:
+            self._append_log(f"Не удалось запустить базу: {type(e).__name__}: {e}")
+
 
     def on_designer_base_stub(self, *_):
-        vals = self.selected_base_values()
-        name = vals.get("name") if vals else "-"
-        self._append_log(f"GTK preview: запуск конфигуратора будет подключен позже. База: {name}")
+        try:
+            self.launch_selected_base("DESIGNER")
+        except Exception as e:
+            self._append_log(f"Не удалось запустить конфигуратор: {type(e).__name__}: {e}")
 
     def on_delete_selected_base_stub(self, *_):
         tree_iter = self.selected_base_iter()
@@ -4163,8 +5470,9 @@ class MainWindow(Gtk.Window):
 
         if response == Gtk.ResponseType.OK:
             self.base_store.remove(tree_iter)
+            self.save_bases_order_from_tree()
             self.update_bases_status()
-            self._append_log(f"Удалено из списка GTK-preview: {name}")
+            self._append_log(f"Удалено из списка: {name}")
 
 
     def _build_settings_tab(self):
@@ -4782,38 +6090,6 @@ class MainWindow(Gtk.Window):
             self._append_log(f"База добавлена: {new_base.get('name', '')}")
         dlg.destroy()
 
-    def on_edit_base(self, *_):
-        vals = self.selected_base_values()
-        if not vals or vals.get("is_group"):
-            self.require_current_base_dict()
-            return
-
-        idx = vals.get("index", -1)
-        base = vals.get("base") or self.current_base_dict() or {}
-
-        dlg = BaseDialog(
-            self,
-            "Свойства базы — Обновлятор 1C Linux",
-            base=base,
-            groups=known_groups_from_bases(self.bases),
-            settings=self.settings,
-        )
-        response = dlg.run()
-        if response == Gtk.ResponseType.OK:
-            new_base = dlg.get_data()
-
-            if 0 <= idx < len(self.bases):
-                self.bases[idx] = new_base
-            else:
-                self.bases.append(new_base)
-
-            self.config["bases"] = self.bases
-            save_json(self.config_path, self.config)
-
-            self._load_bases_tree()
-            self._append_log(f"Свойства базы сохранены: {new_base.get('name', '')}")
-
-        dlg.destroy()
 
     def on_auto_update(self, *_):
         dlg = AutoUpdateDialog(self)

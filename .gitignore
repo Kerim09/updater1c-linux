@@ -1,23 +1,44 @@
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
 *.pyo
-*.bak*
-*.log
-*.tmp
-*.tar.gz
-*.zip
-*.7z
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual envs
+.venv/
+.venv*/
+venv/
+
+# Build artifacts
 dist/
 build/
-.cache/
-.env
-legacy/broken-main-py-20260521/
-.venv/
-reports/
-legacy/broken-main-py-*/
+releases/
+release/
+*.run
+*.tar.gz
+*.tgz
+*.zip
+*.rar
+*.7z
+*.deb
+*.rpm
+*.sha256
 
 # Local backups/checkpoints
-backups/
 checkpoints/
-dist/
-*.before-*
+backups/
+legacy/
+_patch_backups/
+*_CLEANUP_*/
+*_CLEANUP_*.tar.gz
+*.backup*
+*.bak
+*.old
+*.tmp
+*.part
+
+# Logs
+*.log

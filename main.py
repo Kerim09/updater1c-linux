@@ -3389,8 +3389,10 @@ class OneCReleasesPlatformClient:
             return self.BASE_URL + url
         return self.BASE_URL + '/' + url
 
+
     def _auth_ticket_url(self, service_url: str) -> str:
         import json
+        from urllib.parse import quote
 
         self._require_credentials()
 
@@ -3424,7 +3426,16 @@ class OneCReleasesPlatformClient:
         if not ticket:
             raise RuntimeError(f'login.1c.ru не вернул ticket: {data}')
 
-        return self.LOGIN_URL + '/ticket/auth?token=' + ticket
+        # Важно:
+        # одного token недостаточно — login.1c.ru может оставить нас на странице ticket/auth
+        # или вернуть обратно на login. Поэтому явно передаем service.
+        return (
+            self.LOGIN_URL
+            + '/ticket/auth?token='
+            + quote(ticket, safe='')
+            + '&service='
+            + quote(service_url, safe='')
+        )
 
 
     def _login_by_ticket(self, service_url: str):
@@ -3440,21 +3451,31 @@ class OneCReleasesPlatformClient:
         if rr.status_code >= 400:
             raise RuntimeError(
                 f'Не удалось применить ticket: HTTP {rr.status_code}\n'
+                f'URL: {ticket_url}\n'
                 f'{rr.text[:1500]}'
             )
 
         self._authenticated = True
 
-        # Важное отличие: после ticket/auth явно активируем releases security_check.
-        # Иначе releases.1c.ru может снова вернуть страницу login с HTTP 200.
-        if service_url.startswith(self.BASE_URL):
+        # После ticket/auth явно открываем сам service_url.
+        try:
+            self.session.get(
+                service_url if service_url.startswith('http') else self.BASE_URL,
+                auth=(self.login, self.password),
+                timeout=120,
+                allow_redirects=True,
+            )
+        except Exception:
+            pass
+
+        # И отдельно security_check releases.
+        if str(service_url).startswith(self.BASE_URL) or 'releases.1c.ru' in str(service_url):
             try:
                 self._activate_releases_service(self.BASE_URL + '/public/security_check')
             except Exception:
                 pass
 
         return rr
-
 
     def _activate_releases_service(self, service_url: str = ''):
         """
@@ -3487,6 +3508,7 @@ class OneCReleasesPlatformClient:
     def _ticket_url_for_service(self, service_url: str) -> str:
         return self._auth_ticket_url(service_url)
 
+
     def _try_ticket_login(self, service_url: str, use_basic_on_auth: bool = True) -> str:
         ticket_url = self._ticket_url_for_service(service_url)
 
@@ -3505,12 +3527,23 @@ class OneCReleasesPlatformClient:
             )
 
         if rr.status_code >= 400:
-            return f'{service_url}: ticket/auth HTTP {rr.status_code}'
+            return f'{service_url}: ticket/auth HTTP {rr.status_code}; final={rr.url}'
 
-        return f'{service_url}: auth_final={rr.url}'
+        # После ticket/auth сразу дергаем целевой service_url, чтобы выставились cookie.
+        try:
+            target = service_url if str(service_url).startswith('http') else self.BASE_URL
+            probe = self.session.get(
+                target,
+                auth=(self.login, self.password),
+                timeout=120,
+                allow_redirects=True,
+            )
+            return f'{service_url}: auth_final={rr.url}; target_final={probe.url}; target_http={probe.status_code}; target_len={len(probe.text or "")}'
+        except Exception as e:
+            return f'{service_url}: auth_final={rr.url}; target_error={type(e).__name__}: {e}'
 
     def _probe_releases_access(self) -> tuple:
-        test_url = self.BASE_URL + '/project/Platform83'
+        test_url = self.BASE_URL + '/project/' + self.PROJECT_NICK
 
         r = self.session.get(
             test_url,
@@ -3526,60 +3559,142 @@ class OneCReleasesPlatformClient:
             and (
                 'version_files' in text.lower()
                 or 'platform83' in text.lower()
-                or re.search(r'8\\.3\\.\\d+\\.\\d+', text)
-                or re.search(r'8\\.5\\.\\d+\\.\\d+', text)
+                or re.search(r'8\.3\.\d+\.\d+', text)
+                or re.search(r'8\.5\.\d+\.\d+', text)
             )
         )
 
         return ok, r.url, len(text), text[:500]
 
+
+
+
     def _ensure_auth(self):
         if self._authenticated:
             return
 
+        import json
+        from urllib.parse import quote
+
         self._require_credentials()
 
         attempts = []
+        short_timeout = 12
 
-        service_candidates = [
-            self.BASE_URL,
-            self.BASE_URL + '/',
-            self.BASE_URL + '/public/security_check',
-            'releases.1c.ru',
-            'releases.1c.ru/public/security_check',
+        # Минимальная матрица. Полная матрица подвешивает проверку.
+        combos = [
+            ('releases.1c.ru', self.BASE_URL + '/public/security_check', False),
+            ('releases.1c.ru', self.BASE_URL + '/project/' + self.PROJECT_NICK, False),
+            ('https://releases.1c.ru', self.BASE_URL + '/public/security_check', False),
+            ('https://releases.1c.ru/public/security_check', self.BASE_URL + '/public/security_check', False),
         ]
 
-        for service in service_candidates:
-            for use_basic in [True, False]:
-                try:
-                    msg = self._try_ticket_login(service, use_basic_on_auth=use_basic)
-                    attempts.append(f'{msg}; basic_on_auth={use_basic}')
+        def write_debug():
+            try:
+                APP_DIR.mkdir(parents=True, exist_ok=True)
+                (APP_DIR / 'platform_auth_debug.json').write_text(
+                    json.dumps({'attempts': attempts}, ensure_ascii=False, indent=2),
+                    encoding='utf-8'
+                )
+            except Exception:
+                pass
 
-                    ok, final_url, length, head = self._probe_releases_access()
-                    attempts.append(f'probe: ok={ok}; final_url={final_url}; len={length}')
+        def get_ticket(service_nick: str) -> str:
+            payload = {
+                'login': self.login,
+                'password': self.password,
+                'serviceNick': service_nick,
+            }
 
-                    if ok:
-                        self._authenticated = True
-                        return
-
-                except Exception as e:
-                    attempts.append(f'{service}; basic_on_auth={use_basic}; error={e}')
-
-        try:
-            APP_DIR.mkdir(parents=True, exist_ok=True)
-            (APP_DIR / 'platform_auth_debug.json').write_text(
-                json.dumps({'attempts': attempts}, ensure_ascii=False, indent=2),
-                encoding='utf-8'
+            r = self.session.post(
+                self.LOGIN_URL + '/rest/public/ticket/get',
+                auth=(self.login, self.password),
+                headers={'Content-Type': 'application/json'},
+                data=json.dumps(payload, ensure_ascii=False).encode('utf-8'),
+                timeout=short_timeout,
+                allow_redirects=True,
             )
-        except Exception:
-            pass
+
+            if r.status_code != 200:
+                raise RuntimeError(f'ticket/get HTTP {r.status_code}: {r.text[:500]}')
+
+            data = r.json()
+            ticket = data.get('ticket') or data.get('Ticket')
+            if not ticket:
+                raise RuntimeError(f'ticket/get no ticket: {data}')
+
+            return ticket
+
+        def project_probe(label: str) -> bool:
+            url = self.BASE_URL + '/project/' + self.PROJECT_NICK
+
+            r = self.session.get(
+                url,
+                auth=(self.login, self.password),
+                timeout=short_timeout,
+                allow_redirects=True,
+            )
+
+            body = r.text or ''
+            low = body.lower()
+
+            ok = (
+                r.status_code == 200
+                and not self._response_is_login_page(r, body)
+                and (
+                    'version_files' in low
+                    or self.PROJECT_NICK.lower() in low
+                    or re.search(r'8\.\d+\.\d+\.\d+', body)
+                )
+            )
+
+            attempts.append(
+                f'{label}; probe {self.PROJECT_NICK}: ok={ok}; http={r.status_code}; '
+                f'final={r.url}; len={len(body)}; head={body[:180].replace(chr(10), " ")}'
+            )
+            write_debug()
+
+            return ok
+
+        for service_nick, redirect_to, use_basic in combos:
+            label = f'serviceNick={service_nick}; redirect={redirect_to}; basic={use_basic}'
+
+            try:
+                ticket = get_ticket(service_nick)
+
+                auth_url = (
+                    self.LOGIN_URL
+                    + '/ticket/auth?token='
+                    + quote(ticket, safe='')
+                    + '&service='
+                    + quote(redirect_to, safe='')
+                )
+
+                rr = self.session.get(
+                    auth_url,
+                    auth=(self.login, self.password) if use_basic else None,
+                    timeout=short_timeout,
+                    allow_redirects=True,
+                )
+
+                attempts.append(
+                    f'{label}; auth_http={rr.status_code}; auth_final={rr.url}; auth_len={len(rr.text or "")}'
+                )
+                write_debug()
+
+                if project_probe(label):
+                    self._authenticated = True
+                    return
+
+            except Exception as e:
+                attempts.append(f'{label}; error={type(e).__name__}: {e}')
+                write_debug()
 
         raise RuntimeError(
-            'Не удалось авторизоваться на releases.1c.ru через ticket login.\\n'
-            'Все варианты ticket вернули страницу login или не дали доступ к проекту Platform83.\\n\\n'
+            'Не удалось авторизоваться на releases.1c.ru через ticket login.\n'
+            'Ticket получается, но cookie releases.1c.ru не активируется.\n\n'
             'Диагностика сохранена: ' + str(APP_DIR / 'platform_auth_debug.json')
         )
-
 
     def _get(self, url: str, stream: bool = False):
         self._ensure_auth()
@@ -3684,7 +3799,7 @@ class OneCReleasesPlatformClient:
         errors = []
 
         for url in [
-            '/project/Platform83',
+            '/project/' + self.PROJECT_NICK,
             '/project/platform83',
             '/total',
         ]:
