@@ -25,7 +25,7 @@ from gi.repository import Gtk, Gdk, GLib
 
 
 APP_NAME = "Обновлятор 1C Linux"
-APP_VERSION = "1.2"
+APP_VERSION = "1.2.1"
 CONFIG_DIR = Path.home() / ".config" / "updater1c-linux"
 
 DEFAULT_1CESTART = "/opt/1cv8/common/1cestart"
@@ -5190,6 +5190,9 @@ class MainWindow(Gtk.Window):
 
         dlg = BaseDialog(self, "Свойства базы — Обновлятор 1C Linux", base=base)
 
+        self.configure_base_dialog_type_fields(dlg, base)
+        self.configure_base_dialog_group_picker(dlg, base)
+
         # Явно подставляем актуальные значения из верхней формы / keyring.
         try:
             dlg.user.set_text(self.get_base_user_text() or str(base.get("user") or base.get("login") or ""))
@@ -5208,9 +5211,27 @@ class MainWindow(Gtk.Window):
         if resp == Gtk.ResponseType.OK:
             try:
                 base["name"] = dlg.name.get_text().strip()
-                base["group"] = combo_text(dlg.group) or base.get("group") or "Без группы"
+                base["group"] = self.base_dialog_group_value(dlg) or "Без группы"
                 base["kind"] = combo_text(dlg.kind) or base.get("kind") or "file"
-                base["connect"] = dlg.connect.get_text().strip()
+                base["connect"] = self.base_dialog_connect_value(dlg)
+                if self.base_dialog_kind_text(dlg) == "server":
+                    try:
+                        base["server_name"] = str(dlg.server_name.get_text() or "").strip()
+                        base["db_name"] = str(dlg.db_name.get_text() or "").strip()
+                    except Exception:
+                        pass
+                else:
+                    base.pop("server_name", None)
+                    base.pop("db_name", None)
+                if self.base_dialog_kind_text(dlg) == "server":
+                    try:
+                        base["server_name"] = str(dlg.server_name.get_text() or "").strip()
+                        base["db_name"] = str(dlg.db_name.get_text() or "").strip()
+                    except Exception:
+                        pass
+                else:
+                    base.pop("server_name", None)
+                    base.pop("db_name", None)
                 base["user"] = dlg.user.get_text().strip()
                 base["login"] = base["user"]
                 base["username"] = base["user"]
@@ -5261,6 +5282,711 @@ class MainWindow(Gtk.Window):
         # Cancel/закрытие крестиком: ничего не сохраняем.
         dlg.destroy()
         self._append_log("Изменение свойств базы отменено.")
+
+    def parse_server_connect(self, connect):
+        connect = str(connect or "").strip()
+
+        if "\\" in connect:
+            srv, db = connect.split("\\", 1)
+            return srv.strip(), db.strip()
+
+        if "/" in connect and not connect.lower().startswith(("http://", "https://")):
+            srv, db = connect.split("/", 1)
+            return srv.strip(), db.strip()
+
+        return connect, ""
+
+    def base_dialog_kind_text(self, dlg):
+        """Надежно читает текущий тип базы из Gtk.ComboBox/ComboBoxText."""
+        try:
+            value = dlg.kind.get_active_text()
+            if value:
+                return str(value).strip().lower()
+        except Exception:
+            pass
+
+        try:
+            model = dlg.kind.get_model()
+            active_iter = dlg.kind.get_active_iter()
+
+            if model is not None and active_iter is not None:
+                row = model[active_iter]
+                for value in row:
+                    if value:
+                        return str(value).strip().lower()
+        except Exception:
+            pass
+
+        try:
+            active = dlg.kind.get_active()
+            model = dlg.kind.get_model()
+
+            if model is not None and active >= 0:
+                row = model[active]
+                for value in row:
+                    if value:
+                        return str(value).strip().lower()
+        except Exception:
+            pass
+
+        try:
+            return str(combo_text(dlg.kind) or "").strip().lower()
+        except Exception:
+            return ""
+
+    def find_widget_label_for_entry(self, entry):
+        """Ищет подпись именно для поля connect.
+
+        В текущей форме это ближайший Gtk.Label перед строкой с полем connect.
+        """
+        try:
+            toplevel = entry.get_toplevel()
+        except Exception:
+            return None
+
+        labels = []
+
+        def walk(widget):
+            try:
+                children = widget.get_children()
+            except Exception:
+                return
+
+            for child in children:
+                try:
+                    if isinstance(child, Gtk.Label):
+                        txt = str(child.get_text() or "")
+                        if (
+                            "Путь" in txt
+                            or "server" in txt
+                            or "URL" in txt
+                            or "base" in txt
+                            or "1Cv8" in txt
+                        ):
+                            labels.append(child)
+                except Exception:
+                    pass
+
+                walk(child)
+
+        walk(toplevel)
+
+        # Обычно нужная подпись первая из найденных среди "Путь / server / URL".
+        return labels[0] if labels else None
+
+    def find_button_near_entry(self, entry):
+        """Ищет кнопку ... в той же строке, где поле connect."""
+        try:
+            parent = entry.get_parent()
+        except Exception:
+            parent = None
+
+        if parent is None:
+            return None
+
+        buttons = []
+
+        def walk(widget):
+            try:
+                children = widget.get_children()
+            except Exception:
+                return
+
+            for child in children:
+                try:
+                    if isinstance(child, Gtk.Button) and str(child.get_label() or "").strip() == "...":
+                        buttons.append(child)
+                except Exception:
+                    pass
+
+                walk(child)
+
+        walk(parent)
+        return buttons[0] if buttons else None
+
+
+    def hide_base_dialog_template_row(self, dlg):
+        """Скрывает строку 'Шаблон 1С (.dt/.cf/папка)' вместе с полем и кнопкой."""
+        hidden = set()
+
+        def hide_widget(w):
+            try:
+                w.hide()
+                hidden.add(w)
+            except Exception:
+                pass
+
+        def walk(widget):
+            result = []
+            try:
+                children = widget.get_children()
+            except Exception:
+                return result
+
+            for child in children:
+                result.append(child)
+                result.extend(walk(child))
+
+            return result
+
+        try:
+            toplevel = dlg.get_toplevel()
+        except Exception:
+            toplevel = dlg
+
+        widgets = walk(toplevel)
+
+        template_labels = []
+        for w in widgets:
+            try:
+                if isinstance(w, Gtk.Label):
+                    label_text = str(w.get_text() or "")
+                    if "Шаблон 1С" in label_text or ".dt/.cf" in label_text:
+                        template_labels.append(w)
+            except Exception:
+                pass
+
+        for label in template_labels:
+            hide_widget(label)
+
+            # Если это Gtk.Grid, скрываем все элементы той же строки.
+            try:
+                parent = label.get_parent()
+                if isinstance(parent, Gtk.Grid):
+                    top = parent.child_get_property(label, "top-attach")
+                    for child in parent.get_children():
+                        try:
+                            if parent.child_get_property(child, "top-attach") == top:
+                                hide_widget(child)
+                        except Exception:
+                            pass
+                    continue
+            except Exception:
+                pass
+
+            # Fallback: скрываем ближайшие поля/кнопки после label в общем списке.
+            try:
+                idx = widgets.index(label)
+                for child in widgets[idx + 1: idx + 5]:
+                    if isinstance(child, (Gtk.Entry, Gtk.Button, Gtk.Box)):
+                        hide_widget(child)
+            except Exception:
+                pass
+
+        # Дополнительный fallback по известным возможным именам атрибутов.
+        for attr in (
+            "template",
+            "template_path",
+            "template_entry",
+            "template_file",
+            "cf_template",
+            "dt_template",
+            "template_button",
+        ):
+            try:
+                w = getattr(dlg, attr, None)
+                if w is not None:
+                    hide_widget(w)
+            except Exception:
+                pass
+
+    def base_dialog_save_current_type_value(self, dlg):
+        kind = self.base_dialog_kind_text(dlg)
+
+        if not hasattr(dlg, "_u1c_kind_values"):
+            dlg._u1c_kind_values = {}
+
+        if kind == "server":
+            try:
+                srv = str(dlg.server_name.get_text() or "").strip()
+            except Exception:
+                srv = ""
+
+            try:
+                db = str(dlg.db_name.get_text() or "").strip()
+            except Exception:
+                db = ""
+
+            dlg._u1c_kind_values["server"] = {"srv": srv, "db": db}
+
+        elif kind in ("file", "web"):
+            try:
+                value = str(dlg.connect.get_text() or "").strip()
+            except Exception:
+                value = ""
+
+            dlg._u1c_kind_values[kind] = value
+
+    def base_dialog_restore_type_value(self, dlg, kind):
+        kind = str(kind or "").strip().lower()
+
+        if not hasattr(dlg, "_u1c_kind_values"):
+            dlg._u1c_kind_values = {}
+
+        if kind == "server":
+            value = dlg._u1c_kind_values.get("server") or {}
+
+            try:
+                dlg.server_name.set_text(str(value.get("srv") or ""))
+                dlg.db_name.set_text(str(value.get("db") or ""))
+            except Exception:
+                pass
+
+        elif kind in ("file", "web"):
+            value = dlg._u1c_kind_values.get(kind)
+
+            if value is None:
+                value = ""
+
+            try:
+                dlg.connect.set_text(str(value or ""))
+            except Exception:
+                pass
+
+    def configure_base_dialog_type_fields(self, dlg, base=None):
+        """Настраивает поле подключения в свойствах базы под file/server/web.
+
+        При переключении типа не переносим старый путь/URL в другой тип.
+        Значение каждого типа хранится отдельно в рамках открытого окна.
+        """
+        base = base or {}
+
+        if getattr(dlg, "_u1c_type_fields_configured", False):
+            self.hide_base_dialog_template_row(dlg)
+            self.apply_base_dialog_type_visibility(dlg)
+            return
+
+        dlg._u1c_type_fields_configured = True
+
+        original_kind = self.base_dialog_kind_text(dlg) or str(base.get("kind") or "file").strip().lower()
+        original_connect = str(base.get("connect") or dlg.connect.get_text() or "").strip()
+
+        dlg._u1c_original_kind = original_kind
+        dlg._u1c_current_kind = original_kind
+        dlg._u1c_kind_values = {
+            "file": "",
+            "web": "",
+            "server": {"srv": "", "db": ""},
+        }
+
+        if original_kind == "server":
+            srv_value, db_value = self.parse_server_connect(original_connect)
+            dlg._u1c_kind_values["server"] = {
+                "srv": srv_value,
+                "db": db_value,
+            }
+            # connect для server скрывается, поэтому очищаем его, чтобы он не светился при web.
+            try:
+                dlg.connect.set_text("")
+            except Exception:
+                pass
+
+        elif original_kind == "web":
+            dlg._u1c_kind_values["web"] = original_connect
+
+        else:
+            dlg._u1c_kind_values["file"] = original_connect
+
+        dlg._u1c_connect_label = self.find_widget_label_for_entry(dlg.connect)
+        dlg._u1c_connect_browse_button = self.find_button_near_entry(dlg.connect)
+
+        try:
+            connect_parent = dlg.connect.get_parent()
+        except Exception:
+            connect_parent = None
+
+        dlg.server_name = Gtk.Entry()
+        dlg.server_name.set_placeholder_text("srvname")
+
+        dlg.db_name = Gtk.Entry()
+        dlg.db_name.set_placeholder_text("dbname")
+
+        if connect_parent is not None:
+            try:
+                connect_parent.pack_start(dlg.server_name, True, True, 0)
+                connect_parent.pack_start(dlg.db_name, True, True, 0)
+            except Exception:
+                try:
+                    connect_parent.add(dlg.server_name)
+                    connect_parent.add(dlg.db_name)
+                except Exception:
+                    pass
+
+        try:
+            dlg.server_name.show()
+            dlg.db_name.show()
+        except Exception:
+            pass
+
+        # Восстанавливаем значение именно для текущего исходного типа.
+        self.base_dialog_restore_type_value(dlg, original_kind)
+
+        try:
+            dlg.kind.connect("changed", lambda *_: self.on_base_dialog_kind_changed(dlg))
+        except Exception:
+            pass
+
+        self.hide_base_dialog_template_row(dlg)
+        self.apply_base_dialog_type_visibility(dlg)
+
+    def on_base_dialog_kind_changed(self, dlg):
+        old_kind = str(getattr(dlg, "_u1c_current_kind", "") or "").strip().lower()
+        new_kind = self.base_dialog_kind_text(dlg)
+
+        if old_kind and old_kind != new_kind:
+            # Сначала сохраняем значение старого типа.
+            try:
+                dlg._u1c_current_kind = old_kind
+                self.base_dialog_save_current_type_value(dlg)
+            except Exception:
+                pass
+
+        dlg._u1c_current_kind = new_kind
+
+        # Потом восстанавливаем значение нового типа.
+        # Если в этом типе пользователь еще ничего не вводил, поле будет пустым.
+        self.base_dialog_restore_type_value(dlg, new_kind)
+
+        self.hide_base_dialog_template_row(dlg)
+        self.apply_base_dialog_type_visibility(dlg)
+
+    def apply_base_dialog_type_visibility(self, dlg):
+        kind = self.base_dialog_kind_text(dlg)
+
+        label = getattr(dlg, "_u1c_connect_label", None)
+        browse = getattr(dlg, "_u1c_connect_browse_button", None)
+
+        if kind == "server":
+            if label is not None:
+                try:
+                    label.set_text("srvname / dbname:")
+                except Exception:
+                    pass
+
+            try:
+                dlg.connect.hide()
+            except Exception:
+                pass
+
+            try:
+                dlg.server_name.show()
+                dlg.db_name.show()
+            except Exception:
+                pass
+
+            if browse is not None:
+                try:
+                    browse.hide()
+                except Exception:
+                    pass
+
+        elif kind == "web":
+            if label is not None:
+                try:
+                    label.set_text("URL web-базы:")
+                except Exception:
+                    pass
+
+            try:
+                dlg.connect.show()
+            except Exception:
+                pass
+
+            try:
+                dlg.server_name.hide()
+                dlg.db_name.hide()
+            except Exception:
+                pass
+
+            if browse is not None:
+                try:
+                    browse.hide()
+                except Exception:
+                    pass
+
+        else:
+            if label is not None:
+                try:
+                    label.set_text("Путь к папке с 1Cv8.1CD:")
+                except Exception:
+                    pass
+
+            try:
+                dlg.connect.show()
+            except Exception:
+                pass
+
+            try:
+                dlg.server_name.hide()
+                dlg.db_name.hide()
+            except Exception:
+                pass
+
+            if browse is not None:
+                try:
+                    browse.show()
+                except Exception:
+                    pass
+
+    def base_dialog_connect_value(self, dlg):
+        # Перед сохранением фиксируем текущее значение активного типа.
+        self.base_dialog_save_current_type_value(dlg)
+
+        kind = self.base_dialog_kind_text(dlg)
+
+        if kind == "server":
+            value = dlg._u1c_kind_values.get("server") or {}
+
+            srv = str(value.get("srv") or "").strip()
+            db = str(value.get("db") or "").strip()
+
+            if srv and db:
+                return f"{srv}\\{db}"
+
+            return srv or db
+
+        if kind == "web":
+            return str(dlg._u1c_kind_values.get("web") or "").strip()
+
+        return str(dlg._u1c_kind_values.get("file") or "").strip()
+
+
+    def available_base_groups(self, current_group=""):
+        groups = set()
+
+        current_group = str(current_group or "").strip()
+        if current_group:
+            groups.add(current_group)
+
+        for base in self.bases or []:
+            if not isinstance(base, dict):
+                continue
+
+            name = str(base.get("name") or "").strip()
+            group = str(base.get("group") or "").strip()
+
+            is_group = bool(
+                base.get("is_group")
+                or base.get("group_placeholder")
+                or base.get("kind") == "group"
+                or base.get("type") == "group"
+            )
+
+            if is_group and name:
+                groups.add(name)
+
+            if group:
+                groups.add(group)
+
+        try:
+            child = self.base_store.iter_children(None)
+            while child is not None:
+                try:
+                    if self.is_group_iter(child):
+                        group_name = str(self.base_store[child][1] or "").strip()
+                        if group_name:
+                            groups.add(group_name)
+                except Exception:
+                    pass
+
+                child = self.base_store.iter_next(child)
+        except Exception:
+            pass
+
+        groups.discard("")
+        groups.discard("-")
+
+        result = sorted(groups, key=lambda x: x.lower())
+
+        if "Без группы" in result:
+            result.remove("Без группы")
+
+        result.insert(0, "Без группы")
+        return result
+
+    def base_dialog_group_value(self, dlg):
+        try:
+            value = str(getattr(dlg, "_u1c_group_value", "") or "").strip()
+            if value:
+                return value
+        except Exception:
+            pass
+
+        try:
+            if hasattr(dlg, "group_entry"):
+                value = str(dlg.group_entry.get_text() or "").strip()
+                if value:
+                    return value
+        except Exception:
+            pass
+
+        try:
+            value = str(combo_text(dlg.group) or "").strip()
+            if value:
+                return value
+        except Exception:
+            pass
+
+        return "Без группы"
+
+    def set_base_dialog_group_value(self, dlg, value):
+        value = str(value or "").strip() or "Без группы"
+        dlg._u1c_group_value = value
+
+        try:
+            if hasattr(dlg, "group_entry"):
+                dlg.group_entry.set_text(value)
+        except Exception:
+            pass
+
+    def choose_base_group_dialog(self, dlg):
+        current = self.base_dialog_group_value(dlg)
+        groups = self.available_base_groups(current)
+
+        dialog = Gtk.Dialog(
+            title="Выбор группы",
+            transient_for=dlg,
+            flags=Gtk.DialogFlags.MODAL,
+        )
+
+        dialog.add_button("Отмена", Gtk.ResponseType.CANCEL)
+        dialog.add_button("OK", Gtk.ResponseType.OK)
+        dialog.set_default_size(420, 420)
+
+        box = dialog.get_content_area()
+        box.set_spacing(8)
+        box.set_border_width(10)
+
+        info = Gtk.Label(label="Выберите группу для базы:")
+        info.set_xalign(0)
+        box.pack_start(info, False, False, 0)
+
+        scroller = Gtk.ScrolledWindow()
+        scroller.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        scroller.set_min_content_height(260)
+
+        listbox = Gtk.ListBox()
+        listbox.set_selection_mode(Gtk.SelectionMode.SINGLE)
+
+        selected_row = None
+
+        for group_name in groups:
+            row = Gtk.ListBoxRow()
+            label = Gtk.Label(label=group_name)
+            label.set_xalign(0)
+            label.set_margin_top(6)
+            label.set_margin_bottom(6)
+            label.set_margin_start(8)
+            label.set_margin_end(8)
+            row.add(label)
+            row._u1c_group_name = group_name
+            listbox.add(row)
+
+            if group_name == current:
+                selected_row = row
+
+        scroller.add(listbox)
+        box.pack_start(scroller, True, True, 0)
+
+        new_label = Gtk.Label(label="Или введите новую группу:")
+        new_label.set_xalign(0)
+        box.pack_start(new_label, False, False, 0)
+
+        new_entry = Gtk.Entry()
+        new_entry.set_placeholder_text("Новая группа")
+        box.pack_start(new_entry, False, False, 0)
+
+        listbox.connect("row-activated", lambda *_: dialog.response(Gtk.ResponseType.OK))
+
+        dialog.show_all()
+
+        if selected_row is not None:
+            try:
+                listbox.select_row(selected_row)
+            except Exception:
+                pass
+
+        resp = dialog.run()
+
+        if resp == Gtk.ResponseType.OK:
+            typed = str(new_entry.get_text() or "").strip()
+
+            if typed:
+                value = typed
+            else:
+                row = listbox.get_selected_row()
+                value = str(getattr(row, "_u1c_group_name", "") or "").strip() if row is not None else ""
+
+            if value:
+                self.set_base_dialog_group_value(dlg, value)
+
+        dialog.destroy()
+
+    def configure_base_dialog_group_picker(self, dlg, base=None):
+        """Заменяет группу на поле + кнопку ... без изменения on_add_base."""
+        base = base or {}
+
+        if getattr(dlg, "_u1c_group_picker_configured", False):
+            return
+
+        dlg._u1c_group_picker_configured = True
+
+        current_group = str(
+            base.get("group")
+            or self.base_dialog_group_value(dlg)
+            or "Без группы"
+        ).strip() or "Без группы"
+
+        dlg._u1c_group_value = current_group
+
+        dlg.group_entry = Gtk.Entry()
+        dlg.group_entry.set_text(current_group)
+        dlg.group_entry.set_editable(False)
+
+        dlg.group_button = Gtk.Button(label="...")
+        dlg.group_button.set_tooltip_text("Выбрать группу")
+        dlg.group_button.connect("clicked", lambda *_: self.choose_base_group_dialog(dlg))
+
+        picker_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        picker_box.pack_start(dlg.group_entry, True, True, 0)
+        picker_box.pack_start(dlg.group_button, False, False, 0)
+
+        try:
+            parent = dlg.group.get_parent()
+        except Exception:
+            parent = None
+
+        if parent is None:
+            return
+
+        try:
+            if isinstance(parent, Gtk.Grid):
+                left = parent.child_get_property(dlg.group, "left-attach")
+                top = parent.child_get_property(dlg.group, "top-attach")
+                width = parent.child_get_property(dlg.group, "width")
+                height = parent.child_get_property(dlg.group, "height")
+
+                parent.remove(dlg.group)
+                parent.attach(picker_box, left, top, width, height)
+
+            elif isinstance(parent, Gtk.Box):
+                parent.pack_start(picker_box, True, True, 0)
+                parent.reorder_child(picker_box, 0)
+                dlg.group.hide()
+
+            else:
+                dlg.group.hide()
+                parent.add(picker_box)
+
+            picker_box.show_all()
+
+        except Exception:
+            try:
+                dlg.group.hide()
+                parent.add(picker_box)
+                picker_box.show_all()
+            except Exception:
+                pass
 
     def build_1c_launch_args(self, mode="ENTERPRISE"):
         import shlex
