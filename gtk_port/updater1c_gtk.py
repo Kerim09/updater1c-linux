@@ -3934,7 +3934,6 @@ class MainWindow(Gtk.Window):
         self._loading_bases_tree = False
         self.update_bases_status()
 
-
     def is_group_iter(self, tree_iter):
         if tree_iter is None:
             return False
@@ -5131,37 +5130,6 @@ class MainWindow(Gtk.Window):
         except Exception:
             pass
 
-    def select_base_by_name_connect(self, name, connect):
-        name = str(name or "")
-        connect = str(connect or "")
-
-        def walk(parent=None):
-            child = self.base_store.iter_children(parent)
-
-            while child is not None:
-                try:
-                    row_name = str(self.base_store[child][1] or "")
-                    row_connect = str(self.base_store[child][5] or "")
-
-                    if not self.is_group_iter(child) and row_name == name and row_connect == connect:
-                        path = self.base_store.get_path(child)
-                        self.base_tree.get_selection().select_path(path)
-                        self.base_tree.scroll_to_cell(path, None, True, 0.4, 0.0)
-                        return True
-
-                    if self.base_store.iter_has_child(child):
-                        if walk(child):
-                            return True
-
-                except Exception:
-                    pass
-
-                child = self.base_store.iter_next(child)
-
-            return False
-
-        return walk(None)
-
 
     def on_edit_base(self, *_):
         vals = self.selected_base_values()
@@ -5170,7 +5138,6 @@ class MainWindow(Gtk.Window):
             self._append_log("Для свойств выбери конкретную базу, а не группу.")
             return
 
-        # Перед открытием свойств фиксируем текущие верхние поля в выбранной базе.
         self.save_current_credentials_to_selected_base(silent=True)
 
         idx = self.selected_base_index()
@@ -5190,10 +5157,16 @@ class MainWindow(Gtk.Window):
 
         dlg = BaseDialog(self, "Свойства базы — Обновлятор 1C Linux", base=base)
 
-        self.configure_base_dialog_type_fields(dlg, base)
-        self.configure_base_dialog_group_picker(dlg, base)
+        try:
+            self.configure_base_dialog_type_fields(dlg, base)
+        except Exception as e:
+            self._append_log(f"Предупреждение: не удалось настроить поля типа базы: {type(e).__name__}: {e}")
 
-        # Явно подставляем актуальные значения из верхней формы / keyring.
+        try:
+            self.configure_base_dialog_group_picker(dlg, base)
+        except Exception as e:
+            self._append_log(f"Предупреждение: не удалось настроить выбор группы: {type(e).__name__}: {e}")
+
         try:
             dlg.user.set_text(self.get_base_user_text() or str(base.get("user") or base.get("login") or ""))
         except Exception:
@@ -5208,80 +5181,102 @@ class MainWindow(Gtk.Window):
 
         resp = dlg.run()
 
-        if resp == Gtk.ResponseType.OK:
-            try:
-                base["name"] = dlg.name.get_text().strip()
-                base["group"] = self.base_dialog_group_value(dlg) or "Без группы"
-                base["kind"] = combo_text(dlg.kind) or base.get("kind") or "file"
-                base["connect"] = self.base_dialog_connect_value(dlg)
-                if self.base_dialog_kind_text(dlg) == "server":
-                    try:
-                        base["server_name"] = str(dlg.server_name.get_text() or "").strip()
-                        base["db_name"] = str(dlg.db_name.get_text() or "").strip()
-                    except Exception:
-                        pass
-                else:
-                    base.pop("server_name", None)
-                    base.pop("db_name", None)
-                if self.base_dialog_kind_text(dlg) == "server":
-                    try:
-                        base["server_name"] = str(dlg.server_name.get_text() or "").strip()
-                        base["db_name"] = str(dlg.db_name.get_text() or "").strip()
-                    except Exception:
-                        pass
-                else:
-                    base.pop("server_name", None)
-                    base.pop("db_name", None)
-                base["user"] = dlg.user.get_text().strip()
-                base["login"] = base["user"]
-                base["username"] = base["user"]
-                base["platform_version"] = combo_text(dlg.platform) or base.get("platform_version") or "8.3"
-                base["launch_parameters"] = dlg.launch_params.get_text().strip()
-                base["config_name"] = dlg.config_name.get_text().strip()
-                base["config_synonym"] = dlg.config_synonym.get_text().strip()
-                base["config_version"] = dlg.config_version.get_text().strip()
-                base["update_program_name"] = dlg.update_code.get_text().strip()
+        if resp != Gtk.ResponseType.OK:
+            dlg.destroy()
+            self._append_log("Изменение свойств базы отменено.")
+            return
 
-                if hasattr(dlg, "comment"):
-                    try:
-                        buf = dlg.comment.get_buffer()
-                        start, end = buf.get_bounds()
-                        base["comment"] = buf.get_text(start, end, True)
-                    except Exception:
-                        pass
+        try:
+            base["name"] = str(dlg.name.get_text() or "").strip()
+            base["group"] = self.apply_base_group_after_properties_ok(base, dlg)
 
-                self.set_base_password(base, dlg.password.get_text())
-                self.save_config_safe()
+            kind = self.base_dialog_kind_text(dlg) or str(combo_text(dlg.kind) or base.get("kind") or "file").strip().lower()
+            base["kind"] = kind
 
-                new_name = str(base.get("name") or old_name)
-                new_connect = str(base.get("connect") or old_connect)
+            base["connect"] = self.base_dialog_connect_value(dlg)
 
-                dlg.destroy()
-
-                self._load_bases_tree()
-                self.select_base_by_name_connect(new_name, new_connect)
-
-                self._loading_base_credentials = True
+            if kind == "server":
                 try:
-                    self.base_user.set_text(str(base.get("user") or ""))
-                    self.base_password.set_text(self.get_base_password(base))
-                finally:
-                    self._loading_base_credentials = False
-
-                self._append_log(f"Свойства базы сохранены, пароль сохранен в системном хранилище: {new_name}")
-                return
-
-            except Exception as e:
-                try:
-                    dlg.destroy()
+                    base["server_name"] = str(dlg.server_name.get_text() or "").strip()
+                    base["db_name"] = str(dlg.db_name.get_text() or "").strip()
                 except Exception:
                     pass
-                self._append_log(f"Не удалось сохранить свойства базы: {type(e).__name__}: {e}")
-                return
+            else:
+                base.pop("server_name", None)
+                base.pop("db_name", None)
 
-        # Cancel/закрытие крестиком: ничего не сохраняем.
-        dlg.destroy()
-        self._append_log("Изменение свойств базы отменено.")
+            base["user"] = str(dlg.user.get_text() or "").strip()
+            base["login"] = base["user"]
+            base["username"] = base["user"]
+
+            try:
+                base["platform_version"] = combo_text(dlg.platform) or base.get("platform_version") or "8.3"
+            except Exception:
+                base["platform_version"] = base.get("platform_version") or "8.3"
+
+            try:
+                base["launch_parameters"] = str(dlg.launch_params.get_text() or "").strip()
+            except Exception:
+                pass
+
+            try:
+                base["config_name"] = str(dlg.config_name.get_text() or "").strip()
+            except Exception:
+                pass
+
+            try:
+                base["config_synonym"] = str(dlg.config_synonym.get_text() or "").strip()
+            except Exception:
+                pass
+
+            try:
+                base["config_version"] = str(dlg.config_version.get_text() or "").strip()
+            except Exception:
+                pass
+
+            try:
+                base["update_program_name"] = str(dlg.update_code.get_text() or "").strip()
+            except Exception:
+                pass
+
+            if hasattr(dlg, "comment"):
+                try:
+                    buf = dlg.comment.get_buffer()
+                    start, end = buf.get_bounds()
+                    base["comment"] = buf.get_text(start, end, True)
+                except Exception:
+                    pass
+
+            try:
+                self.set_base_password(base, dlg.password.get_text())
+            except Exception as e:
+                self._append_log(f"Не удалось сохранить пароль в keyring: {type(e).__name__}: {e}")
+
+            new_name = str(base.get("name") or old_name)
+            new_connect = str(base.get("connect") or old_connect)
+
+            dlg.destroy()
+
+            self.refresh_bases_tree_after_properties_save(base, old_name, old_connect)
+
+            self._loading_base_credentials = True
+            try:
+                self.base_user.set_text(str(base.get("user") or ""))
+                self.base_password.set_text(self.get_base_password(base))
+            finally:
+                self._loading_base_credentials = False
+
+            self._append_log(f"Свойства базы сохранены: {new_name}")
+            return
+
+        except Exception as e:
+            try:
+                dlg.destroy()
+            except Exception:
+                pass
+
+            self._append_log(f"Не удалось сохранить свойства базы: {type(e).__name__}: {e}")
+            return
 
     def parse_server_connect(self, connect):
         connect = str(connect or "").strip()
@@ -5808,7 +5803,7 @@ class MainWindow(Gtk.Window):
         try:
             value = str(getattr(dlg, "_u1c_group_value", "") or "").strip()
             if value:
-                return value
+                return self.normalize_base_group_name(value)
         except Exception:
             pass
 
@@ -5816,18 +5811,18 @@ class MainWindow(Gtk.Window):
             if hasattr(dlg, "group_entry"):
                 value = str(dlg.group_entry.get_text() or "").strip()
                 if value:
-                    return value
+                    return self.normalize_base_group_name(value)
         except Exception:
             pass
 
         try:
             value = str(combo_text(dlg.group) or "").strip()
             if value:
-                return value
+                return self.normalize_base_group_name(value)
         except Exception:
             pass
 
-        return "Без группы"
+        return self.normalize_base_group_name("Без группы")
 
     def set_base_dialog_group_value(self, dlg, value):
         value = str(value or "").strip() or "Без группы"
@@ -5838,6 +5833,7 @@ class MainWindow(Gtk.Window):
                 dlg.group_entry.set_text(value)
         except Exception:
             pass
+
 
     def choose_base_group_dialog(self, dlg):
         current = self.base_dialog_group_value(dlg)
@@ -5851,6 +5847,7 @@ class MainWindow(Gtk.Window):
 
         dialog.add_button("Отмена", Gtk.ResponseType.CANCEL)
         dialog.add_button("OK", Gtk.ResponseType.OK)
+        dialog.set_default_response(Gtk.ResponseType.OK)
         dialog.set_default_size(420, 420)
 
         box = dialog.get_content_area()
@@ -5868,18 +5865,31 @@ class MainWindow(Gtk.Window):
         listbox = Gtk.ListBox()
         listbox.set_selection_mode(Gtk.SelectionMode.SINGLE)
 
+        # Важно: один клик только выделяет строку.
+        # Без этого row-activated может срабатывать от одного клика.
+        try:
+            listbox.set_activate_on_single_click(False)
+        except Exception:
+            try:
+                listbox.set_property("activate-on-single-click", False)
+            except Exception:
+                pass
+
         selected_row = None
 
         for group_name in groups:
             row = Gtk.ListBoxRow()
+
             label = Gtk.Label(label=group_name)
             label.set_xalign(0)
             label.set_margin_top(6)
             label.set_margin_bottom(6)
             label.set_margin_start(8)
             label.set_margin_end(8)
+
             row.add(label)
             row._u1c_group_name = group_name
+
             listbox.add(row)
 
             if group_name == current:
@@ -5896,7 +5906,11 @@ class MainWindow(Gtk.Window):
         new_entry.set_placeholder_text("Новая группа")
         box.pack_start(new_entry, False, False, 0)
 
-        listbox.connect("row-activated", lambda *_: dialog.response(Gtk.ResponseType.OK))
+        def select_current_row_and_close(*_):
+            dialog.response(Gtk.ResponseType.OK)
+
+        # Теперь это сработает только на двойное нажатие/активацию Enter.
+        listbox.connect("row-activated", select_current_row_and_close)
 
         dialog.show_all()
 
@@ -5987,6 +6001,160 @@ class MainWindow(Gtk.Window):
                 picker_box.show_all()
             except Exception:
                 pass
+
+
+
+    def normalize_base_group_name(self, value):
+        value = str(value or "").strip()
+
+        if not value or value in ("-", "None", "none", "null"):
+            return "Без группы"
+
+        if value.lower() in ("без группы", "no group", "nogroup", "ungrouped"):
+            return "Без группы"
+
+        return value
+
+    def apply_base_group_after_properties_ok(self, base, dlg):
+        """Сохраняет группу из окна свойств и возвращает новое имя группы."""
+        group = "Без группы"
+
+        try:
+            group = self.base_dialog_group_value(dlg)
+        except Exception:
+            try:
+                group = combo_text(dlg.group)
+            except Exception:
+                group = base.get("group") or "Без группы"
+
+        group = self.normalize_base_group_name(group)
+
+        base["group"] = group
+
+        # Чтобы старые поля не удерживали прошлую группу.
+        base.pop("group_name", None)
+        base.pop("parent_group", None)
+
+        return group
+
+    def select_base_by_name_connect(self, name, connect):
+        name = str(name or "")
+        connect = str(connect or "")
+
+        def walk(parent=None):
+            child = self.base_store.iter_children(parent)
+
+            while child is not None:
+                try:
+                    row_name = str(self.base_store[child][1] or "")
+                    row_connect = str(self.base_store[child][5] or "")
+
+                    if not self.is_group_iter(child) and row_name == name and row_connect == connect:
+                        path = self.base_store.get_path(child)
+                        self.base_tree.get_selection().select_path(path)
+                        self.base_tree.expand_to_path(path)
+                        self.base_tree.scroll_to_cell(path, None, True, 0.4, 0.0)
+                        return True
+
+                    if self.base_store.iter_has_child(child):
+                        if walk(child):
+                            return True
+
+                except Exception:
+                    pass
+
+                child = self.base_store.iter_next(child)
+
+            return False
+
+        return walk(None)
+
+
+    def force_reload_bases_from_config_memory(self):
+        """Синхронизирует self.bases с self.config после сохранения.
+
+        Важно для случая, когда группа базы поменялась в свойствах:
+        файл уже сохранен, но дерево может продолжать жить на старой группировке.
+        """
+        try:
+            self.config["bases"] = self.bases
+        except Exception:
+            pass
+
+        try:
+            self.bases = self.config.get("bases", self.bases) or []
+        except Exception:
+            pass
+
+        return self.bases
+
+
+    def refresh_bases_tree_after_properties_save(self, base, old_name="", old_connect=""):
+        """Полностью и сразу перестраивает дерево после сохранения свойств базы."""
+        base = base or {}
+
+        new_name = str(base.get("name") or old_name or "")
+        new_connect = str(base.get("connect") or old_connect or "")
+        new_group = self.normalize_base_group_name(base.get("group"))
+
+        base["group"] = new_group
+
+        try:
+            self.config["bases"] = self.bases
+        except Exception:
+            pass
+
+        try:
+            self.save_config_safe()
+        except Exception as e:
+            try:
+                self._append_log(f"Не удалось сохранить список баз: {type(e).__name__}: {e}")
+            except Exception:
+                pass
+
+        try:
+            if hasattr(self, "base_store") and self.base_store is not None:
+                self.base_store.clear()
+        except Exception:
+            pass
+
+        try:
+            self._load_bases_tree()
+        except Exception as e:
+            try:
+                self._append_log(f"Не удалось обновить список баз: {type(e).__name__}: {e}")
+            except Exception:
+                pass
+
+        try:
+            self.base_tree.expand_all()
+        except Exception:
+            pass
+
+        try:
+            self.select_base_by_name_connect(new_name, new_connect)
+        except Exception:
+            pass
+
+        try:
+            self.base_tree.queue_draw()
+        except Exception:
+            pass
+
+        # Принудительно прокачиваем GTK-события, чтобы список обновился сразу,
+        # а не после полного перезапуска приложения.
+        try:
+            while Gtk.events_pending():
+                Gtk.main_iteration_do(False)
+        except Exception:
+            pass
+
+        try:
+            self._append_log(f"Список баз обновлен: {new_name} → группа «{new_group}»")
+        except Exception:
+            pass
+
+        return False
 
     def build_1c_launch_args(self, mode="ENTERPRISE"):
         import shlex
