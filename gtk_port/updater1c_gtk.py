@@ -3,13 +3,20 @@
 
 import json
 import os
+import html
+import base64
+import re
 import shlex
 import shutil
 import subprocess
 import sys
 import time
+import threading
 import tempfile
 import xml.etree.ElementTree as ET
+import urllib.request
+import urllib.error
+from urllib.parse import urljoin
 from pathlib import Path
 
 import gi
@@ -18,7 +25,7 @@ from gi.repository import Gtk, Gdk, GLib
 
 
 APP_NAME = "Обновлятор 1C Linux"
-APP_VERSION = "1.1-gtk-preview"
+APP_VERSION = "1.2"
 CONFIG_DIR = Path.home() / ".config" / "updater1c-linux"
 
 DEFAULT_1CESTART = "/opt/1cv8/common/1cestart"
@@ -70,16 +77,20 @@ def normalize_base_kind_and_connect(base: dict) -> tuple[str, str]:
     return kind, connect
 
 
+
+
+
 def platform_search_roots():
     return [
         Path("/opt/1cv8/x86_64"),
         Path("/opt/1cv8/i386"),
+        Path("/opt/1cv8"),
         Path("/opt/1C/v8.3/x86_64"),
         Path("/opt/1C/v8.3/i386"),
         Path("/opt/1C/v8.5/x86_64"),
         Path("/opt/1C/v8.5/i386"),
+        Path("/opt/1C"),
     ]
-
 
 def version_key(version: str):
     import re
@@ -87,29 +98,56 @@ def version_key(version: str):
     return tuple(nums or [0])
 
 
+
+
+
 def find_platforms():
     found = {}
+    exe_names = ("1cv8", "1cv8c", "1cv8s", "1cestart")
 
-    def exe_if_exists(version_dir: Path, name: str):
-        exe = version_dir / name
-        return str(exe) if exe.is_file() and os.access(exe, os.X_OK) else ""
+    def is_version_name(name: str) -> bool:
+        return bool(re.match(r"^\d+\.\d+(?:\.\d+){1,3}$", str(name or "")))
+
+    def add_version(version_dir: Path):
+        if not version_dir.is_dir():
+            return
+
+        version = version_dir.name
+        if not is_version_name(version):
+            return
+
+        # Для DESIGNER и универсального запуска предпочтительнее 1cv8.
+        for exe_name in exe_names:
+            exe = version_dir / exe_name
+            if exe.is_file():
+                found[version] = str(exe)
+                return
 
     for root in platform_search_roots():
         if not root.exists():
             continue
 
-        for d in root.iterdir():
-            if not d.is_dir():
-                continue
+        add_version(root)
 
-            for exe_name in ("1cv8", "1cv8c", "1cv8s", "1cestart"):
-                exe = exe_if_exists(d, exe_name)
-                if exe:
-                    found[d.name] = exe
-                    break
+        try:
+            for child in root.iterdir():
+                add_version(child)
+        except Exception:
+            pass
+
+    for root in (Path("/opt/1cv8"), Path("/opt/1C")):
+        if not root.exists():
+            continue
+
+        for exe_name in ("1cv8", "1cv8c"):
+            try:
+                for exe in root.rglob(exe_name):
+                    if exe.is_file():
+                        add_version(exe.parent)
+            except Exception:
+                pass
 
     return dict(sorted(found.items(), key=lambda x: version_key(x[0]), reverse=True))
-
 
 def find_1cestart(configured=""):
     candidates = [
@@ -431,6 +469,20 @@ def combo_get_text(combo):
         return ""
 
 
+def widget_text_value(widget):
+    try:
+        if isinstance(widget, Gtk.Entry):
+            return widget.get_text() or ""
+    except Exception:
+        pass
+
+    try:
+        return widget.get_active_text() or ""
+    except Exception:
+        return ""
+
+
+
 def known_groups_from_bases(bases):
     result = []
     for b in bases or []:
@@ -443,18 +495,24 @@ def known_groups_from_bases(bases):
     return result
 
 
+
+
+
 def known_platform_versions(settings=None, current=""):
-    result = ["8.3", "8.*", "auto"]
+    result = ["8.*", "8.3", "8.5"]
+
     try:
         for v in find_platforms().keys():
             if v not in result:
                 result.append(v)
     except Exception:
         pass
+
+    current = str(current or "").strip()
     if current and current not in result:
         result.insert(0, current)
-    return result
 
+    return result
 
 def load_json(path: Path, fallback):
     try:
@@ -519,6 +577,300 @@ class Ui:
         return c
 
 
+
+
+
+def http_json_post(url: str, body: dict, timeout: int = 120) -> dict:
+    payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": "1C+Enterprise/8.3",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw = r.read()
+            text = raw.decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as e:
+        err = e.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"HTTP {e.code}: {err[:1200]}")
+    except Exception as e:
+        raise RuntimeError(f"{type(e).__name__}: {e}")
+
+    try:
+        data = json.loads(text)
+    except Exception:
+        raise RuntimeError(f"Ответ update-api не JSON: {text[:1200]}")
+
+    if isinstance(data, dict) and data.get("errorName"):
+        raise RuntimeError(f"{data.get('errorName')}: {data.get('errorMessage')}")
+
+    return data
+
+
+class GtkOneCUpdateApi:
+    BASE_URL = "https://update-api.1c.ru"
+    UPDATE_INFO_PATH = "/update-platform/programs/update/info"
+    UPDATE_PATH = "/update-platform/programs/update/"
+
+    UPDATE_TYPE_WORKING = "NewConfigurationAndOrPlatform"
+    UPDATE_TYPE_PROGRAM_OR_REDACTION = "NewProgramOrRedaction"
+
+    def __init__(self, login: str, password: str):
+        self.login = login or ""
+        self.password = password or ""
+
+    def get_update_info(self, program: str, version: str, update_type: str, platform_version: str) -> dict:
+        body = {
+            "programName": (program or "").strip(),
+            "versionNumber": (version or "").strip(),
+            "updateType": update_type,
+            "platformVersion": (platform_version or "").strip() or "8.3",
+        }
+        return http_json_post(self.BASE_URL + self.UPDATE_INFO_PATH, body)
+
+    def check_conf_update(self, program: str, version: str, platform_version: str, allow_next_redaction: bool = False) -> dict:
+        update_type = self.UPDATE_TYPE_PROGRAM_OR_REDACTION if allow_next_redaction else self.UPDATE_TYPE_WORKING
+        full = self.get_update_info(program, version, update_type, platform_version)
+        return full.get("configurationUpdateResponse") or {}
+
+    def get_conf_download_data(self, upgrade_sequence, program_uin: str) -> list:
+        body = {
+            "programVersionUin": program_uin or "",
+            "upgradeSequence": upgrade_sequence or [],
+            "platformDistributionUin": "",
+            "login": self.login,
+            "password": self.password,
+        }
+        data = http_json_post(self.BASE_URL + self.UPDATE_PATH, body)
+        return data.get("configurationUpdateDataList") or []
+
+
+def gtk_get_its_password(settings: dict) -> str:
+    # 1. Старый/plaintext вариант, если он есть.
+    value = settings.get("its_password") or ""
+    if value:
+        return value
+
+    # 2. Новый вариант через secret_store, если модуль рядом и пароль сохранён.
+    try:
+        from secret_store import get_secret, its_password_account
+        return get_secret(its_password_account()) or ""
+    except Exception:
+        return ""
+
+
+def extract_release_from_any(value) -> str:
+    m = re.search(r"\b\d+(?:\.\d+){2,4}\b", str(value or ""))
+    return m.group(0) if m else ""
+
+
+def update_item_release_version(item: dict, fallback: str = "") -> str:
+    candidates = [
+        item.get("version"),
+        item.get("versionNumber"),
+        item.get("release"),
+        item.get("releaseVersion"),
+        item.get("templatePath"),
+        item.get("fileName"),
+        item.get("updateFileName"),
+        item.get("name"),
+        fallback,
+    ]
+    for c in candidates:
+        v = extract_release_from_any(c)
+        if v:
+            return v
+    return ""
+
+
+def update_item_url(item: dict) -> str:
+    for key in (
+        "downloadUrl",
+        "url",
+        "configurationUpdateFileUrl",
+        "updateFileUrl",
+        "templateUrl",
+        "fileUrl",
+    ):
+        value = item.get(key)
+        if value:
+            return str(value)
+    return ""
+
+
+def update_item_filename(item: dict, url: str, fallback: str = "update.zip") -> str:
+    for key in ("fileName", "updateFileName", "name"):
+        value = item.get(key)
+        if value:
+            return safe_name(Path(str(value)).name)
+
+    if url:
+        name = Path(url.split("?", 1)[0]).name
+        if name:
+            return safe_name(name)
+
+    return fallback
+
+
+def update_program_dir(settings: dict, program: str) -> Path:
+    root = Path(settings.get("updates_dir") or "/mnt/DataStore/Updater1C/1c-updates")
+    return root / safe_name(program or "UnknownProgram")
+
+
+
+def download_url_to_file(url: str, dest: Path, log_func, login: str = "", password: str = ""):
+    dest.parent.mkdir(parents=True, exist_ok=True)
+
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+    }
+    headers.update(auth_header_basic(login, password))
+
+    req = urllib.request.Request(url, headers=headers)
+
+    with urllib.request.urlopen(req, timeout=120) as r:
+        total = int(r.headers.get("Content-Length") or 0)
+        done = 0
+        last_percent = -1
+
+        with dest.open("wb") as f:
+            while True:
+                chunk = r.read(1024 * 1024)
+                if not chunk:
+                    break
+
+                f.write(chunk)
+                done += len(chunk)
+
+                if total:
+                    percent = int(done * 100 / total)
+                    if percent != last_percent and (percent % 5 == 0 or percent == 100):
+                        last_percent = percent
+                        log_func(f"Скачано {percent}% ({done // 1024 // 1024} / {total // 1024 // 1024} МБ)")
+                else:
+                    mb = done // 1024 // 1024
+                    log_func(f"Скачано {mb} МБ")
+
+    log_func(f"Файл скачан: {dest}")
+    return dest
+
+def find_download_url_recursive(obj):
+    if isinstance(obj, dict):
+        direct = update_item_url(obj)
+        if direct:
+            return direct
+
+        for v in obj.values():
+            found = find_download_url_recursive(v)
+            if found:
+                return found
+
+    elif isinstance(obj, list):
+        for v in obj:
+            found = find_download_url_recursive(v)
+            if found:
+                return found
+
+    return ""
+
+
+
+
+
+class PlatformVersionSelectDialog(Gtk.Dialog):
+    def __init__(self, parent, current=""):
+        super().__init__(
+            title="Выбор версии платформы 1С — Обновлятор 1C Linux",
+            transient_for=parent,
+            flags=0,
+        )
+        self.set_default_size(680, 470)
+        self.add_button("OK", Gtk.ResponseType.OK)
+        self.add_button("Отмена", Gtk.ResponseType.CANCEL)
+
+        box = self.get_content_area()
+        main = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        main.set_border_width(12)
+        box.add(main)
+
+        main.pack_start(Ui.label("Выберите версию платформы для строки базы:"), False, False, 0)
+
+        self.store = Gtk.ListStore(str, str)
+        self.tree = Gtk.TreeView(model=self.store)
+
+        r1 = Gtk.CellRendererText()
+        c1 = Gtk.TreeViewColumn("Версия", r1, text=0)
+        c1.set_fixed_width(160)
+        c1.set_resizable(True)
+        self.tree.append_column(c1)
+
+        r2 = Gtk.CellRendererText()
+        c2 = Gtk.TreeViewColumn("Исполняемый файл / режим выбора", r2, text=1)
+        c2.set_expand(True)
+        c2.set_resizable(True)
+        self.tree.append_column(c2)
+
+        rows = [
+            ("8.*", "любая самая свежая установленная версия"),
+            ("8.3", "самая свежая установленная версия 8.3"),
+            ("8.5", "самая свежая установленная версия 8.5"),
+        ]
+
+        try:
+            for version, exe in find_platforms().items():
+                rows.append((version, exe))
+        except Exception:
+            pass
+
+        seen = set()
+        for version, description in rows:
+            if version in seen:
+                continue
+            seen.add(version)
+            self.store.append([version, description])
+
+        sw = Gtk.ScrolledWindow()
+        sw.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        sw.add(self.tree)
+        main.pack_start(sw, True, True, 0)
+
+        main.pack_start(
+            Ui.label(
+                "<small>8.* — самая свежая установленная платформа. "
+                "8.3/8.5 — самая свежая установленная платформа выбранного семейства.</small>"
+            ),
+            False,
+            False,
+            0,
+        )
+
+        self.tree.connect("row-activated", self.on_row_activated)
+
+        current = str(current or "").strip()
+        if current:
+            it = self.store.get_iter_first()
+            while it:
+                if self.store[it][0] == current:
+                    self.tree.get_selection().select_iter(it)
+                    break
+                it = self.store.iter_next(it)
+
+        self.show_all()
+
+    def on_row_activated(self, *_):
+        self.response(Gtk.ResponseType.OK)
+
+    def selected_version(self):
+        model, it = self.tree.get_selection().get_selected()
+        if it:
+            return model[it][0]
+        return ""
 
 class LaunchParamsDialog(Gtk.Dialog):
     def __init__(self, parent, current_text=""):
@@ -639,12 +991,7 @@ class BaseDialog(Gtk.Dialog):
         else:
             self.password.set_placeholder_text("")
 
-        self.platform = Ui.combo([])
-        combo_set_values(
-            self.platform,
-            known_platform_versions(self.settings, self.base.get("platform_version") or "8.3"),
-            self.base.get("platform_version") or "8.3",
-        )
+        self.platform = Ui.entry(self.base.get("platform_version") or "8.3")
 
         self.client_mode = Ui.combo(["Тонкий клиент", "Толстый клиент"])
         client_mode = self.base.get("client_mode") or "thin"
@@ -732,8 +1079,13 @@ class BaseDialog(Gtk.Dialog):
         dlg.destroy()
 
     def on_find_platform_versions(self, *_):
-        current = combo_get_text(self.platform)
-        combo_set_values(self.platform, known_platform_versions(self.settings, current), current)
+        current = self.platform.get_text().strip()
+        dlg = PlatformVersionSelectDialog(self, current)
+        if dlg.run() == Gtk.ResponseType.OK:
+            selected = dlg.selected_version()
+            if selected:
+                self.platform.set_text(selected)
+        dlg.destroy()
 
     def on_launch_params_builder(self, *_):
         dlg = LaunchParamsDialog(self, self.launch_params.get_text())
@@ -757,7 +1109,7 @@ class BaseDialog(Gtk.Dialog):
             "connect": self.connect.get_text().strip(),
             "template": self.template.get_text().strip(),
             "user": self.user.get_text().strip(),
-            "platform_version": combo_get_text(self.platform).strip() or "8.3",
+            "platform_version": self.platform.get_text().strip() or "8.3",
             "client_mode": client_mode,
             "launch_parameters": self.launch_params.get_text().strip(),
             "config_name": self.config_name.get_text().strip(),
@@ -827,8 +1179,1798 @@ class AutoUpdateDialog(Gtk.Dialog):
         self.show_all()
 
 
+
+
+def platform_project_url(branch: str) -> str:
+    branch = str(branch or "8.3")
+    if branch.startswith("8.5"):
+        return "https://releases.1c.ru/project/Platform85"
+    return "https://releases.1c.ru/project/Platform83"
+
+
+def fetch_platform_releases_from_site(branch: str):
+    """
+    Пытается прочитать страницу проекта платформы.
+    Если releases.1c.ru требует авторизацию через браузер/куки, вернет пустой список.
+    """
+    url = platform_project_url(branch)
+
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0",
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            html = r.read().decode("utf-8", errors="replace")
+    except Exception:
+        return []
+
+    versions = []
+    for m in re.finditer(r"\b8\.(?:3|5)\.\d+\.\d+\b", html):
+        v = m.group(0)
+        if branch.startswith("8.3") and not v.startswith("8.3."):
+            continue
+        if branch.startswith("8.5") and not v.startswith("8.5."):
+            continue
+        if v not in versions:
+            versions.append(v)
+
+    versions.sort(key=version_key, reverse=True)
+    return versions
+
+
+
+def platform_project_url(branch: str) -> str:
+    branch = str(branch or "8.3")
+    if branch.startswith("8.5"):
+        return "https://releases.1c.ru/project/Platform85"
+    return "https://releases.1c.ru/project/Platform83"
+
+
+def fetch_platform_releases_from_site(branch: str):
+    """
+    Пытаемся получить список релизов со страницы releases.1c.ru.
+    Если сайт требует cookies/авторизацию, вернется пустой список.
+    """
+    url = platform_project_url(branch)
+
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": "Mozilla/5.0"},
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            html = r.read().decode("utf-8", errors="replace")
+    except Exception:
+        return []
+
+    versions = []
+    pattern = r"\b8\.(?:3|5)\.\d+\.\d+\b"
+
+    for m in re.finditer(pattern, html):
+        v = m.group(0)
+
+        if branch.startswith("8.3") and not v.startswith("8.3."):
+            continue
+
+        if branch.startswith("8.5") and not v.startswith("8.5."):
+            continue
+
+        if v not in versions:
+            versions.append(v)
+
+    versions.sort(key=version_key, reverse=True)
+    return versions
+
+
+
+def platform_distribution_variants(version: str, branch: str, component: str, os_name: str, bit64: bool, arm: bool, elbrus: bool, web_clients: bool):
+    """
+    Формируем очередь дистрибутивов по структуре страницы releases.1c.ru:
+    Linux 64, Linux 32, Linux arm64/Эльбрус, macOS, Windows 32/64,
+    внешние компоненты, демобаза, дополнительные материалы.
+
+    URL пока может быть пустым, потому что releases.1c.ru часто требует cookie/авторизацию.
+    Скачивание реальных URL будет работать, когда URL будет получен из страницы/зеркала/API.
+    """
+    result = []
+
+    os_low = (os_name or "").lower()
+    comp = component or "Все компоненты платформы"
+
+    def add(section, title, code, url=""):
+        result.append({
+            "version": version,
+            "section": section,
+            "title": title,
+            "code": code,
+            "url": url,
+        })
+
+    def wants_all():
+        return comp == "Все компоненты платформы"
+
+    def wants_server():
+        return wants_all() or comp == "Сервер"
+
+    def wants_client():
+        return wants_all() or comp in ("Клиент", "Тонкий клиент")
+
+    def wants_thin():
+        return wants_all() or comp == "Тонкий клиент"
+
+    if "linux" in os_low:
+        if arm or elbrus:
+            section = "Linux (arm64, Эльбрус-8С)"
+            if elbrus:
+                if wants_server():
+                    add(section, f"{version} Сервер 1С:Предприятия (Эльбрус-8С) для RPM-based Linux-систем", "linux-elbrus-rpm-server")
+                    add(section, f"{version} Сервер 1С:Предприятия (Эльбрус-8С) для DEB-based Linux-систем", "linux-elbrus-deb-server")
+                if wants_client():
+                    add(section, f"{version} Клиент 1С:Предприятия (Эльбрус-8С) для RPM-based Linux-систем", "linux-elbrus-rpm-client")
+                    add(section, f"{version} Клиент 1С:Предприятия (Эльбрус-8С) для DEB-based Linux-систем", "linux-elbrus-deb-client")
+                if wants_thin():
+                    add(section, f"{version} Тонкий клиент 1С:Предприятия (Эльбрус-8С) для RPM-based Linux-систем", "linux-elbrus-rpm-thin")
+                    add(section, f"{version} Тонкий клиент 1С:Предприятия (Эльбрус-8С) для DEB-based Linux-систем", "linux-elbrus-deb-thin")
+            else:
+                if wants_server():
+                    add(section, f"{version} Сервер 1С:Предприятия (64-bit ARM) для RPM-based Linux-систем", "linux-arm64-rpm-server")
+                    add(section, f"{version} Сервер 1С:Предприятия (64-bit ARM) для DEB-based Linux-систем", "linux-arm64-deb-server")
+                if wants_client():
+                    add(section, f"{version} Клиент 1С:Предприятия (64-bit ARM) для RPM-based Linux-систем", "linux-arm64-rpm-client")
+                    add(section, f"{version} Клиент 1С:Предприятия (64-bit ARM) для DEB-based Linux-систем", "linux-arm64-deb-client")
+                if wants_thin():
+                    add(section, f"{version} Тонкий клиент 1С:Предприятия (64-bit ARM) для RPM-based Linux-систем", "linux-arm64-rpm-thin")
+                    add(section, f"{version} Тонкий клиент 1С:Предприятия (64-bit ARM) для DEB-based Linux-систем", "linux-arm64-deb-thin")
+            return result
+
+        if bit64:
+            section = "Linux (64-bit)"
+            if wants_all():
+                add(section, f"{version} Технологическая платформа 1С:Предприятия (64-bit) для Linux + Тонкий клиент для Windows, Linux и MacOS для автоматического обновления клиентов через веб-сервер", "linux-x64-full-web-all")
+                add(section, f"{version} Технологическая платформа 1С:Предприятия (64-bit) для Linux + Тонкий клиент для Windows и MacOS для автоматического обновления клиентов через веб-сервер", "linux-x64-full-web-winmac")
+                add(section, f"{version} Технологическая платформа 1С:Предприятия (64-bit) для Linux", "linux-x64-full")
+            if wants_thin():
+                add(section, f"{version} Тонкий клиент 1С:Предприятия (64-bit) для DEB-based Linux-систем", "linux-x64-deb-thin")
+                add(section, f"{version} Тонкий клиент 1С:Предприятия (64-bit) для Linux", "linux-x64-thin")
+                add(section, f"{version} Тонкий клиент 1С:Предприятия (64-bit) для RPM-based Linux-систем", "linux-x64-rpm-thin")
+            if wants_client():
+                add(section, f"{version} Клиент 1С:Предприятия (64-bit) для DEB-based Linux-систем", "linux-x64-deb-client")
+                add(section, f"{version} Клиент 1С:Предприятия (64-bit) для RPM-based Linux-систем", "linux-x64-rpm-client")
+            if wants_server():
+                add(section, f"{version} Сервер 1С:Предприятия (64-bit) для DEB-based Linux-систем", "linux-x64-deb-server")
+                add(section, f"{version} Сервер 1С:Предприятия (64-bit) для RPM-based Linux-систем", "linux-x64-rpm-server")
+            if web_clients:
+                add(section, f"{version} Web-компоненты 1С:Предприятия (64-bit) для Linux", "linux-x64-web")
+        else:
+            section = "Linux (32-bit)"
+            if wants_all():
+                add(section, f"{version} Технологическая платформа 1С:Предприятия для Linux + Тонкий клиент для Windows, Linux и MacOS для автоматического обновления клиентов через веб-сервер", "linux-x86-full-web-all")
+                add(section, f"{version} Технологическая платформа 1С:Предприятия для Linux + Тонкий клиент для Windows и MacOS для автоматического обновления клиентов через веб-сервер", "linux-x86-full-web-winmac")
+                add(section, f"{version} Технологическая платформа 1С:Предприятия для Linux", "linux-x86-full")
+            if wants_thin():
+                add(section, f"{version} Тонкий клиент 1С:Предприятия для DEB-based Linux-систем", "linux-x86-deb-thin")
+                add(section, f"{version} Тонкий клиент 1С:Предприятия для Linux", "linux-x86-thin")
+                add(section, f"{version} Тонкий клиент 1С:Предприятия для RPM-based Linux-систем", "linux-x86-rpm-thin")
+            if wants_client():
+                add(section, f"{version} Клиент 1С:Предприятия для DEB-based Linux-систем", "linux-x86-deb-client")
+                add(section, f"{version} Клиент 1С:Предприятия для RPM-based Linux-систем", "linux-x86-rpm-client")
+            if wants_server():
+                add(section, f"{version} Сервер 1С:Предприятия для DEB-based Linux-систем", "linux-x86-deb-server")
+                add(section, f"{version} Сервер 1С:Предприятия для RPM-based Linux-систем", "linux-x86-rpm-server")
+
+    elif "windows" in os_low:
+        section = "Windows (64-bit)" if bit64 else "Windows (32-bit)"
+        bit_title = " (64-bit)" if bit64 else ""
+        bit_code = "x64" if bit64 else "x86"
+
+        if wants_thin():
+            add(section, f"{version} Тонкий клиент 1С:Предприятие{bit_title} для Windows", f"windows-{bit_code}-thin")
+        if wants_server():
+            add(section, f"{version} Сервер 1С:Предприятия{bit_title} для Windows + Тонкий клиент для Windows, Linux и MacOS для автоматического обновления клиентов через веб-сервер", f"windows-{bit_code}-server-web-all")
+            add(section, f"{version} Сервер 1С:Предприятия{bit_title} для Windows + Тонкий клиент для Windows и MacOS для автоматического обновления клиентов через веб-сервер", f"windows-{bit_code}-server-web-winmac")
+        if wants_all():
+            add(section, f"{version} Технологическая платформа 1С:Предприятия{bit_title} для Windows + Тонкий клиент для Windows, Linux и MacOS для автоматического обновления клиентов через веб-сервер", f"windows-{bit_code}-full-web-all")
+            add(section, f"{version} Технологическая платформа 1С:Предприятия{bit_title} для Windows + Тонкий клиент для Windows и MacOS для автоматического обновления клиентов через веб-сервер", f"windows-{bit_code}-full-web-winmac")
+            add(section, f"{version} Технологическая платформа 1С:Предприятия{bit_title} для Windows", f"windows-{bit_code}-full")
+        if wants_server():
+            add(section, f"{version} Сервер 1С:Предприятия{bit_title} для Windows", f"windows-{bit_code}-server")
+        if web_clients:
+            add(section, f"{version} Web-компоненты 1С:Предприятия{bit_title} для Windows", f"windows-{bit_code}-web")
+
+    elif "mac" in os_low:
+        section = "MacOS (64-bit)"
+        if wants_thin():
+            add(section, f"{version} Тонкий клиент 1С:Предприятия для macOS", "macos-thin")
+        if wants_client() or wants_all():
+            add(section, f"{version} Клиент 1С:Предприятия для macOS", "macos-client")
+
+    else:
+        add("Прочее", f"{version} {os_name} клиент 1С", f"{safe_name(os_name)}-client")
+
+    if wants_all():
+        add("Технология внешних компонент", f"{version} Технология внешних компонент", "external-components")
+        add("Демонстрационная информационная база", f"{version} Демонстрационная информационная база", "demo-base")
+        add("Дополнительные материалы", f"{version} Дополнительные материалы", "additional-materials")
+
+    return result
+
+
+def auth_header_basic(login: str, password: str):
+    login = login or ""
+    password = password or ""
+    if not login or not password:
+        return {}
+    token = base64.b64encode(f"{login}:{password}".encode("utf-8")).decode("ascii")
+    return {"Authorization": f"Basic {token}"}
+
+
+def http_get_text_auth(url: str, login: str = "", password: str = "", referer: str = ""):
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
+    if referer:
+        headers["Referer"] = referer
+    headers.update(auth_header_basic(login, password))
+
+    req = urllib.request.Request(url, headers=headers)
+
+    with urllib.request.urlopen(req, timeout=60) as r:
+        raw = r.read()
+        charset = "utf-8"
+        content_type = r.headers.get("Content-Type") or ""
+        m = re.search(r"charset=([^;]+)", content_type, flags=re.I)
+        if m:
+            charset = m.group(1).strip()
+        return raw.decode(charset, errors="replace")
+
+
+
+
+def html_links(page_url: str, html_text: str):
+    result = []
+
+    # Важно: regex в тройных кавычках, чтобы кавычки href не ломали синтаксис Python.
+    pattern = r"""<a\b[^>]*href=["']([^"']+)["'][^>]*>(.*?)</a>"""
+
+    for m in re.finditer(pattern, html_text or "", flags=re.I | re.S):
+        href = html.unescape((m.group(1) or "").strip())
+        body = m.group(2) or ""
+        title = re.sub(r"<[^>]+>", " ", body, flags=re.S)
+        title = html.unescape(re.sub(r"\s+", " ", title).strip())
+
+        if not title:
+            title = href
+
+        result.append({
+            "title": title,
+            "url": urljoin(page_url, href),
+        })
+
+    return result
+
+def platform_project_url(branch: str) -> str:
+    branch = str(branch or "8.3")
+    if branch.startswith("8.5"):
+        return "https://releases.1c.ru/project/Platform85"
+    return "https://releases.1c.ru/project/Platform83"
+
+
+def fetch_platform_releases_from_site(branch: str, login: str = "", password: str = ""):
+    url = platform_project_url(branch)
+    html_text = http_get_text_auth(url, login, password)
+
+    releases = []
+    for link in html_links(url, html_text):
+        title = link["title"]
+        href = link["url"]
+
+        version = extract_release_from_any(title) or extract_release_from_any(href)
+        if not version:
+            continue
+
+        if branch.startswith("8.3") and not version.startswith("8.3."):
+            continue
+        if branch.startswith("8.5") and not version.startswith("8.5."):
+            continue
+
+        if not any(x["version"] == version for x in releases):
+            releases.append({
+                "version": version,
+                "title": version,
+                "url": href,
+            })
+
+    releases.sort(key=lambda x: version_key(x["version"]), reverse=True)
+    return releases
+
+
+def classify_platform_link(title: str):
+    t = (title or "").lower()
+
+    if "контрольн" in t or "sha" in t or "список измен" in t or "проблемные" in t:
+        return ""
+
+    if "linux" in t and "64" in t:
+        return "Linux (64-bit)"
+    if "linux" in t and ("32" in t or "i386" in t):
+        return "Linux (32-bit)"
+    if "arm" in t or "эльбрус" in t:
+        return "Linux (arm64, Эльбрус-8С)"
+    if "macos" in t or "mac os" in t:
+        return "MacOS (64-bit)"
+    if "windows" in t and "64" in t:
+        return "Windows (64-bit)"
+    if "windows" in t and ("32" in t or "x86" in t):
+        return "Windows (32-bit)"
+    if "демонстрац" in t:
+        return "Демонстрационная информационная база"
+    if "внешн" in t:
+        return "Технология внешних компонент"
+    if "дополнитель" in t:
+        return "Дополнительные материалы"
+
+    return "Прочее"
+
+
+def platform_link_matches_filters(title: str, component: str, os_name: str, bit64: bool, arm: bool, elbrus: bool, web_clients: bool):
+    t = (title or "").lower()
+    os_low = (os_name or "").lower()
+    comp = component or "Все компоненты платформы"
+
+    if "windows" in os_low and "windows" not in t:
+        return False
+    if "linux" in os_low and "linux" not in t:
+        return False
+    if "mac" in os_low and not ("macos" in t or "mac os" in t):
+        return False
+
+    if bit64 and not ("64" in t or "x86_64" in t or "amd64" in t):
+        return False
+
+    if arm and "arm" not in t:
+        return False
+
+    if elbrus and "эльбрус" not in t:
+        return False
+
+    if web_clients and not ("веб" in t or "web" in t):
+        return False
+
+    if comp == "Сервер" and "сервер" not in t:
+        return False
+
+    if comp == "Тонкий клиент" and "тонкий клиент" not in t:
+        return False
+
+    if comp == "Клиент" and "клиент" not in t:
+        return False
+
+    return True
+
+
+def fetch_platform_distribution_links(release_url: str, version: str, login: str = "", password: str = ""):
+    html_text = http_get_text_auth(release_url, login, password, referer=platform_project_url("8.5" if version.startswith("8.5.") else "8.3"))
+    links = html_links(release_url, html_text)
+
+    result = []
+    for link in links:
+        title = link["title"]
+        url = link["url"]
+
+        section = classify_platform_link(title)
+        if not section:
+            continue
+
+        # Берем только реальные элементы скачивания/дистрибутивов.
+        low_url = url.lower()
+        low_title = title.lower()
+
+        looks_like_download = (
+            "download" in low_url
+            or "tmplts/get" in low_url
+            or "file" in low_url
+            or ".rar" in low_url
+            or ".zip" in low_url
+            or ".tar" in low_url
+            or ".deb" in low_url
+            or ".rpm" in low_url
+            or "скачать" in low_title
+            or "1с:предприят" in low_title
+            or "1c:предприят" in low_title
+            or "технологическая платформа" in low_title
+            or "тонкий клиент" in low_title
+            or "клиент" in low_title
+            or "сервер" in low_title
+        )
+
+        if not looks_like_download:
+            continue
+
+        code = safe_name(title)
+        result.append({
+            "version": version,
+            "section": section,
+            "title": f"{version} {title}" if not title.startswith(version) else title,
+            "code": code,
+            "url": url,
+            "filename": Path(url.split("?", 1)[0]).name,
+        })
+
+    return result
+
+
+def make_releases_platform_client(login: str, password: str, branch: str):
+    """
+    Используем готовый клиент из Qt/main.py, потому что там уже реализована
+    правильная ticket-авторизация login.1c.ru -> releases.1c.ru.
+    """
+    import sys
+    project_root = str(Path(__file__).resolve().parent.parent)
+    if project_root not in sys.path:
+        sys.path.insert(0, project_root)
+
+    from main import OneCReleasesPlatformClient
+
+    client = OneCReleasesPlatformClient(login, password)
+
+    if str(branch or "").startswith("8.5"):
+        client.PROJECT_NICK = "Platform85"
+    else:
+        client.PROJECT_NICK = "Platform83"
+
+    return client
+
+
+def fetch_platform_releases_with_client(branch: str, login: str, password: str):
+    client = make_releases_platform_client(login, password, branch)
+    versions = client.platform_versions()
+
+    result = []
+    for version in versions:
+        if branch.startswith("8.3") and not version.startswith("8.3."):
+            continue
+        if branch.startswith("8.5") and not version.startswith("8.5."):
+            continue
+
+        result.append({
+            "version": version,
+            "title": version,
+            "url": client._version_files_url(version),
+            "client": client,
+        })
+
+    return result
+
+
+def fetch_platform_distribution_links_with_client(branch: str, version: str, login: str, password: str):
+    client = make_releases_platform_client(login, password, branch)
+
+    # В Qt-клиенте это должно вернуть реальные файлы версии.
+    files = client.version_files(version)
+
+    result = []
+    for item in files or []:
+        if isinstance(item, dict):
+            title = (
+                item.get("title")
+                or item.get("name")
+                or item.get("presentation")
+                or item.get("userName")
+                or item.get("fileName")
+                or str(item)
+            )
+            url = (
+                item.get("url")
+                or item.get("downloadUrl")
+                or item.get("href")
+                or item.get("download_href")
+                or ""
+            )
+            filename = item.get("fileName") or Path(str(url).split("?", 1)[0]).name
+        else:
+            title = str(item)
+            url = ""
+            filename = ""
+
+        section = classify_platform_link(title)
+        if not section:
+            section = "Прочее"
+
+        result.append({
+            "version": version,
+            "section": section,
+            "title": f"{version} {title}" if not str(title).startswith(version) else str(title),
+            "code": safe_name(title),
+            "url": url,
+            "filename": filename,
+        })
+
+    return result
+
+class PlatformBranchSelectDialog(Gtk.Dialog):
+    def __init__(self, parent):
+        super().__init__(
+            title="Выбор редакции платформы 1С",
+            transient_for=parent,
+            flags=0,
+        )
+        self.set_default_size(380, 180)
+        self.add_button("Отмена", Gtk.ResponseType.CANCEL)
+        self.add_button("Продолжить", Gtk.ResponseType.OK)
+
+        box = self.get_content_area()
+        main = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        main.set_border_width(14)
+        box.add(main)
+
+        main.pack_start(Ui.label("Выберите редакцию платформы для загрузки:"), False, False, 0)
+
+        self.combo = Ui.combo(["8.3", "8.5"])
+        self.combo.set_active(0)
+        main.pack_start(self.combo, False, False, 0)
+
+        self.show_all()
+
+    def selected_branch(self):
+        return self.combo.get_active_text() or "8.3"
+
+
+
+def auth_header_basic(login: str, password: str):
+    if not login or not password:
+        return {}
+    raw = f"{login}:{password}".encode("utf-8")
+    token = base64.b64encode(raw).decode("ascii")
+    return {"Authorization": f"Basic {token}"}
+
+
+def download_platform_file_with_progress(item: dict, dest_dir: Path, login: str, password: str, log_func, unpack=False, delete_after_unpack=False):
+    title = item.get("title") or item.get("name") or "platform"
+    url = item.get("url") or ""
+
+    if not url:
+        log_func(f"ПРОПУСК: для элемента нет URL скачивания: {title}")
+        log_func("Нужно получить ссылку файла с releases.1c.ru/API. Пока элемент добавлен в очередь как выбранный дистрибутив.")
+        return None
+
+    filename = item.get("filename") or Path(url.split("?", 1)[0]).name or (safe_name(title) + ".bin")
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / filename
+
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+    }
+    headers.update(auth_header_basic(login, password))
+
+    req = urllib.request.Request(url, headers=headers)
+
+    log_func(f"Скачивание: {title}")
+    log_func(f"URL: {url}")
+    log_func(f"Файл: {dest}")
+
+    with urllib.request.urlopen(req, timeout=120) as r:
+        total = int(r.headers.get("Content-Length") or 0)
+        done = 0
+        last_percent = -1
+
+        with dest.open("wb") as f:
+            while True:
+                chunk = r.read(1024 * 512)
+                if not chunk:
+                    break
+
+                f.write(chunk)
+                done += len(chunk)
+
+                if total > 0:
+                    percent = int(done * 100 / total)
+                    if percent != last_percent and (percent % 5 == 0 or percent == 100):
+                        last_percent = percent
+                        log_func(f"{title}: {percent}% ({done // 1024 // 1024} / {total // 1024 // 1024} МБ)")
+                else:
+                    mb = done // 1024 // 1024
+                    if mb % 10 == 0:
+                        log_func(f"{title}: скачано {mb} МБ")
+
+    log_func(f"Скачано: {dest}")
+
+    if unpack:
+        unpack_dir = dest_dir / (dest.stem + "_unpacked")
+        unpack_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            shutil.unpack_archive(str(dest), str(unpack_dir))
+            log_func(f"Распаковано: {unpack_dir}")
+
+            if delete_after_unpack:
+                dest.unlink()
+                log_func(f"Архив удален после распаковки: {dest}")
+
+        except Exception as e:
+            log_func(f"Не удалось распаковать архив стандартным способом: {type(e).__name__}: {e}")
+            log_func("Для .rar может потребоваться unar/unrar/7z. Архив оставлен на месте.")
+
+    return dest
+
+
+
+def ensure_project_root_on_path():
+    import sys
+    root = str(Path(__file__).resolve().parent.parent)
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    return root
+
+
+def masked_command(args):
+    result = []
+    skip_next = False
+
+    for i, arg in enumerate(args):
+        if skip_next:
+            skip_next = False
+            continue
+
+        if arg in ("--pwd", "--password", "-p"):
+            result.append(arg)
+            result.append("***")
+            skip_next = True
+            continue
+
+        result.append(str(arg))
+
+    return command_to_text(result)
+
+
+def oneget_binary():
+    for candidate in [
+        shutil.which("oneget"),
+        str(Path.home() / ".local/bin/oneget"),
+        "/usr/local/bin/oneget",
+        "/usr/bin/oneget",
+    ]:
+        if candidate and Path(candidate).exists():
+            return candidate
+    return ""
+
+
+
+def platform_branch_to_project(branch: str):
+    # oneget v0.6.0 имеет filter builder для project "platform".
+    # Для platform85 фильтры вида win.thin.x64 падают:
+    # unknown filter builder for project <platform85>.
+    return "platform"
+
+def oneget_filter_from_item(item: dict):
+    code = (item.get("code") or "").lower()
+    title = (item.get("title") or "").lower()
+
+    filters = []
+
+    if "windows" in code or "windows" in title:
+        filters.append("win")
+    elif "mac" in code or "macos" in title:
+        filters.append("mac")
+    elif "rpm" in code or "rpm" in title:
+        filters.append("rpm")
+    elif "deb" in code or "deb" in title:
+        filters.append("deb")
+    elif "linux" in code or "linux" in title:
+        filters.append("linux")
+    else:
+        filters.append("linux")
+
+    if "server" in code or "сервер" in title:
+        filters.append("server")
+    elif "thin" in code or "тонкий клиент" in title:
+        filters.append("thin")
+    elif "client" in code or "клиент" in title:
+        filters.append("client")
+    elif "full" in code or "технологическая платформа" in title:
+        filters.append("full")
+
+    if "x64" in code or "64" in title or "x86_64" in code:
+        filters.append("x64")
+    elif "x86" in code or "32" in title or "i386" in code:
+        filters.append("x32")
+
+    # oneget не все комбинации принимает, но базовые фильтры из README поддерживает.
+    clean = []
+    for f in filters:
+        if f and f not in clean:
+            clean.append(f)
+
+    return ".".join(clean)
+
+
+
+def oneget_release_candidates(item: dict):
+    version = item.get("version") or extract_release_from_any(item.get("title") or "")
+    branch = "8.5" if str(version).startswith("8.5.") else "8.3"
+    flt = oneget_filter_from_item(item)
+
+    candidates = []
+
+    if flt:
+        # Основная попытка: фильтр через универсальный project platform.
+        candidates.append(f"platform:{flt}@{version}")
+
+    # Fallback: без фильтра.
+    if branch == "8.5":
+        candidates.append(f"platform85@{version}")
+
+    candidates.append(f"platform@{version}")
+
+    # Убираем дубли, сохраняя порядок.
+    result = []
+    for c in candidates:
+        if c and c not in result:
+            result.append(c)
+
+    return result
+
+
+
+
+def oneget_release_arg(item: dict):
+    candidates = oneget_release_candidates(item)
+    return candidates[0] if candidates else ""
+
+
+def downloads_v8_auth_diagnostic(login: str, password: str):
+    url = "http://downloads.v8.1c.ru/tmplts/"
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+    }
+    headers.update(auth_header_basic(login, password))
+
+    req = urllib.request.Request(url, headers=headers)
+
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            raw = r.read(3000)
+            status = getattr(r, "status", None) or r.getcode()
+            text = raw.decode("utf-8", errors="replace")
+            return True, f"HTTP {status}; ответ: {text[:500].replace(chr(10), ' ')}"
+    except urllib.error.HTTPError as e:
+        body = e.read(1000).decode("utf-8", errors="replace")
+        return False, f"HTTP {e.code}; {body[:500].replace(chr(10), ' ')}"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
+def platform_item_has_direct_url(item: dict):
+    return bool(item.get("url"))
+
+
+
+class GtkLogWorkerAdapter:
+    def __init__(self, log_func):
+        self._log_func = log_func
+
+    def log(self, message):
+        self._log_func(str(message))
+
+
+
+def make_gtk_releases_client(login: str, password: str, branch: str):
+    ensure_project_root_on_path()
+    from main import OneCReleasesPlatformClient
+
+    client = OneCReleasesPlatformClient(login, password)
+    client.PROJECT_NICK = "Platform85" if str(branch or "").startswith("8.5") else "Platform83"
+    return client
+
+
+
+def platform_candidate_text(item: dict) -> str:
+    return " ".join([
+        str(item.get("title") or ""),
+        str(item.get("code") or ""),
+        str(item.get("name") or ""),
+        str(item.get("fileName") or ""),
+        str(item.get("distributionName") or ""),
+        str(item.get("versionFileUrl") or ""),
+        str(item.get("downloadUrl") or ""),
+        str(item.get("url") or ""),
+    ]).lower()
+
+
+def platform_candidate_score(wanted: dict, candidate: dict) -> int:
+    wanted_code = str(wanted.get("code") or "").lower()
+    wanted_title = str(wanted.get("title") or "").lower()
+    cand_text = platform_candidate_text(candidate)
+    cand_code = str(candidate.get("code") or "").lower()
+
+    score = 0
+
+    if wanted_code and wanted_code == cand_code:
+        score += 100
+
+    tokens = [x for x in wanted_code.replace("_", "-").replace(".", "-").split("-") if x]
+
+    for t in tokens:
+        if t in cand_text or t in cand_code:
+            score += 10
+
+    # Нормализация русских/английских признаков.
+    checks = [
+        ("windows", ["windows", "win"]),
+        ("linux", ["linux"]),
+        ("macos", ["macos", "mac os", "mac"]),
+        ("x64", ["x64", "64-bit", "64"]),
+        ("x32", ["x32", "32-bit", "32", "x86"]),
+        ("thin", ["thin", "тонкий клиент"]),
+        ("client", ["client", "клиент"]),
+        ("server", ["server", "сервер"]),
+        ("deb", ["deb", "debian", "deb-based"]),
+        ("rpm", ["rpm", "rpm-based"]),
+    ]
+
+    for wanted_token, candidate_words in checks:
+        if wanted_token in wanted_code or wanted_token in wanted_title:
+            if any(w in cand_text for w in candidate_words):
+                score += 15
+            else:
+                score -= 20
+
+    if str(wanted.get("version") or "") and str(wanted.get("version")) in cand_text:
+        score += 10
+
+    if candidate.get("versionFileUrl") or candidate.get("downloadUrl") or candidate.get("url"):
+        score += 30
+
+    return score
+
+
+def find_real_platform_item_for_fallback(client, fallback_item: dict):
+    version = fallback_item.get("version") or extract_release_from_any(fallback_item.get("title") or "")
+    if not version:
+        return None
+
+    raw_items = client.platform_files(version) or []
+
+    best = None
+    best_score = -9999
+
+    for cand in raw_items:
+        if not isinstance(cand, dict):
+            continue
+
+        score = platform_candidate_score(fallback_item, cand)
+
+        if score > best_score:
+            best = cand
+            best_score = score
+
+    if best is None or best_score < 20:
+        return None
+
+    title = (
+        best.get("title")
+        or best.get("name")
+        or best.get("distributionName")
+        or best.get("fileName")
+        or fallback_item.get("title")
+        or str(best)
+    )
+
+    result = dict(best)
+    result.setdefault("version", version)
+    result.setdefault("title", title if str(title).startswith(str(version)) else f"{version} {title}")
+    result.setdefault("code", fallback_item.get("code") or safe_name(title))
+    result.setdefault("section", classify_platform_link(title) or fallback_item.get("section") or "Прочее")
+
+    return result
+
+
+def version_to_underscore(version: str) -> str:
+    return str(version or "").strip().replace(".", "_")
+
+
+
+def downloads_v8_candidate_filenames(item: dict):
+    # Для прямого downloads.v8 используем тот же безопасный список,
+    # чтобы Linux больше не проверял Windows .rar.
+    return releases_version_file_candidate_names(item)
+
+def downloads_v8_candidate_urls(item: dict):
+    version = item.get("version") or extract_release_from_any(item.get("title") or "")
+    vu = version_to_underscore(version)
+    filenames = downloads_v8_candidate_filenames(item)
+
+    prefixes = [
+        f"http://downloads.v8.1c.ru/tmplts/{vu}",
+        f"https://downloads.v8.1c.ru/tmplts/{vu}",
+    ]
+
+    urls = []
+    for prefix in prefixes:
+        for fn in filenames:
+            url = prefix.rstrip("/") + "/" + fn
+            if url not in urls:
+                urls.append(url)
+
+    return urls
+
+
+def probe_direct_download_url(url: str, login: str, password: str):
+    import requests
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 updater1c-linux",
+        "Range": "bytes=0-0",
+    }
+
+    try:
+        r = requests.get(
+            url,
+            auth=(login, password),
+            headers=headers,
+            stream=True,
+            timeout=20,
+            allow_redirects=True,
+        )
+
+        content_type = (r.headers.get("Content-Type") or "").lower()
+        final_url = r.url
+
+        ok = (
+            r.status_code in (200, 206)
+            and "text/html" not in content_type
+            and "login.1c.ru" not in final_url.lower()
+        )
+
+        try:
+            r.close()
+        except Exception:
+            pass
+
+        return ok, r.status_code, final_url, content_type
+
+    except Exception as e:
+        return False, 0, "", f"{type(e).__name__}: {e}"
+
+
+def find_direct_downloads_v8_url(item: dict, login: str, password: str, log_func=None):
+    for url in downloads_v8_candidate_urls(item):
+        ok, status, final_url, content_type = probe_direct_download_url(url, login, password)
+
+        if log_func:
+            log_func(f"Проверяю прямой URL: {url} -> HTTP {status}; {content_type}; final={final_url}")
+
+        if ok:
+            return url
+
+    return ""
+
+
+def download_direct_downloads_v8_url(url: str, dest_dir: Path, login: str, password: str, log_func, fallback_title: str = ""):
+    import requests
+    from urllib.parse import urlparse, unquote
+
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    name = Path(unquote(urlparse(url).path)).name
+    if not name:
+        name = safe_name(fallback_title or "platform_download.bin") + ".bin"
+
+    dest = dest_dir / name
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 updater1c-linux",
+    }
+
+    with requests.get(
+        url,
+        auth=(login, password),
+        headers=headers,
+        stream=True,
+        timeout=120,
+        allow_redirects=True,
+    ) as r:
+        if r.status_code >= 400:
+            raise RuntimeError(f"HTTP {r.status_code}: {url}\n{(r.text or '')[:500]}")
+
+        content_type = (r.headers.get("Content-Type") or "").lower()
+        if "text/html" in content_type:
+            head = r.raw.read(500, decode_content=True)
+            raise RuntimeError(f"Вместо архива получен HTML: {content_type}; {head!r}")
+
+        total = int(r.headers.get("Content-Length") or 0)
+        done = 0
+        last_percent = -1
+
+        with dest.open("wb") as f:
+            for chunk in r.iter_content(chunk_size=1024 * 1024):
+                if not chunk:
+                    continue
+
+                f.write(chunk)
+                done += len(chunk)
+
+                if total:
+                    percent = int(done * 100 / total)
+                    if percent != last_percent and (percent % 5 == 0 or percent == 100):
+                        last_percent = percent
+                        log_func(f"Скачано {percent}% ({done // 1024 // 1024} / {total // 1024 // 1024} МБ)")
+                else:
+                    log_func(f"Скачано {done // 1024 // 1024} МБ")
+
+    log_func(f"Файл скачан: {dest}")
+    return dest
+
+
+def releases_platform_nick(version: str) -> str:
+    version = str(version or "")
+    if version.startswith("8.5."):
+        return "Platform85"
+    return "Platform83"
+
+
+
+
+
+def releases_version_file_candidate_names(item: dict):
+    version = item.get("version") or extract_release_from_any(item.get("title") or "")
+    vu = version_to_underscore(version)
+    code = str(item.get("code") or "").lower()
+    title = str(item.get("title") or "").lower()
+
+    names = []
+
+    def add(name):
+        if name and name not in names:
+            names.append(name)
+
+    is_linux = "linux" in code or "linux" in title
+    is_windows = "windows" in code or "win" in code or "windows" in title
+    is_macos = "mac" in code or "macos" in title or "mac os" in title
+
+    is_thin = "thin" in code or "тонкий клиент" in title
+    is_server = "server" in code or "сервер" in title
+    is_client = "client" in code or "клиент" in title
+
+    is_deb = "deb" in code or "deb" in title
+    is_rpm = "rpm" in code or "rpm" in title
+
+    if is_linux:
+        if is_deb:
+            if is_thin:
+                add(f"thin.client.deb64_{vu}.tar.gz")
+                add(f"client.deb64_{vu}.tar.gz")
+                add(f"deb64thin_{vu}.tar.gz")
+            elif is_server:
+                add(f"deb64_{vu}.tar.gz")
+                add(f"server.deb64_{vu}.tar.gz")
+            else:
+                add(f"deb64_{vu}.tar.gz")
+                add(f"client.deb64_{vu}.tar.gz")
+        elif is_rpm:
+            if is_thin:
+                add(f"thin.client.rpm64_{vu}.tar.gz")
+                add(f"client.rpm64_{vu}.tar.gz")
+                add(f"rpm64thin_{vu}.tar.gz")
+            elif is_server:
+                add(f"rpm64_{vu}.tar.gz")
+                add(f"server.rpm64_{vu}.tar.gz")
+            else:
+                add(f"rpm64_{vu}.tar.gz")
+                add(f"client.rpm64_{vu}.tar.gz")
+        else:
+            if is_thin:
+                add(f"thin.client.deb64_{vu}.tar.gz")
+                add(f"client.deb64_{vu}.tar.gz")
+                add(f"thin.client.rpm64_{vu}.tar.gz")
+                add(f"client.rpm64_{vu}.tar.gz")
+            elif is_server:
+                add(f"deb64_{vu}.tar.gz")
+                add(f"rpm64_{vu}.tar.gz")
+            else:
+                add(f"deb64_{vu}.tar.gz")
+                add(f"rpm64_{vu}.tar.gz")
+                add(f"thin.client.deb64_{vu}.tar.gz")
+                add(f"thin.client.rpm64_{vu}.tar.gz")
+
+        return names
+
+    if is_windows:
+        if is_thin:
+            add(f"setuptc64_{vu}.rar")
+            add(f"setuptc_{vu}.rar")
+        elif is_server:
+            add(f"windows64_{vu}.rar")
+        elif is_client:
+            add(f"windows64full_{vu}.rar")
+            add(f"windows64_{vu}.rar")
+        else:
+            add(f"windows64full_{vu}.rar")
+            add(f"windows64_{vu}.rar")
+            add(f"windows_{vu}.rar")
+
+        return names
+
+    if is_macos:
+        add(f"clientosx_{vu}.dmg")
+        add(f"macos_{vu}.dmg")
+        return names
+
+    add(f"thin.client.deb64_{vu}.tar.gz")
+    add(f"deb64_{vu}.tar.gz")
+    add(f"thin.client.rpm64_{vu}.tar.gz")
+    add(f"rpm64_{vu}.tar.gz")
+    add(f"setuptc64_{vu}.rar")
+    add(f"windows64_{vu}.rar")
+
+    return names
+
+def releases_version_file_urls(item: dict):
+    from urllib.parse import quote
+
+    version = item.get("version") or extract_release_from_any(item.get("title") or "")
+    vu = version_to_underscore(version)
+    nick = releases_platform_nick(version)
+
+    urls = []
+
+    for fn in releases_version_file_candidate_names(item):
+        rel_path = f"Platform\\{vu}\\{fn}"
+        url = (
+            "https://releases.1c.ru/version_file"
+            + "?nick=" + quote(nick, safe="")
+            + "&ver=" + quote(str(version), safe="")
+            + "&path=" + quote(rel_path, safe="")
+        )
+        if url not in urls:
+            urls.append(url)
+
+    return urls
+
+
+def releases_form_login_session(login: str, password: str, log_func=None):
+    import re
+    import html as _html
+    import requests
+    from urllib.parse import urljoin
+
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": "Mozilla/5.0 updater1c-linux",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    })
+
+    r = s.get("https://releases.1c.ru", timeout=30, allow_redirects=True)
+    text = r.text or ""
+
+    if log_func:
+        log_func(f"releases.1c.ru start: HTTP {r.status_code}; final={r.url}; len={len(text)}")
+
+    # Если вдруг уже авторизованы.
+    if "login.1c.ru" not in r.url.lower() and "loginForm" not in text:
+        return s
+
+    action = ""
+    execution = ""
+
+    m = re.search(r'<form[^>]+id=["\']loginForm["\'][^>]+action=["\']([^"\']+)["\']', text, re.I | re.S)
+    if not m:
+        m = re.search(r'<form[^>]+action=["\']([^"\']+)["\'][^>]*id=["\']loginForm["\']', text, re.I | re.S)
+    if m:
+        action = _html.unescape(m.group(1))
+
+    m = re.search(r'name=["\']execution["\']\s+value=["\']([^"\']+)["\']', text, re.I)
+    if m:
+        execution = _html.unescape(m.group(1))
+
+    if not action or not execution:
+        raise RuntimeError("Не найдена форма loginForm/execution на странице login.1c.ru")
+
+    post_url = urljoin("https://login.1c.ru", action)
+
+    data = {
+        "inviteCode": "",
+        "inviteType": "",
+        "username": login,
+        "password": password,
+        "rememberMe": "on",
+        "execution": execution,
+        "_eventId": "submit",
+        "geolocation": "",
+        "submit": "Войти",
+    }
+
+    rr = s.post(
+        post_url,
+        data=data,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        timeout=30,
+        allow_redirects=True,
+    )
+
+    if log_func:
+        log_func(f"login form submit: HTTP {rr.status_code}; final={rr.url}; len={len(rr.text or '')}")
+
+    # Пробуем открыть releases после формы.
+    chk = s.get("https://releases.1c.ru/project/Platform83", timeout=30, allow_redirects=True)
+
+    if log_func:
+        log_func(f"releases check Platform83: HTTP {chk.status_code}; final={chk.url}; len={len(chk.text or '')}")
+
+    if "login.1c.ru/login" in chk.url.lower():
+        raise RuntimeError("После form-login releases.1c.ru снова вернул страницу логина")
+
+    return s
+
+
+def extract_download_distribution_href(page_url: str, html_text: str):
+    import re
+    import html as _html
+    from urllib.parse import urljoin
+
+    text = html_text or ""
+
+    # Ищем ссылку с текстом "Скачать дистрибутив".
+    pattern = r'<a\b[^>]*href=["\']([^"\']+)["\'][^>]*>(.*?)</a>'
+    for m in re.finditer(pattern, text, re.I | re.S):
+        href = _html.unescape(m.group(1) or "")
+        body = re.sub(r"<[^>]+>", " ", m.group(2) or "", flags=re.S)
+        title = _html.unescape(re.sub(r"\s+", " ", body).strip()).lower()
+        if "скачать дистрибутив" in title or "скачать" == title:
+            return urljoin(page_url, href)
+
+    # fallback: рядом с текстом.
+    pos = text.lower().find("скачать дистрибутив")
+    if pos >= 0:
+        left = text[max(0, pos - 1200):pos]
+        hrefs = re.findall(r'href=["\']([^"\']+)["\']', left, re.I | re.S)
+        if hrefs:
+            return urljoin(page_url, _html.unescape(hrefs[-1]))
+
+    return ""
+
+
+
+
+
+
+
+def score_version_file_link_for_item(item: dict, href: str, label: str) -> int:
+    text = (href + " " + label).lower()
+    code = str(item.get("code") or "").lower()
+    title = str(item.get("title") or "").lower()
+
+    score = 0
+
+    want_linux = "linux" in code or "linux" in title
+    want_windows = "windows" in code or "win" in code or "windows" in title
+    want_deb = "deb" in code or "deb-based" in title or "deb-based" in code
+    want_rpm = "rpm" in code or "rpm-based" in title or "rpm-based" in code
+    want_generic_linux = want_linux and not want_deb and not want_rpm
+    want_thin = "thin" in code or "тонкий клиент" in title
+    want_server = "server" in code or "сервер" in title
+    want_platform = "platform" in code or "технологическая платформа" in title
+    want_x64 = "x64" in code or "64-bit" in title or "64" in code
+
+    is_server_link = any(x in text for x in [
+        "server",
+        "server64",
+        "сервер",
+        "with_all_clients",
+        "all_clients",
+    ])
+
+    is_platform_link = any(x in text for x in [
+        "platform",
+        "технологическая платформа",
+        "windows64full",
+    ])
+
+    is_windows_link = any(x in text for x in [
+        "windows",
+        "setuptc",
+        "windows64",
+        ".rar",
+    ])
+
+    is_linux_link = any(x in text for x in [
+        "linux",
+        "deb",
+        "rpm",
+        "deb64",
+        "rpm64",
+        ".zip",
+        ".tar.gz",
+    ])
+
+    is_deb_link = "deb" in text or "deb64" in text or "deb-based" in text
+    is_rpm_link = "rpm" in text or "rpm64" in text or "rpm-based" in text
+
+    is_thin_link = any(x in text for x in [
+        "thin",
+        "тонкий клиент",
+        "setuptc",
+        "thin.client",
+    ])
+
+    is_client_link = any(x in text for x in [
+        "client",
+        "клиент",
+        "setuptc",
+    ])
+
+    is_arm_link = "arm" in text or "aarch64" in text or "эльбрус" in text
+
+    # ОС.
+    if want_windows:
+        score += 50 if is_windows_link else -200
+        if is_linux_link and not is_windows_link:
+            score -= 300
+
+    if want_linux:
+        score += 50 if is_linux_link else -200
+        if is_windows_link and not is_linux_link:
+            score -= 300
+
+    # DEB/RPM.
+    if want_deb:
+        score += 80 if is_deb_link else -180
+        if is_rpm_link:
+            score -= 250
+
+    if want_rpm:
+        score += 80 if is_rpm_link else -180
+        if is_deb_link:
+            score -= 250
+
+    # Generic Linux: выбран "для Linux", а не DEB/RPM.
+    # Поэтому generic label получает плюс, а DEB/RPM — штраф.
+    if want_generic_linux:
+        label_is_plain_linux = (
+            "для linux" in text
+            and "deb-based" not in text
+            and "rpm-based" not in text
+            and "deb64" not in text
+            and "rpm64" not in text
+        )
+
+        if label_is_plain_linux:
+            score += 160
+
+        if is_deb_link or is_rpm_link:
+            score -= 120
+
+    # Разрядность.
+    if want_x64:
+        score += 20 if any(x in text for x in ["64", "x64", "64-bit"]) else -60
+
+    if want_x64 and is_arm_link:
+        score -= 300
+
+    # Тонкий клиент.
+    if want_thin:
+        score += 100 if is_thin_link else -120
+
+        if is_server_link:
+            score -= 500
+
+        if is_platform_link and not is_thin_link:
+            score -= 400
+
+        if want_windows and "setuptc" in text:
+            score += 220
+
+        if want_linux and "thin.client" in text and not want_generic_linux:
+            score += 220
+
+    # Сервер.
+    if want_server:
+        score += 120 if is_server_link else -120
+        if is_thin_link and not is_server_link:
+            score -= 200
+
+    # Платформа.
+    if want_platform:
+        score += 120 if is_platform_link or is_server_link else -80
+
+    if not want_thin and "client" in code:
+        score += 70 if is_client_link else 0
+
+    return score
+
+
+def discover_releases_version_file_urls(session, item: dict, log_func=None):
+    import re
+    import html as _html
+    from urllib.parse import urljoin
+
+    version = item.get("version") or extract_release_from_any(item.get("title") or "")
+    nick = releases_platform_nick(version)
+
+    page_url = f"https://releases.1c.ru/version_files?nick={nick}&ver={version}"
+
+    try:
+        r = session.get(page_url, timeout=40, allow_redirects=True)
+    except Exception as e:
+        if log_func:
+            log_func(f"Не удалось открыть список файлов релиза: {type(e).__name__}: {e}")
+        return []
+
+    body = r.text or ""
+
+    if log_func:
+        log_func(f"Список файлов релиза получен: HTTP {r.status_code}; len={len(body)}")
+
+    if "login.1c.ru/login" in r.url.lower():
+        if log_func:
+            log_func("Список файлов релиза вернул форму входа.")
+        return []
+
+    links = []
+
+    for m in re.finditer(r'<a\b[^>]*href=["\']([^"\']*version_file[^"\']+)["\'][^>]*>(.*?)</a>', body, re.I | re.S):
+        href = _html.unescape(m.group(1) or "")
+        raw_label = m.group(2) or ""
+        label = re.sub(r"<[^>]+>", " ", raw_label, flags=re.S)
+        label = _html.unescape(re.sub(r"\s+", " ", label).strip())
+        full = urljoin(r.url, href)
+
+        score = score_version_file_link_for_item(item, full, label)
+
+        if score > 0:
+            links.append((score, full, label))
+
+    links.sort(key=lambda x: x[0], reverse=True)
+
+    if log_func and links:
+        log_func("Лучшие кандидаты из списка релиза:")
+        for score, full, label in links[:3]:
+            log_func(f"  score={score}; {label}")
+
+    result = []
+    seen = set()
+
+    for score, full, label in links:
+        if full in seen:
+            continue
+
+        seen.add(full)
+        result.append(full)
+
+    return result
+
+def filename_from_content_disposition(headers) -> str:
+    import re
+    from urllib.parse import unquote
+
+    try:
+        cd = headers.get("Content-Disposition") or headers.get("content-disposition") or ""
+        if not cd:
+            return ""
+
+        m = re.search(r"filename\\*=UTF-8''([^;]+)", cd, re.I)
+        if m:
+            name = unquote(m.group(1)).strip().strip('"')
+            if name and "." in name:
+                return name
+
+        m = re.search(r'filename="?([^";]+)"?', cd, re.I)
+        if m:
+            name = unquote(m.group(1)).strip().strip('"')
+            if name and "." in name:
+                return name
+
+        return ""
+
+    except Exception:
+        return ""
+
+
+
+def download_by_releases_version_file(item: dict, dest_dir: Path, login: str, password: str, log_func, progress_func=None, cancel_checker=None):
+    import requests
+    from urllib.parse import urlparse, unquote
+
+    def is_cancelled():
+        try:
+            return bool(cancel_checker and cancel_checker())
+        except Exception:
+            return False
+
+    s = releases_form_login_session(login, password, log_func)
+
+    guessed_urls = releases_version_file_urls(item)
+    discovered_urls = discover_releases_version_file_urls(s, item, log_func)
+
+    urls = []
+    for url in discovered_urls + guessed_urls:
+        if url not in urls:
+            urls.append(url)
+
+    for page_url in urls:
+        if is_cancelled():
+            raise RuntimeError("Операция отменена пользователем")
+
+        page_file_name = filename_from_version_file_url(page_url)
+        log_func(f"Проверяю файл релиза: {page_file_name or page_url.split('/version_file?', 1)[-1]}")
+
+        r = s.get(page_url, timeout=40, allow_redirects=True)
+        html_text = r.text or ""
+
+        if r.status_code == 404:
+            continue
+
+        if "login.1c.ru/login" in r.url.lower():
+            log_func("Страница файла вернула форму входа, пробую следующий кандидат.")
+            continue
+
+        href = extract_download_distribution_href(r.url, html_text)
+
+        if not href:
+            continue
+
+        log_func("Ссылка скачивания найдена. Начинаю загрузку...")
+
+        dest_dir.mkdir(parents=True, exist_ok=True)
+
+        # Главное исправление:
+        # dl04/dl05 URL выглядит как /public/file/get/<uuid>, поэтому имя файла
+        # нужно брать из исходного version_file path=...
+        name = page_file_name
+
+        with s.get(href, stream=True, timeout=180, allow_redirects=True) as rr:
+            if rr.status_code >= 400:
+                raise RuntimeError(f"HTTP {rr.status_code}: {href}\n{(rr.text or '')[:500]}")
+
+            content_type = (rr.headers.get("Content-Type") or "").lower()
+
+            if "text/html" in content_type:
+                head = rr.raw.read(500, decode_content=True)
+                raise RuntimeError(f"Вместо архива получен HTML: {content_type}; {head!r}")
+
+            if not name:
+                name = filename_from_content_disposition(rr.headers)
+
+            if not name:
+                parsed_name = Path(unquote(urlparse(href).path)).name
+                if parsed_name and "." in parsed_name and parsed_name.lower() not in ("get", "download"):
+                    name = parsed_name
+
+            if not name:
+                # Последний fallback только для неизвестного файла.
+                name = safe_name(item.get("title") or "platform") + ".bin"
+
+            log_func(f"Имя файла релиза: {name}")
+
+            dest = dest_dir / name
+            part = dest.with_name(dest.name + ".part")
+
+            if part.exists():
+                try:
+                    part.unlink()
+                except Exception:
+                    pass
+
+            total = int(rr.headers.get("Content-Length") or 0)
+            done = 0
+            last_percent = -1
+
+            if progress_func:
+                progress_func(0, done, total, "Начало скачивания")
+
+            try:
+                with part.open("wb") as f:
+                    for chunk in rr.iter_content(chunk_size=1024 * 1024):
+                        if is_cancelled():
+                            raise RuntimeError("Операция отменена пользователем")
+
+                        if not chunk:
+                            continue
+
+                        f.write(chunk)
+                        done += len(chunk)
+
+                        if total:
+                            percent = int(done * 100 / total)
+                            if progress_func and percent != last_percent:
+                                progress_func(percent, done, total, f"{percent}%")
+                                last_percent = percent
+                        else:
+                            if progress_func:
+                                progress_func(0, done, total, f"{done // 1024 // 1024} МБ")
+
+                part.replace(dest)
+
+            except Exception:
+                try:
+                    if part.exists():
+                        part.unlink()
+                except Exception:
+                    pass
+                raise
+
+        if progress_func:
+            progress_func(100, done, total, "100%")
+
+        log_func(f"Файл скачан: {dest}")
+        return dest
+
+    return None
+
+def open_folder_external(path_value):
+    path = Path(str(path_value or "")).expanduser()
+    path.mkdir(parents=True, exist_ok=True)
+    try:
+        subprocess.Popen(["xdg-open", str(path)])
+    except Exception:
+        try:
+            subprocess.Popen(["gio", "open", str(path)])
+        except Exception:
+            pass
+
+
+def default_platform_download_dir_from_config(config=None):
+    try:
+        settings = (config or {}).get("settings", {})
+        value = settings.get("platform_download_dir") or settings.get("platforms_dir") or ""
+        if value:
+            return str(Path(value).expanduser())
+    except Exception:
+        pass
+    return "/mnt/DataStore/Updater1C/1c-platforms"
+
+
+
+
+
+
+
+def is_supported_archive_for_unpack(path_value) -> bool:
+    name = Path(path_value).name.lower()
+
+    non_archives = (
+        ".bin",
+        ".run",
+        ".deb",
+        ".rpm",
+        ".msi",
+        ".exe",
+        ".dmg",
+    )
+
+    if name.endswith(non_archives):
+        return False
+
+    archive_suffixes = (
+        ".zip",
+        ".rar",
+        ".7z",
+        ".tar",
+        ".tar.gz",
+        ".tgz",
+        ".tar.xz",
+        ".txz",
+        ".tar.bz2",
+        ".tbz2",
+        ".gz",
+        ".bz2",
+        ".xz",
+    )
+
+    return name.endswith(archive_suffixes)
+
+def make_executable_if_needed(path_value, log_func=None):
+    path = Path(path_value)
+    name = path.name.lower()
+
+    if name.endswith((".bin", ".run")) and path.exists():
+        try:
+            path.chmod(path.stat().st_mode | 0o111)
+            if log_func:
+                log_func(f"Файл сделан исполняемым: {path}")
+        except Exception as e:
+            if log_func:
+                log_func(f"Не удалось сделать файл исполняемым: {type(e).__name__}: {e}")
+
+
+
+def filename_from_version_file_url(page_url: str) -> str:
+    from urllib.parse import urlparse, parse_qs, unquote
+    import html as _html
+
+    try:
+        url = _html.unescape(str(page_url or ""))
+        q = parse_qs(urlparse(url).query)
+
+        path_value = ""
+        for key in ("path", "Path", "file", "File"):
+            values = q.get(key)
+            if values:
+                path_value = values[0]
+                break
+
+        path_value = unquote(_html.unescape(path_value or ""))
+        path_value = path_value.replace("\\\\", "/").replace("\\", "/")
+        path_value = path_value.strip("/")
+
+        name = Path(path_value).name.strip()
+
+        # Имя должно быть реальным файлом, а не Platform/8_3_27_2130.
+        if name and "." in name:
+            return name
+
+        return ""
+
+    except Exception:
+        return ""
+
+
+
+def unpack_platform_archive(archive: Path, unpack_dir: Path, log_func=None):
+    import shutil
+    import subprocess
+
+    archive = Path(archive)
+    unpack_dir = Path(unpack_dir)
+
+    def log(msg):
+        if log_func:
+            log_func(msg)
+
+    if not is_supported_archive_for_unpack(archive):
+        make_executable_if_needed(archive, log)
+        log(f"Распаковка пропущена: файл не является архивом ({archive.name})")
+        return None
+
+    name_lower = archive.name.lower()
+
+    if unpack_dir.exists():
+        shutil.rmtree(unpack_dir)
+
+    unpack_dir.mkdir(parents=True, exist_ok=True)
+
+    if name_lower.endswith(".rar"):
+        # В GNOME двойной клик обычно идет через file-roller / backend файлового менеджера.
+        # Поэтому сначала используем file-roller — он у тебя руками распаковывает этот RAR.
+        file_roller = shutil.which("file-roller")
+
+        if file_roller:
+            log("Распаковка RAR через file-roller...")
+            cmd = [file_roller, "--extract-to", str(unpack_dir), str(archive)]
+            r = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+
+            if r.returncode == 0:
+                return unpack_dir
+
+            log(f"file-roller не смог распаковать RAR: exit={r.returncode}; {r.stdout[-800:]}")
+
+        seven_zz = shutil.which("7zz")
+
+        if seven_zz:
+            log("Распаковка RAR через 7zz...")
+            cmd = [seven_zz, "x", "-y", f"-o{unpack_dir}", str(archive)]
+            r = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+
+            if r.returncode == 0:
+                return unpack_dir
+
+            log(f"7zz не смог распаковать RAR: exit={r.returncode}; {r.stdout[-800:]}")
+
+        # Старый 7z/p7zip специально не используем: он уже дал Unsupported Method.
+        log("RAR не распакован автоматически. Архив оставлен без удаления.")
+        return None
+
+    shutil.unpack_archive(str(archive), str(unpack_dir))
+    return unpack_dir
+
 class PlatformDownloadDialog(Gtk.Dialog):
     def __init__(self, parent):
+        self.cancel_requested = False
         super().__init__(
             title="Скачать платформу 1с — Обновлятор 1C Linux",
             transient_for=parent,
@@ -837,6 +2979,12 @@ class PlatformDownloadDialog(Gtk.Dialog):
         self.set_default_size(930, 680)
         self.add_button("Отмена", Gtk.ResponseType.CANCEL)
         self.add_button("Скачать", Gtk.ResponseType.OK)
+
+        self.selected_branch = ""
+        self.selected_version = ""
+        self.available_meta = {}
+        self.queue_meta = {}
+        self.release_meta = {}
 
         box = self.get_content_area()
         main = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
@@ -850,36 +2998,57 @@ class PlatformDownloadDialog(Gtk.Dialog):
 
         self.version_link = Gtk.Button(label="загрузить с releases.1c.ru")
         self.version_link.connect("clicked", self.on_open_releases)
-        self.version_link.connect("clicked", self.on_open_releases)
-        self.version_link.connect("clicked", self.on_open_releases)
+
         self.component = Ui.combo(["Все компоненты платформы", "Сервер", "Тонкий клиент", "Клиент"])
         self.os_combo = Ui.combo(["Windows", "Linux", "macOS"])
         self.bit64 = Ui.check("64 бит")
+        self.bit64.set_active(True)
         self.arm = Ui.check("ARM")
         self.elbrus = Ui.check("Эльбрус")
         self.web_clients = Ui.check("Клиенты для веб-сервера")
 
+        for widget in [self.component, self.os_combo, self.bit64, self.arm, self.elbrus, self.web_clients]:
+            try:
+                widget.connect("changed", self.on_filter_changed)
+            except Exception:
+                try:
+                    widget.connect("toggled", self.on_filter_changed)
+                except Exception:
+                    pass
+
         grid.attach(Ui.label("Версия 1С:"), 0, 0, 1, 1)
         grid.attach(self.version_link, 1, 0, 4, 1)
+
         grid.attach(Ui.label("Платформа:"), 0, 1, 1, 1)
         grid.attach(self.component, 1, 1, 1, 1)
         grid.attach(self.bit64, 2, 1, 1, 1)
         grid.attach(self.arm, 3, 1, 1, 1)
         grid.attach(self.elbrus, 4, 1, 1, 1)
+
         grid.attach(Ui.label("ОС:"), 0, 2, 1, 1)
         grid.attach(self.os_combo, 1, 2, 1, 1)
         grid.attach(self.web_clients, 2, 2, 3, 1)
 
-        main.pack_start(Ui.label("Нажмите ссылку «загрузить с releases.1c.ru», чтобы получить список версий платформы."), False, False, 0)
+        main.pack_start(
+            Ui.label("Нажмите «загрузить с releases.1c.ru», выберите ветку 8.3/8.5, затем выберите конкретную версию."),
+            False,
+            False,
+            0,
+        )
 
-        main.pack_start(Ui.label("<b>Элементы для выбора (выбор двойным щелчком или нажатием Enter):</b>"), False, False, 0)
-        self.available = Gtk.TreeView(model=Gtk.ListStore(str))
+        main.pack_start(Ui.label("<b>Элементы для выбора (двойной щелчок или Enter):</b>"), False, False, 0)
+        self.available_store = Gtk.ListStore(str)
+        self.available = Gtk.TreeView(model=self.available_store)
         self._add_text_column(self.available, "Элементы для выбора", 0)
+        self.available.connect("row-activated", self.on_available_row_activated)
         main.pack_start(self._scrolled(self.available), True, True, 0)
 
         main.pack_start(Ui.label("<b>Элементы для скачивания (используйте Delete для удаления):</b>"), False, False, 0)
-        self.queue = Gtk.TreeView(model=Gtk.ListStore(str))
+        self.queue_store = Gtk.ListStore(str)
+        self.queue = Gtk.TreeView(model=self.queue_store)
         self._add_text_column(self.queue, "Элементы для скачивания", 0)
+        self.queue.connect("key-press-event", self.on_queue_key_press)
+        self.queue.connect("row-activated", self.on_queue_row_activated)
         main.pack_start(self._scrolled(self.queue), True, True, 0)
 
         self.unpack = Ui.check("Распаковать архив после скачивания")
@@ -889,31 +3058,34 @@ class PlatformDownloadDialog(Gtk.Dialog):
 
         dir_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         dir_box.pack_start(Ui.label("Скачивать сюда"), False, False, 0)
-        dir_box.pack_start(Ui.entry("/mnt/DataStore/Updater1C/1c-platforms"), True, True, 0)
+        self.download_dir = Ui.entry("/mnt/DataStore/Updater1C/1c-platforms")
+        dir_box.pack_start(self.download_dir, True, True, 0)
         dir_box.pack_start(Gtk.Button(label="..."), False, False, 0)
-        dir_box.pack_start(Gtk.Button(label="Открыть"), False, False, 0)
+        open_btn = Gtk.Button(label="Открыть")
+        open_btn.connect("clicked", self.on_open_download_dir)
+        dir_box.pack_start(open_btn, False, False, 0)
         main.pack_start(dir_box, False, False, 0)
 
+
+        progress_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        main.pack_start(progress_box, False, False, 0)
+
+        self.download_progress = Gtk.ProgressBar()
+        self.download_progress.set_show_text(True)
+        self.download_progress.set_text("Готово к скачиванию")
+        progress_box.pack_start(self.download_progress, True, True, 0)
+
+        self.open_download_dir_btn = Ui.button("Открыть папку")
+        self.open_download_dir_btn.connect("clicked", self.open_download_dir)
+        progress_box.pack_start(self.open_download_dir_btn, False, False, 0)
+
         self.show_all()
-
-
-    def on_open_releases(self, *_):
-        try:
-            subprocess.Popen(["xdg-open", "https://releases.1c.ru/"])
-        except Exception:
-            pass
-
-        try:
-            store = self.available.get_model()
-            store.clear()
-            store.append(["Открыт сайт releases.1c.ru. Автоматическая загрузка списка будет подключена следующим этапом."])
-        except Exception:
-            pass
-
 
     def _add_text_column(self, tree, title, column):
         renderer = Gtk.CellRendererText()
         col = Gtk.TreeViewColumn(title, renderer, text=column)
+        col.set_resizable(True)
+        col.set_expand(True)
         tree.append_column(col)
 
     def _scrolled(self, child):
@@ -923,6 +3095,432 @@ class PlatformDownloadDialog(Gtk.Dialog):
         sw.add(child)
         return sw
 
+
+
+
+
+
+    def on_open_releases(self, *_):
+        dlg = PlatformBranchSelectDialog(self)
+        response = dlg.run()
+        branch = dlg.selected_branch()
+        dlg.destroy()
+
+        if response != Gtk.ResponseType.OK:
+            return
+
+        self.selected_branch = branch
+        self.selected_version = ""
+        self.available_meta.clear()
+        self.queue_meta.clear()
+        self.release_meta.clear()
+        self.available_store.clear()
+        self.queue_store.clear()
+
+        self.available_store.append([f"Подготовка списка версий платформы {branch}..."])
+
+        # Пока список формируем локально, но только по опубликованным версиям,
+        # чтобы в очередь не попадали локально установленные, но нескачиваемые сборки.
+        versions = []
+
+        if branch.startswith("8.5"):
+            versions.extend([
+                "8.5.1.1343",
+                "8.5.1.1302",
+                "8.5.1.1236",
+                "8.5.1.1150",
+            ])
+        else:
+            versions.extend([
+                "8.3.27.2130",
+                "8.3.27.2074",
+                "8.3.27.1786",
+                "8.3.25.1394",
+                "8.3.24.1548",
+            ])
+
+        versions = sorted(set(versions), key=version_key, reverse=True)
+
+        self.available_store.clear()
+
+        for version in versions:
+            self.release_meta[version] = {
+                "version": version,
+                "title": version,
+                "url": "",
+            }
+            self.available_store.append([version])
+
+    def on_available_row_activated(self, tree, path, column):
+        model = tree.get_model()
+        it = model.get_iter(path)
+        if not it:
+            return
+
+        value = model[it][0]
+        version = extract_release_from_any(value)
+
+        if version and value.strip() == version:
+            self.selected_version = version
+            self.fill_available_distributions_for_version(version)
+            return
+
+        item = self.available_meta.get(value)
+        if item:
+            self.add_item_to_queue(item)
+
+    def on_filter_changed(self, *_):
+        if self.selected_version:
+            self.fill_available_distributions_for_version(self.selected_version)
+
+
+
+
+
+
+
+    def fill_available_distributions_for_version(self, version):
+        """
+        ВАЖНО:
+        Здесь нельзя синхронно ходить на releases.1c.ru, иначе GTK зависает.
+        Поэтому список пакетов для выбора формируем локально, быстро.
+        Реальный versionFileUrl/downloadUrl ищется позже — при нажатии "Скачать",
+        уже в фоновом потоке.
+        """
+        self.available_store.clear()
+        self.available_meta.clear()
+
+        component = self.component.get_active_text() or "Все компоненты платформы"
+        os_name = self.os_combo.get_active_text() or "Linux"
+        branch = self.selected_branch or ("8.5" if str(version).startswith("8.5.") else "8.3")
+
+        items = platform_distribution_variants(
+            version=version,
+            branch=branch,
+            component=component,
+            os_name=os_name,
+            bit64=self.bit64.get_active(),
+            arm=self.arm.get_active(),
+            elbrus=self.elbrus.get_active(),
+            web_clients=self.web_clients.get_active(),
+        )
+
+        if not items:
+            self.available_store.append([f"Нет элементов для выбранных фильтров: {version}"])
+            return
+
+        current_section = ""
+
+        for item in items:
+            section = item.get("section") or ""
+            if section and section != current_section:
+                current_section = section
+                self.available_store.append([f"▸ {section}"])
+
+            title = item["title"]
+            self.available_store.append([title])
+            self.available_meta[title] = item
+
+    def add_item_to_queue(self, item):
+        title = item.get("title") or ""
+        if not title:
+            return
+
+        if title in self.queue_meta:
+            return
+
+        self.queue_store.append([title])
+        self.queue_meta[title] = item
+
+    def remove_queue_iter(self, it):
+        if not it:
+            return
+        title = self.queue_store[it][0]
+        self.queue_meta.pop(title, None)
+        self.queue_store.remove(it)
+
+    def on_queue_row_activated(self, tree, path, column):
+        model = tree.get_model()
+        it = model.get_iter(path)
+        if it:
+            title = model[it][0]
+            self.queue_meta.pop(title, None)
+            model.remove(it)
+
+    def on_queue_key_press(self, tree, event):
+        try:
+            keyval = event.keyval
+            keyname = Gdk.keyval_name(keyval)
+        except Exception:
+            keyname = ""
+
+        if keyname != "Delete":
+            return False
+
+        model, it = tree.get_selection().get_selected()
+        if it:
+            title = model[it][0]
+            self.queue_meta.pop(title, None)
+            model.remove(it)
+
+        return True
+
+
+    def get_queue_items(self):
+        result = []
+        it = self.queue_store.get_iter_first()
+        while it:
+            title = self.queue_store[it][0]
+            item = self.queue_meta.get(title)
+            if item:
+                result.append(item)
+            it = self.queue_store.iter_next(it)
+        return result
+
+
+
+
+
+
+
+
+
+    def request_cancel_download(self, *_):
+        self.cancel_requested = True
+        try:
+            self.set_download_progress(0, "Отмена...")
+        except Exception:
+            pass
+
+    def is_download_cancelled(self):
+        return bool(getattr(self, "cancel_requested", False))
+
+    def set_download_progress(self, percent, text=""):
+        try:
+            value = max(0, min(100, int(percent or 0)))
+            self.download_progress.set_fraction(value / 100)
+            self.download_progress.set_text(text or f"{value}%")
+        except Exception:
+            pass
+
+    def open_download_dir(self, *_):
+        try:
+            open_folder_external(self.download_dir.get_text())
+        except Exception:
+            pass
+
+
+
+    def on_download_queue(self):
+        self.cancel_requested = False
+        items = self.get_queue_items()
+        if not items:
+            return
+
+        parent = self.get_transient_for()
+        if parent is not None and hasattr(parent, "switch_to_report_tab"):
+            parent.switch_to_report_tab()
+
+        def log(msg):
+            if parent is not None and hasattr(parent, "_append_log"):
+                GLib.idle_add(parent._append_log, msg)
+            else:
+                print(msg)
+
+        def op(**kwargs):
+            try:
+                if parent is not None and hasattr(parent, "set_current_operation"):
+                    GLib.idle_add(parent.set_current_operation, **kwargs)
+            except Exception:
+                pass
+
+        def progress(percent, done=0, total=0, text=""):
+            value = max(0, min(100, int(percent or 0)))
+
+            label = text or f"{value}%"
+            if total:
+                label = f"{value}% — {done // 1024 // 1024} / {total // 1024 // 1024} МБ"
+            elif done:
+                label = f"{done // 1024 // 1024} МБ"
+
+            try:
+                GLib.idle_add(self.set_download_progress, value, label)
+            except Exception:
+                pass
+
+            try:
+                if parent is not None and hasattr(parent, "set_report_progress"):
+                    GLib.idle_add(parent.set_report_progress, value, label)
+            except Exception:
+                pass
+
+        dest_dir = Path(self.download_dir.get_text()).expanduser()
+        unpack = self.unpack.get_active()
+        delete_after = self.delete_after.get_active()
+
+        login = ""
+        password = ""
+
+        if parent is not None:
+            try:
+                login = parent.settings.get("its_login") or ""
+                password = parent.get_its_password_for_update()
+            except Exception:
+                pass
+
+        def work():
+            import datetime
+
+            started = datetime.datetime.now().strftime("%H:%M:%S")
+            progress(0, 0, 0, "Подготовка")
+            op(
+                base="-",
+                release="-",
+                step="Подготовка",
+                action="Скачивание платформы",
+                mode="download",
+                status="выполняется",
+                pid="-",
+                started=started,
+            )
+
+            log("=== Скачивание платформы 1С ===")
+            log(f"Элементов в очереди: {len(items)}")
+            log(f"Каталог скачивания: {dest_dir}")
+            log(f"Распаковать после скачивания: {'да' if unpack else 'нет'}")
+            log(f"Удалить архив после распаковки: {'да' if delete_after else 'нет'}")
+            log(f"ИТС логин заполнен: {'да' if bool(login) else 'нет'}; пароль найден: {'да' if bool(password) else 'нет'}")
+
+            if not login or not password:
+                log("ОШИБКА: не найден логин/пароль ИТС.")
+                progress(0, 0, 0, "Ошибка: нет ИТС")
+                op(step="Ошибка", status="нет логина/пароля ИТС")
+                return
+
+            dest_dir.mkdir(parents=True, exist_ok=True)
+
+            for i, original_item in enumerate(items, 1):
+                item = dict(original_item)
+                title = item.get("title") or "-"
+                version = item.get("version") or extract_release_from_any(title) or ""
+
+                if self.is_download_cancelled():
+                    log("Операция отменена пользователем.")
+                    progress(0, 0, 0, "Отменено")
+                    op(action="Скачивание платформы", status="отменено")
+                    break
+
+                log("")
+                log(f"[{i}/{len(items)}] {title}")
+
+                archive = None
+                progress(0, 0, 0, f"[{i}/{len(items)}] Поиск ссылки")
+                op(
+                    release=version or "-",
+                    step=f"{i}/{len(items)}",
+                    action="Поиск ссылки скачивания",
+                    status="выполняется",
+                )
+
+                try:
+                    log("Поиск ссылки через releases.1c.ru/version_file...")
+                    archive = download_by_releases_version_file(
+                        item,
+                        dest_dir,
+                        login,
+                        password,
+                        log,
+                        progress_func=progress,
+                        cancel_checker=self.is_download_cancelled,
+                    )
+
+                    if archive:
+                        log("Скачивание завершено.")
+
+                except Exception as e:
+                    log(f"releases.1c.ru/version_file не сработал: {type(e).__name__}: {e}")
+
+                if archive is None:
+                    try:
+                        log("Пробую прямой подбор файла на downloads.v8.1c.ru/tmplts...")
+                        direct_v8_url = find_direct_downloads_v8_url(item, login, password, log)
+
+                        if direct_v8_url:
+                            log("Прямая ссылка найдена. Начинаю загрузку...")
+                            archive = download_direct_downloads_v8_url(
+                                direct_v8_url,
+                                dest_dir,
+                                login,
+                                password,
+                                log,
+                                str(title),
+                            )
+                        else:
+                            log("Прямой URL на downloads.v8.1c.ru не найден.")
+
+                    except Exception as e:
+                        log(f"Прямое скачивание downloads.v8.1c.ru не удалось: {type(e).__name__}: {e}")
+
+                if archive is None:
+                    log(f"ОШИБКА: не удалось скачать элемент: {title}")
+                    progress(0, 0, 0, "Ошибка скачивания")
+                    op(action="Скачивание", status="ошибка")
+                    continue
+
+                op(action="Файл скачан", status="скачан")
+
+                if unpack and archive:
+                    try:
+                        if is_supported_archive_for_unpack(archive):
+                            progress(100, 0, 0, "Распаковка")
+                            op(action="Распаковка архива", status="выполняется")
+
+                            # Распаковываем во временную папку.
+                            # Если архив после распаковки удаляем, итоговая папка будет называться точно как архив.
+                            # Если архив оставляем, добавляем _unpacked, потому файл и папка с одним именем рядом невозможны.
+                            temp_unpack_dir = archive.parent / (archive.name + "_unpack_tmp")
+                            final_unpack_dir = archive.parent / archive.name if delete_after else archive.parent / (archive.name + "_unpacked")
+
+                            result_dir = unpack_platform_archive(archive, temp_unpack_dir, log)
+
+                            if result_dir:
+                                if delete_after:
+                                    archive.unlink()
+                                    log(f"Архив удален после распаковки: {archive}")
+
+                                if final_unpack_dir.exists():
+                                    import shutil
+                                    if final_unpack_dir.is_dir():
+                                        shutil.rmtree(final_unpack_dir)
+                                    else:
+                                        final_unpack_dir.unlink()
+
+                                temp_unpack_dir.rename(final_unpack_dir)
+
+                                log(f"Распаковано: {final_unpack_dir}")
+
+                            op(action="Распаковка", status="готово")
+                        else:
+                            make_executable_if_needed(archive, log)
+                            log(f"Распаковка пропущена: {archive.name} не архив.")
+                            op(action="Распаковка", status="пропущена")
+
+                    except Exception as e:
+                        log(f"Не удалось распаковать архив: {type(e).__name__}: {e}")
+                        op(action="Распаковка", status="ошибка")
+
+                progress(100, 0, 0, "Готово")
+
+            log("Скачивание платформы: завершено")
+            log(f"Папка с файлами платформы: {dest_dir}")
+            op(step="Завершено", action="Скачивание платформы", status="готово")
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_open_download_dir(self, *_):
+        path = Path(self.download_dir.get_text()).expanduser()
+        path.mkdir(parents=True, exist_ok=True)
+        subprocess.Popen(["xdg-open", str(path)])
 
 class MainWindow(Gtk.Window):
     def __init__(self):
@@ -1055,7 +3653,7 @@ class MainWindow(Gtk.Window):
             ("📁  Добавить базу", self.on_add_base),
             ("▤  Свойства", self.on_edit_base),
             ("🔄  Проверить настройки", self.on_check_selected_base_real),
-            ("▼  Скачать обновления", self.on_stub),
+            ("▼  Скачать обновления", self.on_download_updates_real),
             ("◻  Скачать платформу", self.on_download_platform),
             ("🔍  Установить обновления", self.on_auto_update),
         ]
@@ -1362,39 +3960,40 @@ class MainWindow(Gtk.Window):
             self._append_log(f"ОШИБКА запуска {mode}: {type(e).__name__}: {e}")
 
 
+
     def on_check_selected_base_real(self, *_):
         vals = self.selected_base_values()
         base = self.require_current_base_dict()
         if not base:
             return
 
-        self._append_log(f"--- Проверка базы: {base.get('name', '')} ---")
+        def work(log):
+            log(f"--- Проверка базы: {base.get('name', '')} ---")
 
-        kind, connect = normalize_base_kind_and_connect(base)
-        self._append_log(f"Тип: {kind}")
-        self._append_log(f"Подключение: {connect}")
-        self._append_log("Метод определения конфигурации: DumpConfigToFiles Configuration.xml")
+            kind, connect = normalize_base_kind_and_connect(base)
+            log(f"Тип: {kind}")
+            log(f"Подключение: {connect}")
+            log("Метод определения конфигурации: DumpConfigToFiles Configuration.xml")
 
-        try:
             if kind == "file":
                 db_path = Path(connect)
 
                 if db_path.is_file() and db_path.name.lower() == "1cv8.1cd":
-                    self._append_log(f"Файл базы найден: {db_path}")
+                    log(f"Файл базы найден: {db_path}")
                     base["connect"] = str(db_path.parent)
                 elif db_path.is_dir() and (db_path / "1Cv8.1CD").exists():
-                    self._append_log(f"Файловая база найдена: {db_path / '1Cv8.1CD'}")
+                    log(f"Файловая база найдена: {db_path / '1Cv8.1CD'}")
                 else:
-                    self._append_log(f"ОШИБКА: файловая база не найдена: {connect}")
+                    log(f"ОШИБКА: файловая база не найдена: {connect}")
                     return
 
-            result = detect_metadata_by_dump(base, self.settings, self._append_log)
+            result = detect_metadata_by_dump(base, self.settings, log)
 
             name = result.get("config_name") or ""
             synonym = result.get("config_synonym") or ""
             version = result.get("config_version") or ""
 
-            self._append_log(f"Определено: {name} / {synonym} / {version}")
+            log(f"Определено: {name} / {synonym} / {version}")
 
             idx = vals.get("index", -1) if vals else -1
             if 0 <= idx < len(self.bases):
@@ -1413,14 +4012,13 @@ class MainWindow(Gtk.Window):
 
                 self.config["bases"] = self.bases
                 save_json(self.config_path, self.config)
-                self._load_bases_tree()
+                GLib.idle_add(self._load_bases_tree)
 
-            self._append_log(f"Текущая версия конфигурации: {version or '-'}")
-            self._append_log(f"Код программы обновлений: {base.get('update_program_name') or '-'}")
-            self._append_log("Проверка настроек: завершено")
+            log(f"Текущая версия конфигурации: {version or '-'}")
+            log(f"Код программы обновлений: {base.get('update_program_name') or '-'}")
+            log("Проверка настроек: завершено")
 
-        except Exception as e:
-            self._append_log(f"ОШИБКА проверки: {type(e).__name__}: {e}")
+        self.run_in_background("Проверка настроек", work)
 
 
 
@@ -1479,10 +4077,10 @@ class MainWindow(Gtk.Window):
             ("Конфигуратор", self.on_designer_base_real),
             ("Свойства", self.on_edit_base),
             ("Проверить настройки", self.on_check_selected_base_real),
-            ("Скачать обновления", self.on_stub),
+            ("Скачать обновления", self.on_download_updates_real),
             ("Скачать платформу", self.on_download_platform),
             ("Установить обновления", self.on_auto_update),
-            ("Очистить кэш", self.on_stub),
+            ("Очистить кэш", self.on_clear_cache_real),
         ]
 
         for label, handler in items:
@@ -1593,11 +4191,7 @@ class MainWindow(Gtk.Window):
         ]
         inner.append_page(self._form_tab(platform, combos=True), Ui.label("Платформа 1С"))
 
-        its = [
-            ("Логин ИТС/users.v8.1c.ru:", self.settings.get("its_login", "")),
-            ("Пароль ИТС:", "Пароль сохранен в системном хранилище" if self.settings.get("its_password_saved") else ""),
-        ]
-        inner.append_page(self._form_tab(its), Ui.label("ИТС"))
+        inner.append_page(self._build_its_tab(), Ui.label("ИТС"))
 
         service = [
             ("pg_dump:", self.settings.get("pg_dump_path", "")),
@@ -1611,8 +4205,129 @@ class MainWindow(Gtk.Window):
 
         buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         tab.pack_start(buttons, False, False, 0)
-        buttons.pack_start(Ui.button("сохранить настройки"), False, False, 0)
+        btn_save_settings = Ui.button("сохранить настройки")
+        btn_save_settings.connect("clicked", self.on_save_settings_real)
+        buttons.pack_start(btn_save_settings, False, False, 0)
+
         buttons.pack_start(Ui.button("Найти платформы 1С"), False, False, 0)
+
+
+    def _build_its_tab(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        box.set_border_width(10)
+
+        grid = Gtk.Grid()
+        grid.set_column_spacing(12)
+        grid.set_row_spacing(12)
+        box.pack_start(grid, False, False, 0)
+
+        self.its_login_entry = Ui.entry(self.settings.get("its_login", ""))
+
+        self.its_password_entry = Ui.entry("")
+        self.its_password_entry.set_visibility(False)
+        if self.settings.get("its_password_saved"):
+            self.its_password_entry.set_placeholder_text("Пароль сохранен в системном хранилище")
+        else:
+            self.its_password_entry.set_placeholder_text("Введите пароль ИТС")
+
+        grid.attach(Ui.label("Логин ИТС/users.v8.1c.ru:"), 0, 0, 1, 1)
+        grid.attach(self.its_login_entry, 1, 0, 1, 1)
+        grid.attach(Ui.label("Пароль ИТС:"), 0, 1, 1, 1)
+        grid.attach(self.its_password_entry, 1, 1, 1, 1)
+
+        hint = Ui.label("<small>Пароль сохраняется в системном хранилище Linux. В config.json пароль открытым текстом не пишется.</small>")
+        grid.attach(hint, 1, 2, 1, 1)
+
+        return box
+
+
+
+    def save_its_settings_to_store(self):
+        login = self.its_login_entry.get_text().strip() if hasattr(self, "its_login_entry") else self.settings.get("its_login", "")
+        password = self.its_password_entry.get_text() if hasattr(self, "its_password_entry") else ""
+
+        self.settings["its_login"] = login
+
+        if password:
+            saved = False
+
+            try:
+                ensure_project_root_on_path()
+                from secret_store import set_secret, its_password_account
+                set_secret(its_password_account(), password)
+                saved = True
+            except Exception as e:
+                self._append_log(f"Внимание: не удалось сохранить ИТС пароль через secret_store: {type(e).__name__}: {e}")
+
+            if not saved:
+                try:
+                    import keyring
+                    keyring.set_password("updater1c-linux", "its_password", password)
+                    saved = True
+                except Exception as e:
+                    self._append_log(f"Внимание: не удалось сохранить ИТС пароль через keyring: {type(e).__name__}: {e}")
+
+            if saved:
+                self.settings["its_password_saved"] = True
+                self.settings["its_password"] = ""
+
+                try:
+                    self.its_password_entry.set_text("")
+                    self.its_password_entry.set_placeholder_text("Пароль сохранен в системном хранилище")
+                except Exception:
+                    pass
+
+                self._append_log("ИТС пароль сохранен в системном хранилище.")
+            else:
+                self._append_log("ОШИБКА: ИТС пароль не удалось сохранить в системное хранилище.")
+
+        self.config["settings"] = self.settings
+        save_json(self.config_path, self.config)
+
+
+    def get_its_password_for_update(self):
+        try:
+            if hasattr(self, "its_password_entry"):
+                typed = self.its_password_entry.get_text() or ""
+                if typed:
+                    return typed
+        except Exception:
+            pass
+
+        direct = self.settings.get("its_password") or ""
+        if direct:
+            return direct
+
+        try:
+            ensure_project_root_on_path()
+            from secret_store import get_secret, its_password_account
+            value = get_secret(its_password_account()) or ""
+            if value:
+                return value
+        except Exception:
+            pass
+
+        for service, account in [
+            ("updater1c-linux", "its_password"),
+            ("Обновлятор 1С", "its_password"),
+            ("updater1c", "its_password"),
+        ]:
+            try:
+                import keyring
+                value = keyring.get_password(service, account) or ""
+                if value:
+                    return value
+            except Exception:
+                pass
+
+        return ""
+
+    def on_save_settings_real(self, *_):
+        self.save_its_settings_to_store()
+        self.config["settings"] = self.settings
+        save_json(self.config_path, self.config)
+        self._append_log("Настройки сохранены.")
+
 
     def _form_tab(self, rows, combos=False, service=False):
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
@@ -1649,6 +4364,7 @@ class MainWindow(Gtk.Window):
         self.script_text.get_buffer().set_text("# Следующий этап: rac/ras — блокировка пользователей и регламентных заданий.\n")
         tab.pack_start(self._scrolled(self.script_text), True, True, 0)
 
+
     def _build_report_tab(self):
         tab = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         tab.set_border_width(14)
@@ -1660,6 +4376,7 @@ class MainWindow(Gtk.Window):
         for text, handler in [
             ("▶ Запустить обновление", self.on_auto_update),
             ("▼ Скачать обновления", self.on_stub),
+            ("◻ Скачать платформу", self.on_download_platform),
             ("🔍 Установить обновления", self.on_auto_update),
             ("✖ Отменить", self.on_stub),
         ]:
@@ -1686,8 +4403,16 @@ class MainWindow(Gtk.Window):
 
         links = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         left.pack_start(links, False, False, 0)
-        links.pack_start(Ui.button("Открыть папку с отчетами"), False, False, 0)
+
+        b_reports = Ui.button("Открыть папку с отчетами")
+        b_reports.connect("clicked", self.open_reports_dir)
+        links.pack_start(b_reports, False, False, 0)
+
         links.pack_start(Ui.button("Открыть текущий лог"), False, False, 0)
+
+        b_platforms = Ui.button("Открыть папку с платформами")
+        b_platforms.connect("clicked", self.open_platform_download_dir)
+        links.pack_start(b_platforms, False, False, 0)
 
         right = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
         right.set_size_request(420, -1)
@@ -1699,9 +4424,14 @@ class MainWindow(Gtk.Window):
         right.pack_start(current, False, False, 0)
         current.attach(Ui.label("<b>Текущая операция</b>"), 0, 0, 2, 1)
 
+        self.current_operation_labels = {}
         for i, label in enumerate(["База:", "Релиз:", "Шаг:", "Действие:", "Режим:", "Статус:", "PID процесса:", "Время запуска:"], 1):
             current.attach(Ui.label(label), 0, i, 1, 1)
-            current.attach(Ui.label("-"), 1, i, 1, 1)
+            value = Ui.label("-")
+            value.set_xalign(0)
+            key = label.replace(":", "")
+            self.current_operation_labels[key] = value
+            current.attach(value, 1, i, 1, 1)
 
         right.pack_start(Ui.label("<b>Аварийное завершение</b>\nПроцесс 1С может зависнуть и не завершиться автоматически.\nНажмите «Прервать», чтобы завершить его принудительно."), False, False, 0)
         abort = Ui.button("■  Прервать процесс сейчас")
@@ -1717,6 +4447,11 @@ class MainWindow(Gtk.Window):
         right.pack_start(Ui.check("Закрыть 1С перед восстановлением", True), False, False, 0)
         right.pack_start(Ui.label("<b>Внимание!</b>\nВосстановление заменит текущую базу данными из резервной копии."), False, False, 0)
 
+        self.report_progress = Gtk.ProgressBar()
+        self.report_progress.set_show_text(True)
+        self.report_progress.set_text("Нет активного скачивания")
+        tab.pack_start(self.report_progress, False, False, 0)
+
         bottom = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=30)
         tab.pack_start(bottom, False, False, 0)
         bottom.pack_start(Ui.label("Баз в списке: 0"), False, False, 0)
@@ -1729,10 +4464,302 @@ class MainWindow(Gtk.Window):
         sw.add(child)
         return sw
 
+
+    def switch_to_report_tab(self):
+        try:
+            self.notebook.set_current_page(3)
+        except Exception:
+            pass
+
+    def _append_log_safe(self, text):
+        GLib.idle_add(self._append_log, text)
+
+    def run_in_background(self, title, work_func):
+        self.switch_to_report_tab()
+        self._append_log(f"=== {title} ===")
+
+        def runner():
+            try:
+                work_func(lambda s: GLib.idle_add(self._append_log, s))
+            except Exception as e:
+                GLib.idle_add(self._append_log, f"ОШИБКА операции: {type(e).__name__}: {e}")
+
+        t = threading.Thread(target=runner, daemon=True)
+        t.start()
+
+
+
+
+    def set_current_operation(self, **kwargs):
+        try:
+            mapping = {
+                "base": "База",
+                "release": "Релиз",
+                "step": "Шаг",
+                "action": "Действие",
+                "mode": "Режим",
+                "status": "Статус",
+                "pid": "PID процесса",
+                "started": "Время запуска",
+            }
+
+            labels = getattr(self, "current_operation_labels", {})
+
+            for key, value in kwargs.items():
+                label_key = mapping.get(key, key)
+                if label_key in labels:
+                    labels[label_key].set_text(str(value if value not in (None, "") else "-"))
+        except Exception:
+            pass
+
+    def set_report_progress(self, percent, text=""):
+        try:
+            value = max(0, min(100, int(percent or 0)))
+            self.report_progress.set_fraction(value / 100)
+            self.report_progress.set_text(text or f"{value}%")
+        except Exception:
+            pass
+
+    def open_reports_dir(self, *_):
+        try:
+            path = self.settings.get("reports_dir") or self.settings.get("report_dir") or str(Path.home() / "1c-update-reports")
+            open_folder_external(path)
+        except Exception as e:
+            self._append_log(f"Не удалось открыть папку отчетов: {type(e).__name__}: {e}")
+
+    def open_platform_download_dir(self, *_):
+        try:
+            path = default_platform_download_dir_from_config(self.config)
+            open_folder_external(path)
+        except Exception as e:
+            self._append_log(f"Не удалось открыть папку платформ: {type(e).__name__}: {e}")
+
     def _append_log(self, text):
         buf = self.report.get_buffer()
         end = buf.get_end_iter()
         buf.insert(end, text + "\n")
+
+
+    def gtk_operation_target_indices(self):
+        """Если есть отмеченные базы — берем их. Иначе текущую выбранную."""
+        result = []
+
+        def walk(parent_iter=None):
+            child = self.base_store.iter_children(parent_iter)
+            while child is not None:
+                is_group = self.base_store.iter_has_child(child)
+                if is_group:
+                    walk(child)
+                else:
+                    checked = bool(self.base_store[child][0])
+                    try:
+                        idx = int(self.base_store[child][8])
+                    except Exception:
+                        idx = -1
+                    if checked and 0 <= idx < len(self.bases):
+                        result.append(idx)
+                child = self.base_store.iter_next(child)
+
+        walk(None)
+
+        if result:
+            return result
+
+        vals = self.selected_base_values()
+        if vals and not vals.get("is_group"):
+            idx = vals.get("index", -1)
+            if 0 <= idx < len(self.bases):
+                return [idx]
+
+        return []
+
+    def on_download_updates_real(self, *_):
+        self.switch_to_report_tab()
+        indexes = self.gtk_operation_target_indices()
+        if not indexes:
+            self._append_log("ОШИБКА: не выбраны базы для скачивания обновлений.")
+            return
+
+        login = self.settings.get("its_login") or ""
+        password = self.get_its_password_for_update()
+
+        if not login or not password:
+            self._append_log("ОШИБКА: не заполнены логин/пароль ИТС. Проверьте вкладку Настройки программы → ИТС.")
+            return
+
+        api = GtkOneCUpdateApi(login, password)
+
+        self._append_log("=== Скачивание обновлений конфигураций ===")
+        self._append_log(f"Баз к обработке: {len(indexes)}")
+
+        for pos, idx in enumerate(indexes, 1):
+            if not (0 <= idx < len(self.bases)):
+                continue
+
+            base = self.bases[idx]
+            name = base.get("name") or f"base_{idx}"
+            program = base.get("update_program_name") or ""
+            version = base.get("config_version") or ""
+            platform_version = base.get("platform_version") or "8.3"
+
+            self._append_log("")
+            self._append_log(f"[{pos}/{len(indexes)}]")
+            self._append_log(f"--- Скачивание обновлений для базы: {name} ---")
+            self._append_log(f"Текущая версия конфигурации: {version or '-'}")
+            self._append_log(f"Код программы обновлений: {program or '-'}")
+            self._append_log(f"Версия платформы для update-api: {platform_version or '8.3'}")
+
+            if not program or not version:
+                self._append_log("ПРОПУСК: не заполнены код программы обновлений или версия конфигурации. Сначала выполните Проверить настройки.")
+                continue
+
+            try:
+                info = api.check_conf_update(program, version, platform_version)
+
+                if not info:
+                    self._append_log("Обновления не найдены или update-api не вернул configurationUpdateResponse.")
+                    continue
+
+                target_version = (
+                    info.get("targetVersionNumber")
+                    or info.get("newVersionNumber")
+                    or info.get("versionNumber")
+                    or info.get("configurationVersion")
+                    or ""
+                )
+
+                platform_required = (
+                    info.get("platformVersion")
+                    or info.get("requiredPlatformVersion")
+                    or info.get("minimalPlatformVersion")
+                    or ""
+                )
+
+                size = info.get("size") or info.get("totalSize") or info.get("updateSize") or ""
+                upgrade_sequence = info.get("upgradeSequence") or []
+
+                program_uin = (
+                    info.get("programVersionUin")
+                    or info.get("configurationVersionUin")
+                    or info.get("uin")
+                    or ""
+                )
+
+                self._append_log(f"Целевая версия: {target_version or '-'}")
+                self._append_log(f"Минимальная/требуемая платформа по ответу API: {platform_required or '-'}")
+                if size:
+                    self._append_log(f"Размер по ответу API: {size}")
+                self._append_log(f"Последовательность обновлений: {upgrade_sequence}")
+
+                program_root = update_program_dir(self.settings, program)
+                metadata_dir = program_root / "_metadata"
+                metadata_dir.mkdir(parents=True, exist_ok=True)
+
+                (metadata_dir / f"update_info_{now_stamp()}.json").write_text(
+                    json.dumps({"info": info}, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+
+                if not upgrade_sequence:
+                    self._append_log("ПРОПУСК: update-api не вернул upgradeSequence.")
+                    continue
+
+                if not program_uin:
+                    self._append_log("ПРОПУСК: update-api не вернул programVersionUin/configurationVersionUin.")
+                    self._append_log(json.dumps(info, ensure_ascii=False, indent=2)[:3000])
+                    continue
+
+                files = api.get_conf_download_data(upgrade_sequence, program_uin)
+
+                (metadata_dir / f"download_data_{now_stamp()}.json").write_text(
+                    json.dumps({"info": info, "files": files}, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+
+                if not files:
+                    self._append_log("ПРОПУСК: update-api не вернул configurationUpdateDataList.")
+                    continue
+
+                for n, item in enumerate(files, 1):
+                    release = update_item_release_version(item, target_version) or target_version or f"step_{n}"
+                    release_dir = program_root / safe_name(release)
+
+                    url = update_item_url(item) or find_download_url_recursive(item)
+                    if not url:
+                        self._append_log(f"ПРОПУСК: для файла {n} нет URL скачивания.")
+                        self._append_log(json.dumps(item, ensure_ascii=False, indent=2)[:2000])
+                        continue
+
+                    filename = update_item_filename(item, url, fallback=f"{safe_name(release)}.zip")
+                    dest = release_dir / filename
+
+                    self._append_log(f"Скачивание {n}/{len(files)}:")
+                    self._append_log(f"Версия релиза: {release}")
+                    self._append_log(f"Имя файла: {filename}")
+                    self._append_log(f"Папка релиза: {release_dir}")
+                    self._append_log(f"URL: {url}")
+
+                    if dest.exists() and dest.stat().st_size > 0:
+                        self._append_log(f"Файл уже есть: {dest}")
+                    else:
+                        download_url_to_file(url, dest, self._append_log, login, password)
+
+                self._append_log(f"Скачивание обновлений: база {name} завершено")
+
+            except Exception as e:
+                self._append_log(f"ОШИБКА скачивания обновлений для {name}: {type(e).__name__}: {e}")
+
+    def on_clear_cache_real(self, *_):
+        dlg = Gtk.MessageDialog(
+            transient_for=self,
+            flags=0,
+            message_type=Gtk.MessageType.WARNING,
+            buttons=Gtk.ButtonsType.OK_CANCEL,
+            text="Очистить кэш 1С?",
+        )
+        dlg.format_secondary_text(
+            "Будут удалены пользовательские кэш-каталоги 1С в домашней папке.\n"
+            "Информационные базы и настройки списка баз не удаляются."
+        )
+        response = dlg.run()
+        dlg.destroy()
+
+        if response != Gtk.ResponseType.OK:
+            self._append_log("Очистка кэша отменена.")
+            return
+
+        candidates = [
+            Path.home() / ".1cv8" / "1C" / "1cv8",
+            Path.home() / ".1cv8" / "1C" / "1Cv8",
+            Path.home() / ".cache" / "1C" / "1cv8",
+            Path.home() / ".cache" / "1C" / "1Cv8",
+        ]
+
+        self._append_log("=== Очистка кэша 1С ===")
+
+        for folder in candidates:
+            if not folder.exists():
+                self._append_log(f"Нет папки: {folder}")
+                continue
+
+            removed = 0
+            for child in folder.iterdir():
+                try:
+                    if child.is_dir():
+                        shutil.rmtree(child)
+                    else:
+                        child.unlink()
+                    removed += 1
+                except Exception as e:
+                    self._append_log(f"Не удалось удалить {child}: {e}")
+
+            self._append_log(f"Очищено элементов: {removed} в {folder}")
+
+        self._append_log("Очистка кэша 1С завершена.")
+
+    def on_cancel_operation_real(self, *_):
+        self._append_log("Отмена: активная фоновая операция GTK сейчас не запущена.")
+
 
     def on_stub(self, *_):
         self._append_log("GTK preview: обработчик будет подключен на следующем этапе переноса логики.")
@@ -1795,7 +4822,9 @@ class MainWindow(Gtk.Window):
 
     def on_download_platform(self, *_):
         dlg = PlatformDownloadDialog(self)
-        dlg.run()
+        response = dlg.run()
+        if response == Gtk.ResponseType.OK:
+            dlg.on_download_queue()
         dlg.destroy()
 
 
