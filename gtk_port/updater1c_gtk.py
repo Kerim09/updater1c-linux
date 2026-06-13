@@ -25,7 +25,7 @@ from gi.repository import Gtk, Gdk, GLib
 
 
 APP_NAME = "Обновлятор 1C Linux"
-APP_VERSION = "1.2.1"
+APP_VERSION = "1.2.2"
 CONFIG_DIR = Path.home() / ".config" / "updater1c-linux"
 
 DEFAULT_1CESTART = "/opt/1cv8/common/1cestart"
@@ -535,6 +535,59 @@ def find_config_file():
     return candidates[0]
 
 
+
+def u1c_fix_1c_public_download_url(url):
+    """Нормализует endpoint скачивания файлов 1С."""
+    url = str(url or "").strip()
+    url = url.replace("/public/file/get/", "/public/file/get/")
+    url = url.replace("/public/file/get", "/public/file/get")
+    return url
+
+
+
+def u1c_download_url_variants(url):
+    """Возвращает варианты URL скачивания файла 1С.
+
+    update-api для обновлений конфигураций иногда отдает:
+      /public/file/tmplts/get/<uuid>
+
+    Но рабочий endpoint у dl*.1c.ru часто:
+      /public/file/get/<uuid>
+
+    Поэтому пробуем оба варианта.
+    """
+    url = str(url or "").strip()
+    if not url:
+        return []
+
+    variants = []
+
+    def add(u):
+        if u and u not in variants:
+            variants.append(u)
+
+    add(url)
+
+    add(url.replace("/public/file/tmplts/get/", "/public/file/get/"))
+    add(url.replace("/public/file/tmplts/get", "/public/file/get"))
+
+    add(url.replace("/public/file/get/", "/public/file/tmplts/get/"))
+    add(url.replace("/public/file/get", "/public/file/tmplts/get"))
+
+    return variants
+
+
+def u1c_normalize_first_download_url(url):
+    """Для логирования сразу показывает предпочтительный URL."""
+    variants = u1c_download_url_variants(url)
+
+    for u in variants:
+        if "/public/file/get/" in u:
+            return u
+
+    return variants[0] if variants else str(url or "")
+
+
 class Ui:
     @staticmethod
     def label(text):
@@ -803,6 +856,8 @@ class PlatformVersionSelectDialog(Gtk.Dialog):
 
         self.store = Gtk.ListStore(str, str)
         self.tree = Gtk.TreeView(model=self.store)
+        self.tree.set_headers_visible(True)
+        self.tree.set_enable_tree_lines(True)
 
         r1 = Gtk.CellRendererText()
         c1 = Gtk.TreeViewColumn("Версия", r1, text=0)
@@ -863,8 +918,25 @@ class PlatformVersionSelectDialog(Gtk.Dialog):
 
         self.show_all()
 
-    def on_row_activated(self, *_):
-        self.response(Gtk.ResponseType.OK)
+
+    def on_row_activated(self, tree, path, column):
+        try:
+            model = tree.get_model()
+            treeiter = model.get_iter(path)
+            if not treeiter:
+                return
+
+            is_group = bool(model.get_value(treeiter, 5))
+            if is_group:
+                if tree.row_expanded(path):
+                    tree.collapse_row(path)
+                else:
+                    tree.expand_row(path, False)
+                return
+
+            self.response(Gtk.ResponseType.OK)
+        except Exception:
+            pass
 
     def selected_version(self):
         model, it = self.tree.get_selection().get_selected()
@@ -933,6 +1005,446 @@ class LaunchParamsDialog(Gtk.Dialog):
         start, end = buf.get_bounds()
         return buf.get_text(start, end, True).strip()
 
+
+
+
+class TemplateSelectDialogGtk(Gtk.Dialog):
+    """GTK-выбор шаблона 1С по логике старого TemplateSelectDialog."""
+
+    def __init__(self, parent=None):
+        super().__init__(title="Выбор шаблона 1С", transient_for=parent, flags=Gtk.DialogFlags.MODAL)
+        self.set_default_size(900, 560)
+
+        self.selected_template = ""
+        self.selected_template_kind = ""
+        self.selected_template_name = ""
+        self.selected_template_version = ""
+        self.extra_roots = []
+
+        self.add_button("Отмена", Gtk.ResponseType.CANCEL)
+        self.add_button("OK", Gtk.ResponseType.OK)
+        self.set_default_response(Gtk.ResponseType.OK)
+
+        box = self.get_content_area()
+        box.set_border_width(10)
+        box.set_spacing(8)
+
+        info = Gtk.Label(label="Выберите поставляемую конфигурацию для начала работы или демонстрационный пример.")
+        info.set_xalign(0)
+        info.set_line_wrap(True)
+        box.pack_start(info, False, False, 0)
+
+        self.template_filter = Gtk.ComboBoxText()
+        for key, title in [
+            ("all", "Показывать все шаблоны"),
+            ("clean", "Только чистые рабочие базы"),
+            ("demo", "Только демонстрационные базы"),
+            ("cf", "Только конфигурационные файлы .cf"),
+        ]:
+            self.template_filter.append(key, title)
+        self.template_filter.set_active_id("all")
+        self.template_filter.connect("changed", lambda *_: self.load_templates())
+        box.pack_start(self.template_filter, False, False, 0)
+
+        toolbar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+
+        btn_refresh = Gtk.Button(label="Обновить")
+        btn_add_dir = Gtk.Button(label="Выбрать папку шаблонов...")
+        btn_choose_file = Gtk.Button(label="Выбрать файл/папку вручную...")
+
+        btn_refresh.connect("clicked", lambda *_: self.load_templates())
+        btn_add_dir.connect("clicked", self.choose_root)
+        btn_choose_file.connect("clicked", self.choose_file_or_folder)
+
+        toolbar.pack_start(btn_refresh, False, False, 0)
+        toolbar.pack_start(btn_add_dir, False, False, 0)
+        toolbar.pack_start(btn_choose_file, False, False, 0)
+        box.pack_start(toolbar, False, False, 0)
+
+        self.store = Gtk.ListStore(str, str, str, str, str, str, str)
+        # 0 name, 1 type title, 2 version, 3 folder/path, 4 payload, 5 kind, 6 product
+
+        self.tree = Gtk.TreeView(model=self.store)
+        self.tree.set_headers_visible(True)
+        self.tree.set_enable_tree_lines(True)
+        self.tree.set_headers_visible(True)
+        self.tree.get_selection().set_mode(Gtk.SelectionMode.SINGLE)
+
+        for idx, title, width in [
+            (6, "Продукт", 230),
+            (0, "Шаблон", 260),
+            (1, "Тип", 180),
+            (2, "Версия", 110),
+            (3, "Путь", 360),
+        ]:
+            renderer = Gtk.CellRendererText()
+            column = Gtk.TreeViewColumn(title, renderer, text=idx)
+            column.set_resizable(True)
+            column.set_min_width(80)
+            column.set_fixed_width(width)
+            self.tree.append_column(column)
+
+        self.tree.connect("row-activated", lambda *_: self.response(Gtk.ResponseType.OK))
+
+        scroller = Gtk.ScrolledWindow()
+        scroller.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        scroller.add(self.tree)
+        box.pack_start(scroller, True, True, 0)
+
+        self.load_templates()
+        self.show_all()
+
+
+
+    def _template_group_name(self, item):
+        """Наименование конфигурации для группировки."""
+        if not isinstance(item, dict):
+            return "Прочее"
+
+        for key in ("config_name", "display_name", "product_name", "config", "product"):
+            value = str(item.get(key) or "").strip()
+            if value:
+                return value
+
+        tmpl = str(item.get("template_name") or item.get("name") or "").strip()
+        if tmpl:
+            return tmpl
+
+        return "Прочее"
+
+    def _template_release_name(self, item):
+        """Текст релиза внутри группы."""
+        if not isinstance(item, dict):
+            return ""
+
+        version = str(item.get("version") or "").strip()
+        typ = str(item.get("type") or "").strip()
+        template_name = str(item.get("template_name") or item.get("name") or "").strip()
+
+        parts = []
+        if version:
+            parts.append(version)
+        if typ and typ.lower() not in ("", "шаблон"):
+            parts.append(typ)
+        if not version and template_name:
+            parts.append(template_name)
+
+        return " — ".join(parts) if parts else "Без версии"
+
+    def _template_version_sort_key(self, value):
+        s = str(value or "").strip()
+        nums = re.findall(r'\d+', s)
+        if nums:
+            return tuple(int(x) for x in nums)
+        return (0,)
+
+    def _selected_template_item_from_tree(self):
+        try:
+            selection = self.tree.get_selection()
+            model, treeiter = selection.get_selected()
+            if not treeiter:
+                return None
+
+            is_group = bool(model.get_value(treeiter, 5))
+            if is_group:
+                return None
+
+            item = model.get_value(treeiter, 6)
+            if isinstance(item, dict):
+                return item
+        except Exception:
+            pass
+        return None
+
+    def template_roots(self):
+        from pathlib import Path
+
+        roots = [
+            Path("/mnt/DataStore/Updater1C/1c-updates"),
+        ]
+
+        # Папки, добавленные вручную кнопкой "Выбрать папку шаблонов..."
+        roots.extend(self.extra_roots)
+
+        result = []
+        seen = set()
+
+        for root in roots:
+            try:
+                root = Path(root).expanduser()
+                key = str(root)
+
+                if key not in seen and root.exists():
+                    seen.add(key)
+                    result.append(root)
+            except Exception:
+                pass
+
+        return result
+
+    def read_template_meta(self, folder):
+        import re
+
+        name = folder.name
+        version = ""
+
+        mft = folder / "1cv8.mft"
+
+        if mft.exists():
+            try:
+                txt = mft.read_text(encoding="utf-8", errors="ignore")
+
+                for line in txt.splitlines():
+                    low = line.lower().strip()
+
+                    if low.startswith("name=") or low.startswith("caption="):
+                        name = line.split("=", 1)[1].strip().strip('"') or name
+                    elif low.startswith("version="):
+                        version = line.split("=", 1)[1].strip().strip('"')
+            except Exception:
+                pass
+
+        if not version:
+            m = re.search(r"(\d+[._]\d+[._]\d+(?:[._]\d+)?)", str(folder))
+
+            if m:
+                version = m.group(1).replace("_", ".")
+
+        return name, version
+
+    def product_group_name(self, folder, name):
+        text = (str(folder) + " " + str(name or "")).lower()
+
+        if "accounting" in text or "бухгалтер" in text:
+            return "1С:Бухгалтерия предприятия", "Бухгалтерия предприятия"
+
+        if "trade" in text or "торгов" in text:
+            return "1С:Управление торговлей", "Управление торговлей"
+
+        if "hrm" in text or "зарплат" in text or "zup" in text:
+            return "1С:Зарплата и управление персоналом", "Зарплата и управление персоналом"
+
+        return "Шаблоны 1С", name or folder.name
+
+    def template_variants(self, folder):
+        name, version = self.read_template_meta(folder)
+        variants = []
+
+        rules = [
+            ("1Cv8new.dt", "clean", "Чистая рабочая база"),
+            ("1cv8new.dt", "clean", "Чистая рабочая база"),
+            ("1Cv8.dt", "demo", "Демо база"),
+            ("1cv8.dt", "demo", "Демо база"),
+            ("1Cv8.cf", "cf", "Чистая конфигурация .cf"),
+            ("1cv8.cf", "cf", "Чистая конфигурация .cf"),
+            ("1Cv8.1CD", "file", "Готовая файловая база 1Cv8.1CD"),
+        ]
+
+        for fn, kind, title in rules:
+            f = folder / fn
+
+            if f.exists():
+                variants.append({
+                    "name": name,
+                    "version": version,
+                    "kind": kind,
+                    "title": title,
+                    "payload": str(f),
+                    "folder": str(folder),
+                })
+
+        return variants
+
+
+    def refresh_templates(self, *_):
+        try:
+            items = list(self.scan_templates() or [])
+        except Exception:
+            items = []
+
+        filter_text = ""
+        try:
+            filter_text = str(self.filter_combo.get_active_text() or "").strip().lower()
+        except Exception:
+            pass
+
+        show_all = not filter_text or "все шаблоны" in filter_text
+
+        self.store.clear()
+
+        groups = {}
+        grouped_items = {}
+
+        for item in items:
+            group_name = self._template_group_name(item)
+            release_name = self._template_release_name(item)
+            type_name = str(item.get("type") or "").strip()
+            version = str(item.get("version") or "").strip()
+            path = str(item.get("path") or "").strip()
+
+            hay = " ".join([
+                group_name,
+                release_name,
+                type_name,
+                version,
+                path,
+                str(item.get("template_name") or ""),
+                str(item.get("product_name") or ""),
+            ]).lower()
+
+            if not show_all and filter_text not in hay:
+                continue
+
+            grouped_items.setdefault(group_name, []).append({
+                "release_name": release_name,
+                "type": type_name,
+                "version": version,
+                "path": path,
+                "item": item,
+            })
+
+        for group_name in sorted(grouped_items.keys(), key=lambda x: x.lower()):
+            parent = self.store.append(
+                None,
+                [group_name, "", "", "", "", True, None]
+            )
+            groups[group_name] = parent
+
+            children = grouped_items[group_name]
+            children.sort(
+                key=lambda x: self._template_version_sort_key(x.get("version")),
+                reverse=True
+            )
+
+            for row in children:
+                self.store.append(parent, [
+                    row["release_name"],
+                    "",
+                    row["type"],
+                    row["version"],
+                    row["path"],
+                    False,
+                    row["item"],
+                ])
+
+        try:
+            self.tree.expand_all()
+        except Exception:
+            pass
+
+    def choose_root(self, *_):
+        from pathlib import Path
+
+        dlg = Gtk.FileChooserDialog(
+            title="Выберите каталог шаблонов 1С",
+            transient_for=self,
+            action=Gtk.FileChooserAction.SELECT_FOLDER,
+        )
+        dlg.add_button("Отмена", Gtk.ResponseType.CANCEL)
+        dlg.add_button("Выбрать", Gtk.ResponseType.OK)
+
+        if dlg.run() == Gtk.ResponseType.OK:
+            path = dlg.get_filename()
+
+            if path:
+                self.extra_roots.append(Path(path))
+                self.load_templates()
+
+        dlg.destroy()
+
+    def choose_file_or_folder(self, *_):
+        from pathlib import Path
+
+        dlg = Gtk.FileChooserDialog(
+            title="Выберите .dt/.cf/папку шаблона",
+            transient_for=self,
+            action=Gtk.FileChooserAction.OPEN,
+        )
+        dlg.add_button("Отмена", Gtk.ResponseType.CANCEL)
+        dlg.add_button("Выбрать файл", Gtk.ResponseType.OK)
+        dlg.add_button("Выбрать папку", 1001)
+
+        resp = dlg.run()
+
+        if resp == Gtk.ResponseType.OK:
+            path = dlg.get_filename()
+
+            if path:
+                self.selected_template = path
+                low = path.lower()
+                self.selected_template_kind = "demo" if low.endswith(".dt") else "cf" if low.endswith(".cf") else "manual"
+                self.selected_template_name = Path(path).stem
+                self.selected_template_version = ""
+                dlg.destroy()
+                self.response(Gtk.ResponseType.OK)
+                return
+
+        elif resp == 1001:
+            dlg.destroy()
+
+            d2 = Gtk.FileChooserDialog(
+                title="Выберите папку шаблона",
+                transient_for=self,
+                action=Gtk.FileChooserAction.SELECT_FOLDER,
+            )
+            d2.add_button("Отмена", Gtk.ResponseType.CANCEL)
+            d2.add_button("Выбрать", Gtk.ResponseType.OK)
+
+            if d2.run() == Gtk.ResponseType.OK:
+                path = d2.get_filename()
+
+                if path:
+                    self.selected_template = path
+                    self.selected_template_kind = "manual"
+                    self.selected_template_name = Path(path).name
+                    self.selected_template_version = ""
+                    d2.destroy()
+                    self.response(Gtk.ResponseType.OK)
+                    return
+
+            d2.destroy()
+            return
+
+        dlg.destroy()
+
+    def accept_selected(self):
+        model, it = self.tree.get_selection().get_selected()
+
+        if it is None:
+            return False
+
+        payload = model[it][4]
+
+        if not payload:
+            return False
+
+        self.selected_template = payload
+        self.selected_template_kind = model[it][5] or ""
+        self.selected_template_name = model[it][0] or ""
+        self.selected_template_version = model[it][2] or ""
+
+        return True
+
+    def run(self):
+        while True:
+            resp = super().run()
+
+            if resp != Gtk.ResponseType.OK:
+                return resp
+
+            if self.selected_template or self.accept_selected():
+                return Gtk.ResponseType.OK
+
+            msg = Gtk.MessageDialog(
+                transient_for=self,
+                modal=True,
+                message_type=Gtk.MessageType.WARNING,
+                buttons=Gtk.ButtonsType.OK,
+                text="Выберите шаблон 1С",
+            )
+            msg.format_secondary_text("Выделите строку шаблона и нажмите OK или дважды щелкните по строке.")
+            msg.run()
+            msg.destroy()
 
 class BaseDialog(Gtk.Dialog):
     def __init__(
@@ -1066,16 +1578,71 @@ class BaseDialog(Gtk.Dialog):
             self.connect.set_text(dlg.get_filename() or "")
         dlg.destroy()
 
+
+
+
     def on_browse_template(self, *_):
+        parent = getattr(self, "parent_window", None) or self.get_transient_for()
+
+        action = ""
+
+        try:
+            if parent is not None and hasattr(parent, "add_base_action_key"):
+                action = parent.add_base_action_key(self)
+        except Exception:
+            action = ""
+
+        # Создание новой базы из шаблона 1С:
+        # открываем список шаблонов из /mnt/DataStore/Updater1C/1c-updates.
+        if action == "template" and parent is not None and hasattr(parent, "select_1c_template_for_dialog"):
+            parent.select_1c_template_for_dialog(self)
+            return
+
+        # Добавить существующую базу:
+        # шаблон здесь означает ручной .dt/.cf, без списка шаблонов.
+        if action == "existing" and parent is not None and hasattr(parent, "select_dt_cf_file_for_dialog"):
+            parent.select_dt_cf_file_for_dialog(self)
+            return
+
+        # Fallback: обычный выбор .dt/.cf.
         dlg = Gtk.FileChooserDialog(
-            title="Выберите шаблон/файл",
+            title="Выберите файл .dt или .cf",
             transient_for=self,
             action=Gtk.FileChooserAction.OPEN,
         )
         dlg.add_button("Отмена", Gtk.ResponseType.CANCEL)
         dlg.add_button("Выбрать", Gtk.ResponseType.OK)
+
+        try:
+            filt = Gtk.FileFilter()
+            filt.set_name("Файлы 1С (*.dt, *.cf)")
+            filt.add_pattern("*.dt")
+            filt.add_pattern("*.DT")
+            filt.add_pattern("*.cf")
+            filt.add_pattern("*.CF")
+            dlg.add_filter(filt)
+
+            all_filter = Gtk.FileFilter()
+            all_filter.set_name("Все файлы")
+            all_filter.add_pattern("*")
+            dlg.add_filter(all_filter)
+        except Exception:
+            pass
+
+        try:
+            dlg.set_current_folder(str(Path.home()))
+        except Exception:
+            pass
+
         if dlg.run() == Gtk.ResponseType.OK:
-            self.template.set_text(dlg.get_filename() or "")
+            path = dlg.get_filename() or ""
+
+            if path:
+                try:
+                    self.template.set_text(path)
+                except Exception:
+                    pass
+
         dlg.destroy()
 
     def on_find_platform_versions(self, *_):
@@ -3666,6 +4233,13 @@ class MainWindow(Gtk.Window):
 
         self.show_all()
 
+        try:
+            from gi.repository import GLib
+            GLib.idle_add(self.install_clipboard_paste_workaround, self)
+        except Exception:
+            pass
+
+
     def _apply_css(self):
         css = b"""
         window { background: #f7f8fa; font-size: 9pt; }
@@ -4350,18 +4924,34 @@ class MainWindow(Gtk.Window):
 
             idx = vals.get("index", -1) if vals else -1
             if 0 <= idx < len(self.bases):
-                self.bases[idx]["config_name"] = name
-                self.bases[idx]["config_synonym"] = synonym
-                self.bases[idx]["config_version"] = version
-
-                if not self.bases[idx].get("update_program_name"):
+                base["config_name"] = name
+                base["config_synonym"] = synonym
+                base["config_version"] = version
+                if not base.get("update_program_name"):
                     hay = (name + " " + synonym).lower()
+
                     if "бухгалтер" in hay or "accounting" in hay:
-                        self.bases[idx]["update_program_name"] = "Accounting"
-                    elif "документооборот" in hay:
-                        self.bases[idx]["update_program_name"] = "Document"
-                    elif "зарплата" in hay or "зуп" in hay:
-                        self.bases[idx]["update_program_name"] = "HRM"
+                        base["update_program_name"] = "Accounting"
+
+                    elif (
+                        "управление торговлей" in hay
+                        or "управлениеторговлей" in hay.replace(" ", "")
+                        or "торговл" in hay
+                        or "trade" in hay
+                    ):
+                        base["update_program_name"] = "Trade"
+
+                    elif "документооборот" in hay or "document" in hay or "docmng" in hay:
+                        base["update_program_name"] = "DocumentManagement"
+
+                    elif "зарплата" in hay or "зуп" in hay or "hrm" in hay or "salary" in hay:
+                        base["update_program_name"] = "HRM"
+
+                    elif "управление нашей фирмой" in hay or "унф" in hay or "smallbusiness" in hay:
+                        base["update_program_name"] = "SmallBusiness"
+
+                    elif "erp" in hay:
+                        base["update_program_name"] = "ERP"
 
                 self.config["bases"] = self.bases
                 save_json(self.config_path, self.config)
@@ -4372,8 +4962,6 @@ class MainWindow(Gtk.Window):
             log("Проверка настроек: завершено")
 
         self.run_in_background("Проверка настроек", work)
-
-
 
     def on_run_base_real(self, *_):
         self.run_base_mode("ENTERPRISE")
@@ -5178,6 +5766,8 @@ class MainWindow(Gtk.Window):
             pass
 
         self.normalize_base_dialog_response_buttons(dlg)
+
+        self.install_clipboard_paste_workaround(dlg)
 
         resp = dlg.run()
 
@@ -6156,6 +6746,1079 @@ class MainWindow(Gtk.Window):
 
         return False
 
+
+
+    def show_add_base_error(self, title, message):
+        try:
+            self.show_error(title, message)
+            return
+        except Exception:
+            pass
+
+        dlg = Gtk.MessageDialog(
+            transient_for=self,
+            modal=True,
+            message_type=Gtk.MessageType.ERROR,
+            buttons=Gtk.ButtonsType.OK,
+            text=str(title),
+        )
+        dlg.format_secondary_text(str(message))
+        dlg.run()
+        dlg.destroy()
+
+    def dialog_combo_text(self, combo):
+        try:
+            value = combo.get_active_text()
+
+            if value:
+                return str(value).strip()
+        except Exception:
+            pass
+
+        try:
+            model = combo.get_model()
+            active_iter = combo.get_active_iter()
+
+            if model is not None and active_iter is not None:
+                row = model[active_iter]
+
+                for value in row:
+                    if value:
+                        return str(value).strip()
+        except Exception:
+            pass
+
+        try:
+            return str(combo_text(combo) or "").strip()
+        except Exception:
+            return ""
+
+    def add_base_action_key(self, dlg):
+        text = self.dialog_combo_text(dlg.action).lower()
+
+        if "групп" in text:
+            return "group"
+
+        if "шаблон" in text:
+            return "template"
+
+        if "пуст" in text or "без конфигурац" in text:
+            return "empty"
+
+        return "existing"
+
+    def dialog_widget_row_children(self, widget):
+        if widget is None:
+            return []
+
+        try:
+            w = widget
+            grid = None
+            grid_child = None
+
+            while w is not None:
+                parent = w.get_parent()
+
+                if parent is not None and isinstance(parent, Gtk.Grid):
+                    grid = parent
+                    grid_child = w
+                    break
+
+                w = parent
+
+            if grid is None or grid_child is None:
+                return [widget]
+
+            top = grid.child_get_property(grid_child, "top-attach")
+            result = []
+
+            for child in grid.get_children():
+                try:
+                    if grid.child_get_property(child, "top-attach") == top:
+                        result.append(child)
+                except Exception:
+                    pass
+
+            return result or [widget]
+
+        except Exception:
+            return [widget]
+
+    def dialog_row_set_visible(self, widget, visible):
+        for child in self.dialog_widget_row_children(widget):
+            try:
+                if visible:
+                    child.show()
+                else:
+                    child.hide()
+            except Exception:
+                pass
+
+    def dialog_find_label(self, dlg, needles):
+        needles = [str(x).lower() for x in needles]
+        labels = []
+
+        def walk(w):
+            try:
+                children = w.get_children()
+            except Exception:
+                return
+
+            for child in children:
+                try:
+                    if isinstance(child, Gtk.Label):
+                        txt = str(child.get_text() or "").lower()
+
+                        if any(n in txt for n in needles):
+                            labels.append(child)
+                except Exception:
+                    pass
+
+                walk(child)
+
+        walk(dlg)
+
+        return labels[0] if labels else None
+
+    def dialog_find_entry_after_label(self, dlg, label):
+        if label is None:
+            return None
+
+        try:
+            parent = label.get_parent()
+
+            if isinstance(parent, Gtk.Grid):
+                top = parent.child_get_property(label, "top-attach")
+
+                for child in parent.get_children():
+                    try:
+                        if parent.child_get_property(child, "top-attach") != top:
+                            continue
+
+                        if isinstance(child, Gtk.Entry):
+                            return child
+
+                        if isinstance(child, Gtk.Box):
+                            for sub in child.get_children():
+                                if isinstance(sub, Gtk.Entry):
+                                    return sub
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        return None
+
+    def dialog_find_button_after_label(self, dlg, label):
+        if label is None:
+            return None
+
+        try:
+            parent = label.get_parent()
+
+            if isinstance(parent, Gtk.Grid):
+                top = parent.child_get_property(label, "top-attach")
+
+                for child in parent.get_children():
+                    try:
+                        if parent.child_get_property(child, "top-attach") != top:
+                            continue
+
+                        if isinstance(child, Gtk.Button):
+                            return child
+
+                        if isinstance(child, Gtk.Box):
+                            for sub in child.get_children():
+                                if isinstance(sub, Gtk.Button):
+                                    return sub
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        return None
+
+    def configure_add_base_action_behavior(self, dlg):
+        if getattr(dlg, "_u1c_add_actions_configured", False):
+            self.apply_add_base_action_visibility(dlg)
+            return
+
+        dlg._u1c_add_actions_configured = True
+
+        try:
+            self.configure_base_dialog_group_picker(dlg, {})
+        except Exception:
+            pass
+
+        dlg._u1c_connect_label = (
+            self.dialog_find_label(dlg, ["путь / server", "url", "1cv8.1cd", "путь к папке"])
+            or self.find_widget_label_for_entry(dlg.connect)
+        )
+        dlg._u1c_connect_browse_button = self.find_button_near_entry(dlg.connect)
+
+        dlg._u1c_template_label = self.dialog_find_label(dlg, ["шаблон 1с", ".dt/.cf", "шаблон"])
+        dlg._u1c_template_entry = self.dialog_find_entry_after_label(dlg, dlg._u1c_template_label) or getattr(dlg, "template", None)
+        dlg._u1c_template_button = self.dialog_find_button_after_label(dlg, dlg._u1c_template_label)
+
+        try:
+            parent = dlg.connect.get_parent()
+        except Exception:
+            parent = None
+
+        dlg.add_server_name = Gtk.Entry()
+        dlg.add_server_name.set_placeholder_text("srvname")
+
+        dlg.add_db_name = Gtk.Entry()
+        dlg.add_db_name.set_placeholder_text("dbname")
+
+        if parent is not None:
+            try:
+                parent.pack_start(dlg.add_server_name, True, True, 0)
+                parent.pack_start(dlg.add_db_name, True, True, 0)
+            except Exception:
+                try:
+                    parent.add(dlg.add_server_name)
+                    parent.add(dlg.add_db_name)
+                except Exception:
+                    pass
+
+        try:
+            dlg.action.connect("changed", lambda *_: self.on_add_base_action_changed(dlg))
+        except Exception:
+            pass
+
+        try:
+            dlg.kind.connect("changed", lambda *_: self.apply_add_base_action_visibility(dlg))
+        except Exception:
+            pass
+
+        try:
+            dlg.name.connect("changed", lambda *_: self.add_dialog_default_base_path(dlg, only_if_empty=False))
+        except Exception:
+            pass
+
+        self.apply_add_base_action_visibility(dlg)
+
+    def on_add_base_action_changed(self, dlg):
+        action = self.add_base_action_key(dlg)
+
+        try:
+            if action == "group":
+                dlg.name.set_placeholder_text("Имя группы")
+            else:
+                dlg.name.set_placeholder_text("Имя базы")
+        except Exception:
+            pass
+
+        if action in ("empty", "template"):
+            try:
+                if not dlg.name.get_text().strip() or dlg.name.get_text().strip() == "Новая база":
+                    dlg.name.set_text("NewBase" if action == "template" else "Empty")
+            except Exception:
+                pass
+
+            try:
+                combo_set_values(dlg.kind, ["file", "server", "web"], "file")
+            except Exception:
+                pass
+
+            self.add_dialog_default_base_path(dlg, only_if_empty=True)
+
+        self.apply_add_base_action_visibility(dlg)
+
+    def apply_add_base_action_visibility(self, dlg):
+        action = self.add_base_action_key(dlg)
+        kind = self.base_dialog_kind_text(dlg)
+        is_group = action == "group"
+
+        # В существующей базе шаблон тоже оставляем видимым:
+        # если он заполнен, создаем новую file-базу и грузим .dt/.cf.
+        template_visible = action in ("existing", "template")
+
+        for attr in (
+            "kind",
+            "connect",
+            "user",
+            "password",
+            "platform",
+            "client_mode",
+            "launch_params",
+            "config_name",
+            "config_synonym",
+            "config_version",
+            "update_code",
+        ):
+            try:
+                self.dialog_row_set_visible(getattr(dlg, attr, None), not is_group)
+            except Exception:
+                pass
+
+        try:
+            self.dialog_row_set_visible(getattr(dlg, "_u1c_template_label", None), (not is_group and template_visible))
+            self.dialog_row_set_visible(getattr(dlg, "_u1c_template_entry", None), (not is_group and template_visible))
+            self.dialog_row_set_visible(getattr(dlg, "_u1c_template_button", None), (not is_group and template_visible))
+        except Exception:
+            pass
+
+        if is_group:
+            try:
+                dlg.add_server_name.hide()
+                dlg.add_db_name.hide()
+            except Exception:
+                pass
+            return
+
+        label = getattr(dlg, "_u1c_connect_label", None)
+        browse = getattr(dlg, "_u1c_connect_browse_button", None)
+
+        if kind == "server":
+            if label is not None:
+                label.set_text("srvname / dbname:")
+
+            try:
+                dlg.connect.hide()
+                dlg.add_server_name.show()
+                dlg.add_db_name.show()
+            except Exception:
+                pass
+
+            if browse is not None:
+                browse.hide()
+
+        elif kind == "web":
+            if label is not None:
+                label.set_text("URL web-базы:")
+
+            try:
+                dlg.connect.show()
+                dlg.add_server_name.hide()
+                dlg.add_db_name.hide()
+            except Exception:
+                pass
+
+            if browse is not None:
+                browse.hide()
+
+        else:
+            if label is not None:
+                if action in ("empty", "template") or (action == "existing" and self.add_dialog_template_value(dlg)):
+                    label.set_text("Путь к папке новой базы:")
+                else:
+                    label.set_text("Путь к папке с 1Cv8.1CD:")
+
+            try:
+                dlg.connect.show()
+                dlg.add_server_name.hide()
+                dlg.add_db_name.hide()
+            except Exception:
+                pass
+
+            if browse is not None:
+                browse.show()
+
+    def add_dialog_default_base_path(self, dlg, only_if_empty=True):
+        action = self.add_base_action_key(dlg)
+        kind = self.base_dialog_kind_text(dlg)
+
+        if kind != "file" or action not in ("empty", "template"):
+            return
+
+        try:
+            current = str(dlg.connect.get_text() or "").strip()
+        except Exception:
+            current = ""
+
+        if only_if_empty and current:
+            return
+
+        try:
+            name = str(dlg.name.get_text() or "").strip() or "NewBase"
+            root = (self.settings.get("default_new_base_dir") or "/mnt/DataStore/bases") if hasattr(self, "settings") else "/mnt/DataStore/bases"
+            dlg.connect.set_text(str(Path(root).expanduser() / safe_name(name)))
+        except Exception:
+            pass
+
+    def add_dialog_connect_value(self, dlg):
+        kind = self.base_dialog_kind_text(dlg)
+
+        if kind == "server":
+            srv = ""
+            db = ""
+
+            try:
+                srv = str(dlg.add_server_name.get_text() or "").strip()
+            except Exception:
+                pass
+
+            try:
+                db = str(dlg.add_db_name.get_text() or "").strip()
+            except Exception:
+                pass
+
+            if srv and db:
+                return f"{srv}\\{db}"
+
+            return srv or db
+
+        return str(dlg.connect.get_text() or "").strip()
+
+    def add_dialog_template_value(self, dlg):
+        try:
+            return str(dlg.template.get_text() or "").strip()
+        except Exception:
+            pass
+
+        try:
+            w = getattr(dlg, "_u1c_template_entry", None)
+
+            if w is not None:
+                return str(w.get_text() or "").strip()
+        except Exception:
+            pass
+
+        return ""
+
+    def suggest_name_from_template_path(self, template_path, kind=""):
+        text = str(template_path or "").lower()
+
+        if "accounting" in text or "бухгалтер" in text:
+            return "AccountingDemo" if kind == "demo" else "AccountingBase"
+
+        if "trade" in text or "торгов" in text:
+            return "TradeDemo" if kind == "demo" else "TradeBase"
+
+        if "hrm" in text or "zup" in text or "зарплат" in text:
+            return "HRMDemo" if kind == "demo" else "HRMBase"
+
+        return "DemoBase" if kind == "demo" else "NewBase"
+
+
+    def select_dt_cf_file_for_dialog(self, dlg):
+        """Обычный файловый выбор .dt/.cf для действия 'Добавить существующую базу'."""
+        chooser = Gtk.FileChooserDialog(
+            title="Выберите файл .dt или .cf",
+            transient_for=dlg,
+            action=Gtk.FileChooserAction.OPEN,
+        )
+
+        chooser.add_button("Отмена", Gtk.ResponseType.CANCEL)
+        chooser.add_button("Выбрать", Gtk.ResponseType.OK)
+
+        try:
+            filt = Gtk.FileFilter()
+            filt.set_name("Файлы 1С (*.dt, *.cf)")
+            filt.add_pattern("*.dt")
+            filt.add_pattern("*.DT")
+            filt.add_pattern("*.cf")
+            filt.add_pattern("*.CF")
+            chooser.add_filter(filt)
+
+            all_filter = Gtk.FileFilter()
+            all_filter.set_name("Все файлы")
+            all_filter.add_pattern("*")
+            chooser.add_filter(all_filter)
+        except Exception:
+            pass
+
+        for folder in [
+            "/mnt/DataStore/Updater1C/1c-updates",
+            str(Path.home() / "Загрузки"),
+            str(Path.home() / "Downloads"),
+            str(Path.home()),
+        ]:
+            try:
+                if Path(folder).exists():
+                    chooser.set_current_folder(folder)
+                    break
+            except Exception:
+                pass
+
+        if chooser.run() == Gtk.ResponseType.OK:
+            path = chooser.get_filename() or ""
+
+            if path:
+                low = path.lower()
+
+                if not (low.endswith(".dt") or low.endswith(".cf")):
+                    self.show_add_base_error(
+                        "Неверный файл шаблона",
+                        "Для добавления существующей базы через шаблон выберите файл .dt или .cf."
+                    )
+                else:
+                    try:
+                        dlg.template.set_text(path)
+                    except Exception:
+                        pass
+
+                    # Для существующей базы с заполненным .dt/.cf дальше будет создана новая file-база
+                    # по указанному пути и загружен выбранный файл.
+                    try:
+                        self.apply_add_base_action_visibility(dlg)
+                    except Exception:
+                        pass
+
+        chooser.destroy()
+
+    def select_1c_template_for_dialog(self, dlg):
+        selector = TemplateSelectDialogGtk(dlg)
+        self.install_clipboard_paste_workaround(selector)
+
+        try:
+            if selector.run() == Gtk.ResponseType.OK and selector.selected_template:
+                dlg.template.set_text(selector.selected_template)
+
+                current_name = str(dlg.name.get_text() or "").strip()
+
+                if not current_name or current_name in ("Новая база", "NewBase", "Empty"):
+                    dlg.name.set_text(self.suggest_name_from_template_path(selector.selected_template, selector.selected_template_kind))
+
+                try:
+                    combo_set_values(dlg.kind, ["file", "server", "web"], "file")
+                except Exception:
+                    pass
+
+                self.add_dialog_default_base_path(dlg, only_if_empty=False)
+
+                if hasattr(dlg, "comment"):
+                    kind_text = "Демонстрационная база" if selector.selected_template_kind == "demo" else "Чистая конфигурация"
+                    extra = f"Шаблон 1С: {kind_text}; {selector.selected_template_name}; версия {selector.selected_template_version}"
+
+                    try:
+                        buf = dlg.comment.get_buffer()
+                        start, end = buf.get_bounds()
+                        cur = buf.get_text(start, end, True).strip()
+                        buf.set_text((cur + "\n" + extra).strip() if cur else extra)
+                    except Exception:
+                        pass
+
+                self.apply_add_base_action_visibility(dlg)
+
+        finally:
+            selector.destroy()
+
+    def find_1c_executable_for_create(self, base):
+        try:
+            exe = select_platform_exe_for_base(base, self.settings if hasattr(self, "settings") else {}, "DESIGNER")
+
+            if exe:
+                return exe
+        except Exception:
+            pass
+
+        platforms = find_platforms()
+
+        if platforms:
+            return next(iter(platforms.values()))
+
+        raise RuntimeError("Не найден исполняемый файл платформы 1С")
+
+    def run_1c_command_for_add_base(self, args, timeout=3600):
+        import os
+        import subprocess
+
+        env = os.environ.copy()
+
+        for lib in ("/usr/lib/x86_64-linux-gnu/libgcc_s.so.1", "/lib/x86_64-linux-gnu/libgcc_s.so.1"):
+            if Path(lib).exists():
+                old = env.get("LD_PRELOAD", "")
+                env["LD_PRELOAD"] = lib if not old else lib + ":" + old
+                break
+
+        self._append_log("Команда 1С: " + " ".join(str(x) for x in args))
+
+        proc = subprocess.run(
+            args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=timeout,
+            env=env,
+        )
+
+        out = proc.stdout or ""
+
+        if out.strip():
+            self._append_log(out.strip()[-4000:])
+
+        if proc.returncode != 0:
+            raise RuntimeError(f"Команда 1С завершилась с кодом {proc.returncode}")
+
+    def create_infobase_from_add_dialog(self, dlg, base, template_path=""):
+        import shutil
+
+        kind = str(base.get("kind") or "file").strip().lower()
+
+        if kind != "file":
+            raise RuntimeError("Создание новой базы сейчас реализовано только для файловых баз.")
+
+        path = Path(base.get("connect") or "").expanduser()
+
+        if not str(path).strip():
+            raise RuntimeError("Укажите путь к новой файловой базе.")
+
+        exe = self.find_1c_executable_for_create(base)
+
+        path.mkdir(parents=True, exist_ok=True)
+
+        reports_dir = Path((self.settings.get("reports_dir") if hasattr(self, "settings") else "") or str(Path.home() / "1c-update-reports")).expanduser()
+        reports_dir.mkdir(parents=True, exist_ok=True)
+
+        out = reports_dir / f"{safe_name(base.get('name') or 'new_base')}_create_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+
+        self._append_log(f"Создание информационной базы: {base.get('name')}")
+
+        self.run_1c_command_for_add_base(
+            [exe, "CREATEINFOBASE", f"File=\"{path}\"", "/Out", str(out), "-NoTruncate"],
+            timeout=900,
+        )
+
+        base["connect"] = str(path)
+
+        if not template_path:
+            self._append_log(f"Пустая база создана: {path}")
+            return
+
+        t = Path(template_path).expanduser()
+
+        if not t.exists():
+            raise RuntimeError(f"Шаблон 1С не найден: {t}")
+
+        if t.is_dir():
+            dt = (
+                next(t.rglob("1Cv8new.dt"), None)
+                or next(t.rglob("1cv8new.dt"), None)
+                or next(t.rglob("1Cv8.dt"), None)
+                or next(t.rglob("1cv8.dt"), None)
+            )
+            cf = next(t.rglob("1Cv8.cf"), None) or next(t.rglob("1cv8.cf"), None)
+            onecd = next(t.rglob("1Cv8.1CD"), None)
+
+            if dt:
+                t = dt
+            elif cf:
+                t = cf
+            elif onecd:
+                shutil.copy2(onecd, path / "1Cv8.1CD")
+                self._append_log(f"База создана копированием 1Cv8.1CD: {onecd}")
+                return
+            else:
+                self._append_log("В папке шаблона не найден 1Cv8.dt / 1Cv8.cf / 1Cv8.1CD. Создана пустая база.")
+                return
+
+        suffix = t.suffix.lower()
+
+        if suffix == ".dt":
+            self._append_log(f"Восстановление .dt: {t}")
+            self.run_1c_command_for_add_base(
+                [exe, "DESIGNER", f"/F{path}", "/RestoreIB", str(t), "/Out", str(out), "-NoTruncate"],
+                timeout=3600,
+            )
+
+        elif suffix == ".cf":
+            self._append_log(f"Загрузка .cf: {t}")
+            self.run_1c_command_for_add_base(
+                [exe, "DESIGNER", f"/F{path}", "/LoadCfg", str(t), "/Out", str(out), "-NoTruncate"],
+                timeout=3600,
+            )
+
+            self._append_log("Обновление структуры базы после .cf")
+            self.run_1c_command_for_add_base(
+                [exe, "DESIGNER", f"/F{path}", "/UpdateDBCfg", "-Dynamic+", "/Out", str(out), "-NoTruncate"],
+                timeout=3600,
+            )
+
+        elif t.name == "1Cv8.1CD":
+            shutil.copy2(t, path / "1Cv8.1CD")
+            self._append_log(f"База создана копированием 1Cv8.1CD: {t}")
+
+        else:
+            raise RuntimeError("Поддерживаются шаблоны .dt, .cf, папка шаблона или 1Cv8.1CD")
+
+    def build_base_from_add_dialog(self, dlg):
+        name = str(dlg.name.get_text() or "").strip()
+
+        if not name:
+            raise RuntimeError("Не заполнено имя базы.")
+
+        kind = self.base_dialog_kind_text(dlg) or "file"
+
+        group = self.normalize_base_group_name(
+            self.base_dialog_group_value(dlg) if hasattr(self, "base_dialog_group_value") else "Без группы"
+        )
+
+        connect = self.add_dialog_connect_value(dlg)
+        user = str(dlg.user.get_text() or "").strip()
+
+        client_caption = self.dialog_combo_text(dlg.client_mode) if hasattr(dlg, "client_mode") else "Тонкий клиент"
+        client_mode = "thick" if client_caption == "Толстый клиент" else "thin"
+
+        base = {
+            "name": name,
+            "group": group,
+            "kind": kind,
+            "type": kind,
+            "connect": connect,
+            "template": self.add_dialog_template_value(dlg),
+            "user": user,
+            "login": user,
+            "username": user,
+            "platform_version": str(dlg.platform.get_text() or "8.3").strip() or "8.3",
+            "client_mode": client_mode,
+            "launch_parameters": str(dlg.launch_params.get_text() or "").strip(),
+            "config_name": str(dlg.config_name.get_text() or "").strip(),
+            "config_synonym": str(dlg.config_synonym.get_text() or "").strip(),
+            "config_version": str(dlg.config_version.get_text() or "").strip(),
+            "update_program_name": str(dlg.update_code.get_text() or "").strip(),
+        }
+
+        if kind == "server":
+            srv, db = self.parse_server_connect(connect)
+            base["server_name"] = srv
+            base["db_name"] = db
+
+        if hasattr(dlg, "comment"):
+            try:
+                buf = dlg.comment.get_buffer()
+                start, end = buf.get_bounds()
+                base["comment"] = buf.get_text(start, end, True)
+            except Exception:
+                pass
+
+        return base
+
+    def add_group_from_dialog(self, dlg):
+        name = str(dlg.name.get_text() or "").strip()
+
+        if not name:
+            raise RuntimeError("Не заполнено имя группы.")
+
+        parent_group = self.normalize_base_group_name(
+            self.base_dialog_group_value(dlg) if hasattr(self, "base_dialog_group_value") else "Без группы"
+        )
+
+        group_item = {
+            "name": name,
+            "group": "" if parent_group == "Без группы" else parent_group,
+            "kind": "group",
+            "type": "group",
+            "is_group": True,
+            "connect": "",
+            "platform_version": "",
+        }
+
+        self.bases.append(group_item)
+        self.config["bases"] = self.bases
+        self.save_config_safe()
+        self.refresh_bases_tree_after_add(group_item)
+        self._append_log(f"Группа добавлена: {name}")
+
+    def refresh_bases_tree_after_add(self, base):
+        try:
+            self.config["bases"] = self.bases
+        except Exception:
+            pass
+
+        try:
+            self.save_config_safe()
+        except Exception:
+            pass
+
+        try:
+            self.base_store.clear()
+        except Exception:
+            pass
+
+        self._load_bases_tree()
+
+        try:
+            self.base_tree.expand_all()
+        except Exception:
+            pass
+
+        try:
+            if not base.get("is_group"):
+                self.select_base_by_name_connect(base.get("name"), base.get("connect"))
+        except Exception:
+            pass
+
+        try:
+            while Gtk.events_pending():
+                Gtk.main_iteration_do(False)
+        except Exception:
+            pass
+
+    def on_add_base(self, *_):
+        dlg = BaseDialog(
+            self,
+            "Добавление базы — Обновлятор 1C Linux",
+            base={},
+            groups=self.available_base_groups("Без группы") if hasattr(self, "available_base_groups") else [],
+            settings=self.settings if hasattr(self, "settings") else {},
+        )
+
+        try:
+            self.configure_add_base_action_behavior(dlg)
+        except Exception as e:
+            self._append_log(f"Предупреждение: не удалось настроить действия добавления базы: {type(e).__name__}: {e}")
+
+        try:
+            self.normalize_base_dialog_response_buttons(dlg)
+        except Exception:
+            pass
+
+        self.install_clipboard_paste_workaround(dlg)
+
+        resp = dlg.run()
+
+        if resp != Gtk.ResponseType.OK:
+            dlg.destroy()
+            self._append_log("Добавление базы отменено.")
+            return
+
+        try:
+            action = self.add_base_action_key(dlg)
+
+            if action == "group":
+                self.add_group_from_dialog(dlg)
+                dlg.destroy()
+                return
+
+            base = self.build_base_from_add_dialog(dlg)
+            template_path = self.add_dialog_template_value(dlg)
+
+            if action == "empty":
+                self.create_infobase_from_add_dialog(dlg, base, "")
+
+            elif action == "template":
+                if not template_path:
+                    raise RuntimeError("Не выбран шаблон 1С (.dt/.cf/папка).")
+
+                self.create_infobase_from_add_dialog(dlg, base, template_path)
+
+            elif action == "existing" and template_path:
+                # Старая рабочая логика: существующая база + заполненный шаблон
+                # значит создать новую file-базу по указанному пути и загрузить .dt/.cf/1Cv8.1CD.
+                self.create_infobase_from_add_dialog(dlg, base, template_path)
+
+            elif action == "existing":
+                if not base.get("connect"):
+                    raise RuntimeError("Не заполнен путь/server/base/URL.")
+
+            self.bases.append(base)
+
+            try:
+                password = str(dlg.password.get_text() or "")
+
+                if password:
+                    self.set_base_password(base, password)
+            except Exception as e:
+                self._append_log(f"Не удалось сохранить пароль базы в keyring: {type(e).__name__}: {e}")
+
+            self.config["bases"] = self.bases
+            self.save_config_safe()
+            self.refresh_bases_tree_after_add(base)
+
+            dlg.destroy()
+
+            self._append_log(f"База добавлена: {base.get('name')}")
+
+        except Exception as e:
+            try:
+                dlg.destroy()
+            except Exception:
+                pass
+
+            self._append_log(f"Не удалось добавить базу: {type(e).__name__}: {e}")
+            self.show_add_base_error("Не удалось добавить базу", f"{type(e).__name__}: {e}")
+
+    def read_clipboard_text_safe(self):
+        """Читает буфер обмена с fallback для Wayland.
+
+        GTK на Wayland иногда пишет:
+        gdkselection-wayland.c: error reading selection buffer: Операция была отменена.
+        Поэтому сначала пробуем wl-paste/xclip/xsel, потом уже Gtk.Clipboard.
+        """
+        import shutil
+        import subprocess
+
+        commands = []
+
+        if shutil.which("wl-paste"):
+            commands.append(["wl-paste", "-n"])
+            commands.append(["wl-paste", "--no-newline"])
+
+        if shutil.which("xclip"):
+            commands.append(["xclip", "-selection", "clipboard", "-o"])
+
+        if shutil.which("xsel"):
+            commands.append(["xsel", "--clipboard", "--output"])
+
+        for cmd in commands:
+            try:
+                proc = subprocess.run(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                    timeout=2,
+                )
+
+                if proc.returncode == 0 and proc.stdout:
+                    return proc.stdout
+            except Exception:
+                pass
+
+        try:
+            from gi.repository import Gtk, Gdk
+            clipboard = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+            value = clipboard.wait_for_text()
+
+            if value:
+                return value
+        except Exception:
+            pass
+
+        return ""
+
+    def paste_text_into_entry_safe(self, entry, text):
+        text = "" if text is None else str(text)
+
+        if text == "":
+            return False
+
+        try:
+            bounds = entry.get_selection_bounds()
+
+            has_selection = False
+            start = end = 0
+
+            if isinstance(bounds, tuple):
+                if len(bounds) == 3:
+                    has_selection, start, end = bounds
+                elif len(bounds) == 2:
+                    has_selection = True
+                    start, end = bounds
+
+            current = str(entry.get_text() or "")
+
+            if has_selection:
+                left = min(int(start), int(end))
+                right = max(int(start), int(end))
+                new_text = current[:left] + text + current[right:]
+                pos = left + len(text)
+            else:
+                pos0 = int(entry.get_position())
+                if pos0 < 0:
+                    pos0 = len(current)
+                new_text = current[:pos0] + text + current[pos0:]
+                pos = pos0 + len(text)
+
+            entry.set_text(new_text)
+            entry.set_position(pos)
+            return True
+
+        except Exception:
+            try:
+                entry.set_text(text)
+                entry.set_position(len(text))
+                return True
+            except Exception:
+                return False
+
+    def safe_paste_into_entry(self, entry):
+        text = self.read_clipboard_text_safe()
+
+        if not text:
+            try:
+                self._append_log("Буфер обмена пуст или недоступен.")
+            except Exception:
+                pass
+            return True
+
+        self.paste_text_into_entry_safe(entry, text)
+        return True
+
+    def connect_entry_clipboard_fallback(self, entry):
+        try:
+            from gi.repository import Gtk, Gdk
+        except Exception:
+            return
+
+        try:
+            if getattr(entry, "_u1c_clipboard_fallback_connected", False):
+                return
+
+            entry._u1c_clipboard_fallback_connected = True
+        except Exception:
+            pass
+
+        def on_key_press(widget, event):
+            try:
+                state = event.state & Gtk.accelerator_get_default_mod_mask()
+                ctrl = bool(state & Gdk.ModifierType.CONTROL_MASK)
+                shift = bool(state & Gdk.ModifierType.SHIFT_MASK)
+
+                key_name = (Gdk.keyval_name(event.keyval) or "").lower()
+
+                if (ctrl and key_name == "v") or (shift and key_name == "insert"):
+                    return self.safe_paste_into_entry(widget)
+
+            except Exception:
+                pass
+
+            return False
+
+        def on_paste_clipboard(widget):
+            try:
+                widget.stop_emission_by_name("paste-clipboard")
+            except Exception:
+                pass
+
+            self.safe_paste_into_entry(widget)
+            return True
+
+        try:
+            entry.connect("key-press-event", on_key_press)
+        except Exception:
+            pass
+
+        try:
+            entry.connect("paste-clipboard", on_paste_clipboard)
+        except Exception:
+            pass
+
+    def install_clipboard_paste_workaround(self, root=None):
+        """Подключает устойчивую вставку ко всем Gtk.Entry внутри root."""
+        try:
+            from gi.repository import Gtk
+        except Exception:
+            return False
+
+        if root is None:
+            root = self
+
+        def walk(widget):
+            try:
+                if isinstance(widget, Gtk.Entry):
+                    self.connect_entry_clipboard_fallback(widget)
+            except Exception:
+                pass
+
+            try:
+                children = widget.get_children()
+            except Exception:
+                children = []
+
+            for child in children:
+                walk(child)
+
+        try:
+            walk(root)
+        except Exception:
+            pass
+
+        return False
+
     def build_1c_launch_args(self, mode="ENTERPRISE"):
         import shlex
 
@@ -6804,6 +8467,39 @@ class MainWindow(Gtk.Window):
             version = base.get("config_version") or ""
             platform_version = base.get("platform_version") or "8.3"
 
+            if not program:
+                hay = " ".join([
+                    str(base.get("config_name") or ""),
+                    str(base.get("config_synonym") or ""),
+                    str(base.get("name") or ""),
+                ]).lower()
+
+                if "бухгалтер" in hay or "accounting" in hay:
+                    program = "Accounting"
+                elif (
+                    "управление торговлей" in hay
+                    or "управлениеторговлей" in hay.replace(" ", "")
+                    or "торговл" in hay
+                    or "trade" in hay
+                ):
+                    program = "Trade"
+                elif "документооборот" in hay or "document" in hay or "docmng" in hay:
+                    program = "DocumentManagement"
+                elif "зарплата" in hay or "зуп" in hay or "hrm" in hay or "salary" in hay:
+                    program = "HRM"
+                elif "управление нашей фирмой" in hay or "унф" in hay or "smallbusiness" in hay:
+                    program = "SmallBusiness"
+                elif "erp" in hay:
+                    program = "ERP"
+
+                if program:
+                    base["update_program_name"] = program
+                    try:
+                        self.config["bases"] = self.bases
+                        save_json(self.config_path, self.config)
+                    except Exception:
+                        pass
+
             self._append_log("")
             self._append_log(f"[{pos}/{len(indexes)}]")
             self._append_log(f"--- Скачивание обновлений для базы: {name} ---")
@@ -6899,8 +8595,16 @@ class MainWindow(Gtk.Window):
                     self._append_log(f"Версия релиза: {release}")
                     self._append_log(f"Имя файла: {filename}")
                     self._append_log(f"Папка релиза: {release_dir}")
+                    _old_url = url
+                    url = u1c_fix_1c_public_download_url(url)
+                    if url != _old_url:
+                        self._append_log(f"URL нормализован: {url}")
                     self._append_log(f"URL: {url}")
 
+                    _old_url = url
+                    url = u1c_normalize_first_download_url(url)
+                    if url != _old_url:
+                        self._append_log(f"URL нормализован: {url}")
                     if dest.exists() and dest.stat().st_size > 0:
                         self._append_log(f"Файл уже есть: {dest}")
                     else:
@@ -6965,25 +8669,6 @@ class MainWindow(Gtk.Window):
 
     def on_stub(self, *_):
         self._append_log("GTK preview: обработчик будет подключен на следующем этапе переноса логики.")
-
-    def on_add_base(self, *_):
-        dlg = BaseDialog(
-            self,
-            "Добавление базы — Обновлятор 1C Linux",
-            base={},
-            groups=known_groups_from_bases(self.bases),
-            settings=self.settings,
-        )
-        response = dlg.run()
-        if response == Gtk.ResponseType.OK:
-            new_base = dlg.get_data()
-            self.bases.append(new_base)
-            self.config["bases"] = self.bases
-            save_json(self.config_path, self.config)
-            self._load_bases_tree()
-            self._append_log(f"База добавлена: {new_base.get('name', '')}")
-        dlg.destroy()
-
 
     def on_auto_update(self, *_):
         dlg = AutoUpdateDialog(self)

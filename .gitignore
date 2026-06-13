@@ -11,7 +11,6 @@ __pycache__/
 .venv/
 .venv*/
 venv/
-
 # Build artifacts
 dist/
 build/
@@ -26,7 +25,6 @@ release/
 *.deb
 *.rpm
 *.sha256
-
 # Local backups/checkpoints
 checkpoints/
 backups/
@@ -39,6 +37,14 @@ _patch_backups/
 *.old
 *.tmp
 *.part
-
 # Logs
 *.log
+# release/build artifacts
+/dist/
+/build/
+/releases/
+/release/
+/checkpoints/
+/backups/
+/legacy/
+*.pyc
