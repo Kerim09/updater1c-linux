@@ -23,7 +23,7 @@ import zipfile
 
 
 APP_ID = 'io.github.kerim1c.updater1clinux'
-APP_VERSION = "1.2.2"
+APP_VERSION = "1.2.3"
 APP_NAME = 'Обновлятор 1c linux'
 
 

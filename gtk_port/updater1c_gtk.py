@@ -25,7 +25,7 @@ from gi.repository import Gtk, Gdk, GLib
 
 
 APP_NAME = "Обновлятор 1C Linux"
-APP_VERSION = "1.2.2"
+APP_VERSION = "1.2.3"
 CONFIG_DIR = Path.home() / ".config" / "updater1c-linux"
 
 DEFAULT_1CESTART = "/opt/1cv8/common/1cestart"
@@ -4381,10 +4381,10 @@ class MainWindow(Gtk.Window):
         b1 = Ui.button("✔ Отметить все")
         b2 = Ui.button("✖ Снять все")
         b3 = Ui.button("🔄 Синхронизировать со списком баз 1С")
+        b3.connect("clicked", self.on_sync_with_1c_list)
 
         b1.connect("clicked", self.on_check_all_bases)
         b2.connect("clicked", self.on_uncheck_all_bases)
-        b3.connect("clicked", self.on_sync_1c_stub)
 
         bottom.pack_start(b1, False, False, 0)
         bottom.pack_start(b2, False, False, 0)
@@ -7818,6 +7818,344 @@ class MainWindow(Gtk.Window):
             pass
 
         return False
+
+
+    def ibases_v8i_candidate_paths(self):
+        """Ищет стандартные файлы списка информационных баз 1С."""
+        home = Path.home()
+
+        candidates = [
+            home / ".1C" / "1cestart" / "ibases.v8i",
+            home / ".1C" / "1CEStart" / "ibases.v8i",
+            home / ".1cv8" / "1C" / "1CEStart" / "ibases.v8i",
+            home / ".config" / "1C" / "1CEStart" / "ibases.v8i",
+            home / ".config" / "1C" / "1cestart" / "ibases.v8i",
+        ]
+
+        try:
+            xdg = Path(os.environ.get("XDG_CONFIG_HOME") or (home / ".config"))
+            candidates.extend([
+                xdg / "1C" / "1CEStart" / "ibases.v8i",
+                xdg / "1C" / "1cestart" / "ibases.v8i",
+            ])
+        except Exception:
+            pass
+
+        # Иногда 1С кладет файл глубже; fallback ограничиваем домашней папкой 1C.
+        for root in [home / ".1C", home / ".1cv8"]:
+            try:
+                if root.exists():
+                    candidates.extend(root.rglob("ibases.v8i"))
+            except Exception:
+                pass
+
+        result = []
+        seen = set()
+
+        for path in candidates:
+            try:
+                path = Path(path).expanduser()
+                key = str(path)
+
+                if key not in seen and path.exists() and path.is_file():
+                    seen.add(key)
+                    result.append(path)
+            except Exception:
+                pass
+
+        return result
+
+    def read_ibases_v8i_text(self, path):
+        """Читает ibases.v8i с учетом типовых кодировок."""
+        path = Path(path)
+
+        data = path.read_bytes()
+
+        for enc in ("utf-8-sig", "utf-16", "utf-16le", "cp1251"):
+            try:
+                return data.decode(enc)
+            except Exception:
+                pass
+
+        return data.decode("utf-8", errors="replace")
+
+    def v8i_unquote(self, value):
+        value = str(value or "").strip()
+
+        if len(value) >= 2 and value[0] == '"' and value[-1] == '"':
+            value = value[1:-1]
+
+        value = value.replace('""', '"')
+        value = value.replace("\\\\", "\\")
+
+        return value.strip()
+
+    def v8i_get_quoted(self, text, key):
+        """Достает Key="..." из строки подключения 1С."""
+        text = str(text or "")
+        rx = re.compile(r'(?i)(?:^|;)\s*' + re.escape(key) + r'\s*=\s*"((?:[^"]|"")*)"')
+        m = rx.search(text)
+
+        if not m:
+            return ""
+
+        return self.v8i_unquote('"' + m.group(1) + '"')
+
+    def v8i_parse_connect(self, connect):
+        connect = str(connect or "").strip()
+
+        if not connect:
+            return "file", ""
+
+        file_path = self.v8i_get_quoted(connect, "File")
+        if file_path:
+            return "file", file_path
+
+        srv = self.v8i_get_quoted(connect, "Srvr")
+        ref = self.v8i_get_quoted(connect, "Ref")
+        if srv or ref:
+            return "server", (srv + "\\" + ref).strip("\\")
+
+        for web_key in ("ws", "http", "https"):
+            url = self.v8i_get_quoted(connect, web_key)
+            if url:
+                return "web", url
+
+        # Иногда web может лежать без стандартного ключа.
+        m = re.search(r'(https?://[^";]+)', connect, flags=re.I)
+        if m:
+            return "web", m.group(1)
+
+        return "file", connect
+
+    def parse_ibases_v8i_file(self, path):
+        """Парсит ibases.v8i в список словарей баз."""
+        text = self.read_ibases_v8i_text(path)
+
+        sections = []
+        current = None
+
+        for raw in text.splitlines():
+            line = raw.strip()
+
+            if not line or line.startswith(";") or line.startswith("#"):
+                continue
+
+            if line.startswith("[") and line.endswith("]"):
+                name = line[1:-1].strip()
+
+                current = {
+                    "name": name,
+                    "_source_v8i": str(path),
+                }
+                sections.append(current)
+                continue
+
+            if current is None:
+                continue
+
+            if "=" not in line:
+                continue
+
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip()
+
+            current[key] = self.v8i_unquote(value)
+
+        imported = []
+
+        for sec in sections:
+            item = self.normalize_imported_base_from_v8i(sec)
+
+            if item:
+                imported.append(item)
+
+        return imported
+
+    def normalize_imported_base_from_v8i(self, sec):
+        name = str(sec.get("name") or "").strip()
+
+        if not name:
+            return None
+
+        connect_raw = str(sec.get("Connect") or sec.get("connect") or "").strip()
+
+        # Секции-группы в ibases.v8i могут быть без Connect — их не добавляем как базу.
+        if not connect_raw:
+            return None
+
+        kind, connect = self.v8i_parse_connect(connect_raw)
+
+        folder = (
+            sec.get("Folder")
+            or sec.get("folder")
+            or sec.get("Каталог")
+            or ""
+        )
+
+        group = str(folder or "").replace("\\", "/").strip().strip("/")
+
+        if not group:
+            group = "Без группы"
+
+        # Для file-базы 1С иногда хранит путь с File="..."
+        if kind == "file":
+            connect = str(Path(connect).expanduser()) if connect else ""
+
+        item = {
+            "name": name,
+            "group": group,
+            "kind": kind,
+            "type": kind,
+            "connect": connect,
+            "platform_version": "8.3",
+            "source": "ibases.v8i",
+            "_source_v8i": str(sec.get("_source_v8i") or ""),
+        }
+
+        # Если логин есть в строке подключения, переносим.
+        user = self.v8i_get_quoted(connect_raw, "Usr")
+        if user:
+            item["user"] = user
+            item["login"] = user
+            item["username"] = user
+
+        if kind == "server":
+            try:
+                srv, db = self.parse_server_connect(connect)
+                item["server_name"] = srv
+                item["db_name"] = db
+            except Exception:
+                pass
+
+        return item
+
+    def base_sync_key(self, base):
+        kind = str(base.get("kind") or base.get("type") or "").strip().lower()
+        connect = str(base.get("connect") or "").strip()
+
+        if kind and connect:
+            return (kind, connect.lower())
+
+        name = str(base.get("name") or "").strip().lower()
+        group = str(base.get("group") or "").strip().lower()
+
+        return ("name", group, name)
+
+    def merge_imported_1c_bases(self, imported):
+        existing_by_key = {}
+
+        for base in self.bases or []:
+            if not isinstance(base, dict):
+                continue
+
+            if base.get("is_group") or base.get("kind") == "group" or base.get("type") == "group":
+                continue
+
+            key = self.base_sync_key(base)
+            existing_by_key[key] = base
+
+        added = 0
+        updated = 0
+        skipped = 0
+
+        for item in imported:
+            key = self.base_sync_key(item)
+            existing = existing_by_key.get(key)
+
+            if existing is not None:
+                # Обновляем только безопасные поля. Пароли/секреты не трогаем.
+                for field in ("name", "group", "kind", "type", "connect", "server_name", "db_name"):
+                    value = item.get(field)
+
+                    if value:
+                        existing[field] = value
+
+                if not existing.get("platform_version"):
+                    existing["platform_version"] = item.get("platform_version") or "8.3"
+
+                if item.get("user") and not (existing.get("user") or existing.get("login") or existing.get("username")):
+                    existing["user"] = item.get("user")
+                    existing["login"] = item.get("user")
+                    existing["username"] = item.get("user")
+
+                existing["source"] = item.get("source") or existing.get("source") or "ibases.v8i"
+                existing["_source_v8i"] = item.get("_source_v8i") or existing.get("_source_v8i") or ""
+
+                updated += 1
+                continue
+
+            self.bases.append(item)
+            existing_by_key[key] = item
+            added += 1
+
+        return added, updated, skipped
+
+    def on_sync_with_1c_list(self, *_):
+        """Синхронизация с ibases.v8i 1С."""
+        self._append_log("=== Синхронизация со списком баз 1С ===")
+
+        try:
+            paths = self.ibases_v8i_candidate_paths()
+
+            if not paths:
+                self._append_log("Файлы ibases.v8i не найдены.")
+                self._append_log("Проверенные места: ~/.1C/1cestart, ~/.1C/1CEStart, ~/.1cv8/1C/1CEStart")
+                return
+
+            all_imported = []
+
+            for path in paths:
+                try:
+                    items = self.parse_ibases_v8i_file(path)
+                    self._append_log(f"Найден список 1С: {path}")
+                    self._append_log(f"Баз в файле: {len(items)}")
+                    all_imported.extend(items)
+                except Exception as e:
+                    self._append_log(f"Не удалось прочитать {path}: {type(e).__name__}: {e}")
+
+            # Убираем дубли между несколькими ibases.v8i.
+            unique = {}
+            for item in all_imported:
+                unique[self.base_sync_key(item)] = item
+
+            imported = list(unique.values())
+
+            if not imported:
+                self._append_log("В ibases.v8i не найдено баз с заполненной строкой Connect.")
+                return
+
+            added, updated, skipped = self.merge_imported_1c_bases(imported)
+
+            self.config["bases"] = self.bases
+
+            try:
+                self.save_config_safe()
+            except Exception:
+                save_json(self.config_path, self.config)
+
+            self._load_bases_tree()
+
+            try:
+                self.base_tree.expand_all()
+            except Exception:
+                pass
+
+            try:
+                self.update_bases_status()
+            except Exception:
+                pass
+
+            self._append_log(f"Синхронизация завершена. Добавлено: {added}; обновлено: {updated}; пропущено: {skipped}.")
+
+        except Exception as e:
+            self._append_log(f"ОШИБКА синхронизации со списком баз 1С: {type(e).__name__}: {e}")
+
+            try:
+                self.show_error("Ошибка синхронизации", f"{type(e).__name__}: {e}")
+            except Exception:
+                pass
 
     def build_1c_launch_args(self, mode="ENTERPRISE"):
         import shlex
