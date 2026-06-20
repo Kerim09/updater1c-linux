@@ -4888,6 +4888,248 @@ class MainWindow(Gtk.Window):
 
 
 
+
+    def guess_update_program_name_from_metadata(self, config_name="", config_synonym="", base_name=""):
+        """Определяет код программы обновлений 1С по имени/синониму конфигурации."""
+        raw = " ".join(str(x or "") for x in [config_name, config_synonym, base_name])
+        hay = raw.lower()
+        compact = hay.replace(" ", "").replace("_", "").replace("-", "").replace(",", "")
+
+        # Базовую бухгалтерию проверяем раньше обычной.
+        if (
+            "бухгалтерияпредприятиябазовая" in compact
+            or "бухгалтерияпредприятиябаз" in compact
+            or ("бухгалтер" in hay and "базов" in hay)
+            or "accountingbase" in compact
+        ):
+            return "AccountingBase"
+
+        if "бухгалтер" in hay or "accounting" in compact:
+            return "Accounting"
+
+        if (
+            "управлениеторговлей" in compact
+            or "торговл" in hay
+            or "trade" in compact
+        ):
+            return "Trade"
+
+        if "документооборот" in hay or "document" in compact or "docmng" in compact:
+            return "DocumentManagement"
+
+        if "зарплата" in hay or "зуп" in hay or "hrm" in compact or "salary" in compact:
+            return "HRM"
+
+        if "управлениенашейфирмой" in compact or "унф" in hay or "smallbusiness" in compact:
+            return "SmallBusiness"
+
+        if "erp" in compact:
+            return "ERP"
+
+        return ""
+
+    def refresh_bases_tree_keep_selected(self, base):
+        """Сохраняет конфиг и перерисовывает список баз после проверки настроек."""
+        try:
+            self.config["bases"] = self.bases
+        except Exception:
+            pass
+
+        try:
+            self.save_config_safe()
+        except Exception:
+            try:
+                save_json(self.config_path, self.config)
+            except Exception:
+                pass
+
+        try:
+            self._load_bases_tree()
+        except Exception:
+            pass
+
+        try:
+            self.base_tree.expand_all()
+        except Exception:
+            pass
+
+        try:
+            self.select_base_by_name_connect(base.get("name"), base.get("connect"))
+        except Exception:
+            pass
+
+        try:
+            self.update_bases_status()
+        except Exception:
+            pass
+
+    def cf_export_file_name(self, base):
+        """Имя .cf: база + конфигурация + релиз, если есть + дата."""
+        base_name = safe_name(base.get("name") or "base")
+
+        config_name = (
+            base.get("config_name")
+            or base.get("configuration_name")
+            or base.get("config_synonym")
+            or base.get("configuration_synonym")
+            or ""
+        )
+        config_name = safe_name(config_name) if config_name else ""
+
+        release = (
+            base.get("config_version")
+            or base.get("configuration_version")
+            or base.get("version")
+            or ""
+        )
+        release = str(release or "").strip()
+
+        parts = [base_name]
+
+        if config_name:
+            parts.append(config_name)
+
+        if release:
+            parts.append(safe_name(release))
+
+        parts.append(now_stamp())
+
+        return "_".join([x for x in parts if x]) + ".cf"
+
+
+    def find_real_base_for_checked_metadata(self, base):
+        """Находит настоящий словарь базы в self.bases для записи результата проверки.
+
+        В некоторых местах GTK-форма работает с копией строки, поэтому простое base["config_version"]
+        не обновляет таблицу и свойства.
+        """
+        if not isinstance(base, dict):
+            return None
+
+        # 1. Если это тот же объект — отлично.
+        for item in self.bases:
+            if item is base:
+                return item
+
+        name = str(base.get("name") or "").strip()
+        connect = str(base.get("connect") or "").strip()
+        kind = str(base.get("kind") or base.get("type") or "").strip().lower()
+        group = str(base.get("group") or "").strip()
+
+        # 2. Лучшее совпадение: тип + подключение.
+        if connect:
+            for item in self.bases:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("is_group") or item.get("kind") == "group" or item.get("type") == "group":
+                    continue
+
+                item_connect = str(item.get("connect") or "").strip()
+                item_kind = str(item.get("kind") or item.get("type") or "").strip().lower()
+
+                if item_connect == connect and (not kind or item_kind == kind):
+                    return item
+
+        # 3. Имя + группа.
+        if name:
+            for item in self.bases:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("is_group") or item.get("kind") == "group" or item.get("type") == "group":
+                    continue
+
+                if str(item.get("name") or "").strip() != name:
+                    continue
+
+                if not group or str(item.get("group") or "").strip() == group:
+                    return item
+
+        # 4. Просто имя, если оно уникально.
+        matches = []
+        if name:
+            for item in self.bases:
+                if not isinstance(item, dict):
+                    continue
+                if str(item.get("name") or "").strip() == name:
+                    matches.append(item)
+
+        if len(matches) == 1:
+            return matches[0]
+
+        return None
+
+    def apply_checked_metadata_to_real_base(self, base, config_name="", config_synonym="", config_version="", update_program_name=""):
+        """Сохраняет результат Проверить настройки в base и в реальную строку self.bases."""
+        real_base = self.find_real_base_for_checked_metadata(base) or base
+
+        config_name = str(config_name or "").strip()
+        config_synonym = str(config_synonym or "").strip()
+        config_version = str(config_version or "").strip()
+        update_program_name = str(update_program_name or "").strip()
+
+        # Если код не передан — определяем здесь.
+        if not update_program_name:
+            try:
+                update_program_name = self.guess_update_program_name_from_metadata(
+                    config_name,
+                    config_synonym,
+                    real_base.get("name") or base.get("name"),
+                )
+            except Exception:
+                update_program_name = ""
+
+        targets = []
+
+        if isinstance(base, dict):
+            targets.append(base)
+
+        if isinstance(real_base, dict) and real_base is not base:
+            targets.append(real_base)
+
+        for target in targets:
+            if config_name:
+                target["config_name"] = config_name
+                target["configuration_name"] = config_name
+
+            if config_synonym:
+                target["config_synonym"] = config_synonym
+                target["configuration_synonym"] = config_synonym
+
+            if config_version:
+                target["config_version"] = config_version
+                target["configuration_version"] = config_version
+                target["version"] = config_version
+
+            if update_program_name:
+                target["update_program_name"] = update_program_name
+                target["update_code"] = update_program_name
+                target["program_name"] = update_program_name
+                target["program_code"] = update_program_name
+
+        try:
+            self.config["bases"] = self.bases
+        except Exception:
+            pass
+
+        try:
+            self.save_config_safe()
+        except Exception:
+            try:
+                save_json(self.config_path, self.config)
+            except Exception:
+                pass
+
+        # Перерисовываем дерево в UI-потоке.
+        try:
+            GLib.idle_add(self.refresh_bases_tree_keep_selected, real_base)
+        except Exception:
+            try:
+                GLib.idle_add(self._load_bases_tree)
+            except Exception:
+                pass
+
+        return real_base
+
     def on_check_selected_base_real(self, *_):
         vals = self.selected_base_values()
         base = self.require_current_base_dict()
@@ -4957,8 +5199,21 @@ class MainWindow(Gtk.Window):
                 save_json(self.config_path, self.config)
                 GLib.idle_add(self._load_bases_tree)
 
+                guessed_program = self.guess_update_program_name_from_metadata(name, synonym, base.get("name"))
+                if guessed_program:
+                    base["update_program_name"] = guessed_program
+
+            checked_base = self.apply_checked_metadata_to_real_base(
+                base,
+                name,
+                synonym,
+                version,
+                self.guess_update_program_name_from_metadata(name, synonym, base.get("name")),
+            )
+
             log(f"Текущая версия конфигурации: {version or '-'}")
             log(f"Код программы обновлений: {base.get('update_program_name') or '-'}")
+            GLib.idle_add(self.refresh_bases_tree_keep_selected, base)
             log("Проверка настроек: завершено")
 
         self.run_in_background("Проверка настроек", work)
@@ -5072,7 +5327,673 @@ class MainWindow(Gtk.Window):
         self.show_base_context_menu(event)
         return True
 
+
+    def context_selected_1c_base(self):
+        """Выбранная база для операций из контекстного меню."""
+        try:
+            self.save_current_credentials_to_selected_base(silent=True)
+        except Exception:
+            pass
+
+        base = self.require_current_base_dict()
+
+        if not base:
+            return None
+
+        kind, connect = normalize_base_kind_and_connect(base)
+
+        if kind == "web":
+            self._append_log("Операция недоступна для web-базы: DESIGNER по URL в этой операции не используется.")
+            return None
+
+        if not connect:
+            self._append_log("У выбранной базы не заполнен путь / сервер / URL.")
+            return None
+
+        return base
+
+    def onec_command_env_for_maintenance(self):
+        import os
+
+        env = os.environ.copy()
+
+        try:
+            libgcc = system_libgcc_path_for_1c()
+        except Exception:
+            libgcc = ""
+
+        if not libgcc:
+            for candidate in ("/usr/lib/x86_64-linux-gnu/libgcc_s.so.1", "/lib/x86_64-linux-gnu/libgcc_s.so.1"):
+                if Path(candidate).exists():
+                    libgcc = candidate
+                    break
+
+        if libgcc:
+            old = env.get("LD_PRELOAD", "").strip()
+            parts = [x for x in old.split() if x]
+
+            if libgcc not in parts:
+                parts.insert(0, libgcc)
+
+            env["LD_PRELOAD"] = " ".join(parts)
+
+        return env
+
+    def mask_1c_command_for_log(self, args):
+        import re
+        safe = []
+
+        for arg in args:
+            s = str(arg)
+
+            if s.startswith("/P") and len(s) > 2:
+                s = "/P***"
+
+            if "Pwd=" in s:
+                s = re.sub(r'Pwd="[^"]*"', 'Pwd="***"', s)
+
+            safe.append(s)
+
+        try:
+            return command_to_text(safe)
+        except Exception:
+            import shlex
+            return " ".join(shlex.quote(str(x)) for x in safe)
+
+
+    def u1c_walk_widgets(self, root=None):
+        """Обходит GTK-виджеты окна, чтобы обновлять панель статуса без привязки к именам полей."""
+        if root is None:
+            root = self
+
+        result = []
+
+        def walk(widget):
+            result.append(widget)
+
+            try:
+                children = widget.get_children()
+            except Exception:
+                children = []
+
+            for child in children:
+                walk(child)
+
+        try:
+            walk(root)
+        except Exception:
+            pass
+
+        return result
+
+    def u1c_set_label_near_caption(self, caption, value):
+        """Ищет Label 'База:'/'Статус:' и меняет соседний Label справа в той же строке Gtk.Grid."""
+        try:
+            from gi.repository import Gtk
+        except Exception:
+            return False
+
+        wanted = str(caption or "").strip().lower().rstrip(":")
+        value = "-" if value is None or str(value) == "" else str(value)
+
+        for widget in self.u1c_walk_widgets(self):
+            try:
+                if not isinstance(widget, Gtk.Label):
+                    continue
+
+                text = str(widget.get_text() or "").strip().lower().rstrip(":")
+
+                if text != wanted:
+                    continue
+
+                parent = widget.get_parent()
+
+                if not isinstance(parent, Gtk.Grid):
+                    continue
+
+                top = parent.child_get_property(widget, "top-attach")
+                left = parent.child_get_property(widget, "left-attach")
+
+                candidates = []
+
+                for child in parent.get_children():
+                    try:
+                        if child is widget:
+                            continue
+
+                        if parent.child_get_property(child, "top-attach") != top:
+                            continue
+
+                        child_left = parent.child_get_property(child, "left-attach")
+
+                        if child_left <= left:
+                            continue
+
+                        if isinstance(child, Gtk.Label):
+                            candidates.append((child_left, child))
+                    except Exception:
+                        pass
+
+                if candidates:
+                    candidates.sort(key=lambda x: x[0])
+                    candidates[0][1].set_text(value)
+                    return True
+
+            except Exception:
+                pass
+
+        return False
+
+    def u1c_set_all_progressbars(self, fraction=None, text="", pulse=False):
+        try:
+            from gi.repository import Gtk
+        except Exception:
+            return False
+
+        changed = False
+
+        for widget in self.u1c_walk_widgets(self):
+            try:
+                if not isinstance(widget, Gtk.ProgressBar):
+                    continue
+
+                widget.set_show_text(True)
+
+                if text:
+                    widget.set_text(str(text))
+
+                if pulse:
+                    widget.pulse()
+                elif fraction is not None:
+                    f = max(0.0, min(1.0, float(fraction)))
+                    widget.set_fraction(f)
+
+                changed = True
+
+            except Exception:
+                pass
+
+        return changed
+
+    def u1c_operation_pulse_tick(self):
+        try:
+            if not getattr(self, "_u1c_maintenance_pulse_active", False):
+                return False
+
+            self.u1c_set_all_progressbars(text=getattr(self, "_u1c_maintenance_pulse_text", "Выполняется..."), pulse=True)
+            return True
+
+        except Exception:
+            return False
+
+    def u1c_set_operation_panel(
+        self,
+        base=None,
+        operation="",
+        release="-",
+        step="-",
+        action="-",
+        mode="DESIGNER",
+        status="выполняется",
+        pid="-",
+        started="-",
+        progress=None,
+        pulse=False,
+    ):
+        """Обновляет правую панель 'Текущая операция' и progress bar из любого фонового потока."""
+        try:
+            from gi.repository import GLib
+        except Exception:
+            GLib = None
+
+        def apply():
+            try:
+                base_name = "-"
+
+                if isinstance(base, dict):
+                    base_name = base.get("name") or "-"
+
+                self.u1c_set_label_near_caption("База", base_name)
+                self.u1c_set_label_near_caption("Релиз", release)
+                self.u1c_set_label_near_caption("Шаг", step)
+                self.u1c_set_label_near_caption("Действие", action or operation or "-")
+                self.u1c_set_label_near_caption("Режим", mode or "-")
+                self.u1c_set_label_near_caption("Статус", status or "-")
+                self.u1c_set_label_near_caption("PID процесса", pid)
+                self.u1c_set_label_near_caption("Время запуска", started)
+
+                text = status or operation or "Выполняется..."
+
+                if progress is not None:
+                    self.u1c_set_all_progressbars(progress, text=text, pulse=False)
+                elif pulse:
+                    self.u1c_set_all_progressbars(text=text, pulse=True)
+
+            except Exception:
+                pass
+
+            return False
+
+        if GLib is not None:
+            GLib.idle_add(apply)
+        else:
+            apply()
+
+    def u1c_begin_maintenance_operation(self, base, operation, action=None):
+        from datetime import datetime
+
+        try:
+            from gi.repository import GLib
+        except Exception:
+            GLib = None
+
+        self._u1c_maintenance_pulse_active = True
+        self._u1c_maintenance_pulse_text = operation or "Выполняется..."
+
+        started = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        self.u1c_set_operation_panel(
+            base=base,
+            operation=operation,
+            step="1/1",
+            action=action or operation,
+            mode="DESIGNER",
+            status="запуск",
+            pid="-",
+            started=started,
+            progress=0.02,
+            pulse=False,
+        )
+
+        if GLib is not None:
+            GLib.timeout_add(250, self.u1c_operation_pulse_tick)
+
+        return started
+
+    def u1c_finish_maintenance_operation(self, base, operation, ok=True, error_text=""):
+        self._u1c_maintenance_pulse_active = False
+
+        if ok:
+            status = "завершено"
+            progress = 1.0
+        else:
+            status = "ошибка" + (": " + str(error_text)[:180] if error_text else "")
+            progress = 1.0
+
+        self.u1c_set_operation_panel(
+            base=base,
+            operation=operation,
+            step="1/1",
+            action=operation,
+            mode="DESIGNER",
+            status=status,
+            progress=progress,
+            pulse=False,
+        )
+
+
+    def run_1c_maintenance_command(self, log, title, base, extra_args, timeout=7200):
+        import subprocess
+        from datetime import datetime
+
+        args = build_1c_args(base, self.settings, "DESIGNER")
+        args.extend(extra_args)
+
+        env = self.onec_command_env_for_maintenance()
+
+        started = self.u1c_begin_maintenance_operation(base, title, action=title)
+
+        log("")
+        log(f"=== {title}: {base.get('name') or '-'} ===")
+        log("Команда: " + self.mask_1c_command_for_log(args))
+
+        if env.get("LD_PRELOAD"):
+            log("LD_PRELOAD: " + env.get("LD_PRELOAD", ""))
+
+        proc = None
+
+        try:
+            proc = subprocess.Popen(
+                args,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                env=env,
+            )
+
+            self.u1c_set_operation_panel(
+                base=base,
+                operation=title,
+                step="1/1",
+                action=title,
+                mode="DESIGNER",
+                status="выполняется",
+                pid=str(proc.pid),
+                started=started,
+                pulse=True,
+            )
+
+            try:
+                out, _ = proc.communicate(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+
+                out, _ = proc.communicate()
+                raise RuntimeError(f"Таймаут операции 1С: {timeout} сек.")
+
+            out = out or ""
+
+            if out.strip():
+                log(out.strip()[-6000:])
+
+            if proc.returncode != 0:
+                raise RuntimeError(f"1С завершилась с кодом {proc.returncode}")
+
+            self.u1c_finish_maintenance_operation(base, title, ok=True)
+            return True
+
+        except Exception as e:
+            self.u1c_finish_maintenance_operation(base, title, ok=False, error_text=f"{type(e).__name__}: {e}")
+            raise
+
+    def default_maintenance_dir(self, base):
+        root = (
+            self.settings.get("backup_dir")
+            or self.settings.get("backups_dir")
+            or "/mnt/DataStore/Updater1C/1c-backups"
+        )
+
+        name = safe_name(base.get("name") or "base")
+        path = Path(root).expanduser() / name
+        path.mkdir(parents=True, exist_ok=True)
+
+        return path
+
+    def archive_selected_base_dt(self, base):
+        """Архивирование ИБ через /DumpIB в .dt."""
+        out_dir = self.default_maintenance_dir(base)
+        dest = out_dir / f"{safe_name(base.get('name') or 'base')}_{now_stamp()}.dt"
+
+        reports_dir = Path(
+            self.settings.get("reports_dir")
+            or self.settings.get("report_dir")
+            or "/mnt/DataStore/Updater1C/1c-update-reports"
+        ).expanduser()
+        reports_dir.mkdir(parents=True, exist_ok=True)
+
+        log_file = reports_dir / f"{safe_name(base.get('name') or 'base')}_DumpIB_{now_stamp()}.log"
+
+        def work(log):
+            self.run_1c_maintenance_command(
+                log,
+                "Архивирование базы в .dt",
+                base,
+                ["/DumpIB", str(dest), "/Out", str(log_file), "-NoTruncate"],
+                timeout=14400,
+            )
+
+            log(f"Архив создан: {dest}")
+
+            if log_file.exists():
+                try:
+                    tail = log_file.read_text(encoding="utf-8", errors="replace")[-6000:]
+                    if tail.strip():
+                        log("Хвост лога 1С:")
+                        log(tail)
+                except Exception:
+                    pass
+
+        self.run_in_background("Архивирование базы", work)
+
+
+    def save_selected_config_cf(self, base):
+        """Выгрузка конфигурации через /DumpCfg в .cf."""
+        from pathlib import Path
+
+        out_dir = self.default_maintenance_dir(base)
+        dest = out_dir / self.cf_export_file_name(base)
+
+        reports_dir = Path(
+            self.settings.get("reports_dir")
+            or self.settings.get("report_dir")
+            or "/mnt/DataStore/Updater1C/1c-update-reports"
+        ).expanduser()
+        reports_dir.mkdir(parents=True, exist_ok=True)
+
+        log_file = reports_dir / f"{safe_name(base.get('name') or 'base')}_DumpCfg_{now_stamp()}.log"
+
+        def work(log):
+            self.run_1c_maintenance_command(
+                log,
+                "Сохранение конфигурации в .cf",
+                base,
+                ["/DumpCfg", str(dest), "/Out", str(log_file), "-NoTruncate"],
+                timeout=14400,
+            )
+
+            log(f"Файл конфигурации создан: {dest}")
+
+            if log_file.exists():
+                try:
+                    tail = log_file.read_text(encoding="utf-8", errors="replace")[-6000:]
+
+                    if tail.strip():
+                        log("Хвост лога 1С:")
+                        log(tail)
+                except Exception:
+                    pass
+
+        self.run_in_background("Сохранение конфигурации в cf", work)
+
+    def choose_cf_file_for_load(self):
+        dlg = Gtk.FileChooserDialog(
+            title="Выберите файл конфигурации .cf",
+            transient_for=self,
+            action=Gtk.FileChooserAction.OPEN,
+        )
+
+        dlg.add_button("Отмена", Gtk.ResponseType.CANCEL)
+        dlg.add_button("Выбрать", Gtk.ResponseType.OK)
+
+        try:
+            filt = Gtk.FileFilter()
+            filt.set_name("Файлы конфигурации 1С (*.cf)")
+            filt.add_pattern("*.cf")
+            filt.add_pattern("*.CF")
+            dlg.add_filter(filt)
+
+            all_filter = Gtk.FileFilter()
+            all_filter.set_name("Все файлы")
+            all_filter.add_pattern("*")
+            dlg.add_filter(all_filter)
+        except Exception:
+            pass
+
+        for folder in [
+            self.settings.get("backup_dir") or "",
+            "/mnt/DataStore/Updater1C/1c-backups",
+            str(Path.home() / "Загрузки"),
+            str(Path.home() / "Downloads"),
+            str(Path.home()),
+        ]:
+            try:
+                if folder and Path(folder).expanduser().exists():
+                    dlg.set_current_folder(str(Path(folder).expanduser()))
+                    break
+            except Exception:
+                pass
+
+        result = ""
+
+        if dlg.run() == Gtk.ResponseType.OK:
+            result = dlg.get_filename() or ""
+
+        dlg.destroy()
+
+        return result
+
+    def load_selected_config_from_cf(self, base, cf_file):
+        """Загрузка .cf через /LoadCfg и применение /UpdateDBCfg -Dynamic+."""
+        cf_path = Path(cf_file).expanduser()
+
+        if not cf_path.exists() or not cf_path.is_file():
+            self._append_log(f"Файл .cf не найден: {cf_path}")
+            return
+
+        if cf_path.suffix.lower() != ".cf":
+            self._append_log(f"Выбран не .cf файл: {cf_path}")
+            return
+
+        reports_dir = Path(
+            self.settings.get("reports_dir")
+            or self.settings.get("report_dir")
+            or "/mnt/DataStore/Updater1C/1c-update-reports"
+        ).expanduser()
+        reports_dir.mkdir(parents=True, exist_ok=True)
+
+        log_load = reports_dir / f"{safe_name(base.get('name') or 'base')}_LoadCfg_{now_stamp()}.log"
+        log_update = reports_dir / f"{safe_name(base.get('name') or 'base')}_UpdateDBCfg_{now_stamp()}.log"
+
+        def work(log):
+            self.run_1c_maintenance_command(
+                log,
+                "Загрузка конфигурации из .cf",
+                base,
+                ["/LoadCfg", str(cf_path), "/Out", str(log_load), "-NoTruncate"],
+                timeout=14400,
+            )
+
+            if log_load.exists():
+                try:
+                    tail = log_load.read_text(encoding="utf-8", errors="replace")[-6000:]
+                    if tail.strip():
+                        log("Хвост лога LoadCfg:")
+                        log(tail)
+                except Exception:
+                    pass
+
+            self.run_1c_maintenance_command(
+                log,
+                "Обновление конфигурации базы данных",
+                base,
+                ["/UpdateDBCfg", "-Dynamic+", "/Out", str(log_update), "-NoTruncate"],
+                timeout=14400,
+            )
+
+            if log_update.exists():
+                try:
+                    tail = log_update.read_text(encoding="utf-8", errors="replace")[-6000:]
+                    if tail.strip():
+                        log("Хвост лога UpdateDBCfg:")
+                        log(tail)
+                except Exception:
+                    pass
+
+            log("Загрузка .cf и обновление конфигурации БД завершены.")
+
+        self.run_in_background("Загрузка конфигурации из cf", work)
+
+    def on_context_archive_base(self, *_):
+        base = self.context_selected_1c_base()
+
+        if not base:
+            return
+
+        self.archive_selected_base_dt(base)
+
+    def on_context_save_config_cf(self, *_):
+        base = self.context_selected_1c_base()
+
+        if not base:
+            return
+
+        self.save_selected_config_cf(base)
+
+    def on_context_load_config_cf(self, *_):
+        base = self.context_selected_1c_base()
+
+        if not base:
+            return
+
+        cf_file = self.choose_cf_file_for_load()
+
+        if not cf_file:
+            self._append_log("Загрузка конфигурации из .cf отменена.")
+            return
+
+        dlg = Gtk.MessageDialog(
+            transient_for=self,
+            modal=True,
+            message_type=Gtk.MessageType.WARNING,
+            buttons=Gtk.ButtonsType.OK_CANCEL,
+            text="Загрузить конфигурацию из .cf?",
+        )
+        dlg.format_secondary_text(
+            "База: "
+            + str(base.get("name") or "-")
+            + "\nФайл: "
+            + str(cf_file)
+            + "\n\nОперация изменит конфигурацию базы. Перед загрузкой рекомендуется сделать архив."
+        )
+
+        resp = dlg.run()
+        dlg.destroy()
+
+        if resp != Gtk.ResponseType.OK:
+            self._append_log("Загрузка конфигурации из .cf отменена пользователем.")
+            return
+
+        self.load_selected_config_from_cf(base, cf_file)
+
+
+    def is_group_base_item(self, base):
+        if not isinstance(base, dict):
+            return True
+
+        kind = str(base.get("kind") or base.get("type") or "").strip().lower()
+
+        return bool(base.get("is_group")) or kind == "group"
+
+    def is_web_base_item(self, base):
+        if not isinstance(base, dict):
+            return False
+
+        try:
+            kind, connect = normalize_base_kind_and_connect(base)
+            return str(kind or "").strip().lower() == "web"
+        except Exception:
+            kind = str(base.get("kind") or base.get("type") or "").strip().lower()
+            return kind == "web"
+
+    def context_menu_archive_cf_items_disabled(self):
+        """Для групп и web-баз архив/cf операции в контекстном меню недоступны."""
+        try:
+            base = self.require_current_base_dict()
+        except Exception:
+            base = None
+
+        if not base:
+            return True
+
+        if self.is_group_base_item(base):
+            return True
+
+        if self.is_web_base_item(base):
+            return True
+
+        return False
+
     def show_base_context_menu(self, event):
+        _u1c_archive_cf_restricted_labels = {
+            "Архивировать",
+            "Сохранить конфигурацию в cf",
+            "Загрузить конфигурацию из cf",
+        }
+        _u1c_archive_cf_disabled = self.context_menu_archive_cf_items_disabled()
+
         vals = self.selected_base_values()
 
         menu = Gtk.Menu()
@@ -5080,6 +6001,12 @@ class MainWindow(Gtk.Window):
         if vals:
             title = vals.get("name") or "База"
             item_title = Gtk.MenuItem(label=f"База: {title}")
+            try:
+                _u1c_menu_label_text = str(f"База: {title}")
+                if _u1c_menu_label_text in _u1c_archive_cf_restricted_labels and _u1c_archive_cf_disabled:
+                    item_title.set_sensitive(False)
+            except Exception:
+                pass
             item_title.set_sensitive(False)
             menu.append(item_title)
 
@@ -5090,6 +6017,9 @@ class MainWindow(Gtk.Window):
             ("Конфигуратор", self.on_designer_base_real),
             ("Свойства", self.on_edit_base),
             ("Проверить настройки", self.on_check_selected_base_real),
+            ("Архивировать", self.on_context_archive_base),
+            ("Сохранить конфигурацию в cf", self.on_context_save_config_cf),
+            ("Загрузить конфигурацию из cf", self.on_context_load_config_cf),
             ("Скачать обновления", self.on_download_updates_real),
             ("Скачать платформу", self.on_download_platform),
             ("Установить обновления", self.on_auto_update),
@@ -5098,22 +6028,64 @@ class MainWindow(Gtk.Window):
 
         for label, handler in items:
             item = Gtk.MenuItem(label=label)
+            try:
+                _u1c_menu_label_text = str(label)
+                if _u1c_menu_label_text in _u1c_archive_cf_restricted_labels and _u1c_archive_cf_disabled:
+                    item.set_sensitive(False)
+            except Exception:
+                pass
             item.connect("activate", lambda _item, h=handler: h())
             menu.append(item)
 
         menu.append(Gtk.SeparatorMenuItem())
 
         item_check = Gtk.MenuItem(label="Отметить выбранную строку/группу")
+
+        try:
+
+            _u1c_menu_label_text = str("Отметить выбранную строку/группу")
+
+            if _u1c_menu_label_text in _u1c_archive_cf_restricted_labels and _u1c_archive_cf_disabled:
+
+                item_check.set_sensitive(False)
+
+        except Exception:
+
+            pass
         item_check.connect("activate", lambda *_: self.set_selected_base_checked(True))
         menu.append(item_check)
 
         item_uncheck = Gtk.MenuItem(label="Снять отметку с выбранной строки/группы")
+
+        try:
+
+            _u1c_menu_label_text = str("Снять отметку с выбранной строки/группы")
+
+            if _u1c_menu_label_text in _u1c_archive_cf_restricted_labels and _u1c_archive_cf_disabled:
+
+                item_uncheck.set_sensitive(False)
+
+        except Exception:
+
+            pass
         item_uncheck.connect("activate", lambda *_: self.set_selected_base_checked(False))
         menu.append(item_uncheck)
 
         menu.append(Gtk.SeparatorMenuItem())
 
         item_delete = Gtk.MenuItem(label="Удалить из списка")
+
+        try:
+
+            _u1c_menu_label_text = str("Удалить из списка")
+
+            if _u1c_menu_label_text in _u1c_archive_cf_restricted_labels and _u1c_archive_cf_disabled:
+
+                item_delete.set_sensitive(False)
+
+        except Exception:
+
+            pass
         item_delete.connect("activate", lambda *_: self.on_delete_selected_base_stub())
         menu.append(item_delete)
 
@@ -8812,7 +9784,9 @@ class MainWindow(Gtk.Window):
                     str(base.get("name") or ""),
                 ]).lower()
 
-                if "бухгалтер" in hay or "accounting" in hay:
+                if ("бухгалтер" in hay and "базов" in hay) or "accountingbase" in hay.replace(" ", "").replace("_", "").replace("-", ""):
+                    program = "AccountingBase"
+                elif "бухгалтер" in hay or "accounting" in hay:
                     program = "Accounting"
                 elif (
                     "управление торговлей" in hay
