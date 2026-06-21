@@ -25,7 +25,7 @@ from gi.repository import Gtk, Gdk, GLib
 
 
 APP_NAME = "Обновлятор 1C Linux"
-APP_VERSION = "1.2.3"
+APP_VERSION = "1.2.4"
 CONFIG_DIR = Path.home() / ".config" / "updater1c-linux"
 
 DEFAULT_1CESTART = "/opt/1cv8/common/1cestart"
@@ -537,11 +537,18 @@ def find_config_file():
 
 
 def u1c_fix_1c_public_download_url(url):
-    """Нормализует endpoint скачивания файлов 1С."""
-    url = str(url or "").strip()
-    url = url.replace("/public/file/get/", "/public/file/get/")
-    url = url.replace("/public/file/get", "/public/file/get")
-    return url
+    """Не меняем URL, который вернул update-api.
+
+    Для обновлений конфигураций 1С update-api может вернуть:
+      /public/file/tmplts/get/<uuid>
+
+    Это правильный endpoint для шаблонов/обновлений.
+    Нельзя принудительно менять его на:
+      /public/file/get/<uuid>
+
+    Иначе dl04.1c.ru может вернуть HTML-страницу вместо файла обновления.
+    """
+    return str(url or "").strip()
 
 
 
@@ -578,14 +585,13 @@ def u1c_download_url_variants(url):
 
 
 def u1c_normalize_first_download_url(url):
-    """Для логирования сразу показывает предпочтительный URL."""
-    variants = u1c_download_url_variants(url)
+    """Возвращаем исходный URL без подмены endpoint.
 
-    for u in variants:
-        if "/public/file/get/" in u:
-            return u
+    Раньше здесь принудительно предпочитался /public/file/get/,
+    из-за этого ссылка /public/file/tmplts/get/ превращалась в неправильную.
+    """
+    return str(url or "").strip()
 
-    return variants[0] if variants else str(url or "")
 
 
 class Ui:
@@ -771,47 +777,316 @@ def update_item_filename(item: dict, url: str, fallback: str = "update.zip") -> 
     return fallback
 
 
-def update_program_dir(settings: dict, program: str) -> Path:
-    root = Path(settings.get("updates_dir") or "/mnt/DataStore/Updater1C/1c-updates")
-    return root / safe_name(program or "UnknownProgram")
 
 
+def download_url_to_file(
+    url: str,
+    dest: Path,
+    log_func,
+    login: str = "",
+    password: str = "",
+    progress_func=None,
+    progress_label: str = "",
+):
+    """Скачать файл обновления 1С через requests с Basic Auth.
 
-def download_url_to_file(url: str, dest: Path, log_func, login: str = "", password: str = ""):
+    Проценты не пишем в текстовый лог. Прогресс передаём в progress_func,
+    чтобы GTK показывал его через ProgressBar.
+    """
+    import requests
+    import time
+
+    dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
 
+    tmp = dest.with_suffix(dest.suffix + ".part")
+    if tmp.exists():
+        tmp.unlink()
+
     headers = {
-        "User-Agent": "Mozilla/5.0",
+        "User-Agent": "1C+Enterprise/8.3",
+        "Accept": "*/*",
     }
-    headers.update(auth_header_basic(login, password))
 
-    req = urllib.request.Request(url, headers=headers)
+    auth = (login, password) if (login or password) else None
 
-    with urllib.request.urlopen(req, timeout=120) as r:
+    def progress(percent: int, done: int = 0, total: int = 0, text: str = ""):
+        if progress_func:
+            try:
+                progress_func(percent, done, total, text)
+            except Exception:
+                pass
+
+    log_func(f"Скачивание через requests: {url}")
+    progress(0, 0, 0, progress_label or "Скачивание: подготовка")
+
+    with requests.get(
+        url,
+        headers=headers,
+        auth=auth,
+        timeout=120,
+        stream=True,
+        allow_redirects=True,
+    ) as r:
+        content_type = (r.headers.get("Content-Type") or "").lower()
         total = int(r.headers.get("Content-Length") or 0)
+
+        log_func(f"HTTP статус: {r.status_code}")
+        log_func(f"Итоговый URL: {r.url}")
+        log_func(f"Content-Type: {content_type or '-'}")
+        log_func(f"Content-Length: {total or '-'}")
+
+        if r.status_code >= 400:
+            head = ""
+            try:
+                head = r.text[:1000]
+            except Exception:
+                pass
+            progress(0, 0, total, "Ошибка скачивания")
+            raise RuntimeError(
+                f"HTTP ошибка скачивания: {r.status_code} {r.reason}\n"
+                f"URL: {url}\n"
+                f"Итоговый URL: {r.url}\n"
+                f"Начало ответа:\n{head}"
+            )
+
+        if "text/html" in content_type:
+            head = ""
+            try:
+                head = next(r.iter_content(1000), b"").decode("utf-8", errors="replace")
+            except Exception:
+                pass
+            progress(0, 0, total, "Ошибка: получена HTML-страница")
+            raise RuntimeError(
+                "Вместо файла обновления сервер вернул HTML-страницу. "
+                f"Content-Type: {content_type}\n"
+                f"URL: {url}\n"
+                f"Итоговый URL: {r.url}\n"
+                f"Начало ответа:\n{head}"
+            )
+
         done = 0
         last_percent = -1
+        last_ui_update = 0.0
 
-        with dest.open("wb") as f:
-            while True:
-                chunk = r.read(1024 * 1024)
+        with tmp.open("wb") as f:
+            for chunk in r.iter_content(chunk_size=1024 * 1024):
                 if not chunk:
-                    break
+                    continue
 
                 f.write(chunk)
                 done += len(chunk)
 
                 if total:
                     percent = int(done * 100 / total)
-                    if percent != last_percent and (percent % 5 == 0 or percent == 100):
-                        last_percent = percent
-                        log_func(f"Скачано {percent}% ({done // 1024 // 1024} / {total // 1024 // 1024} МБ)")
                 else:
-                    mb = done // 1024 // 1024
-                    log_func(f"Скачано {mb} МБ")
+                    percent = 0
 
+                now = time.monotonic()
+
+                # В UI обновляем часто, но без спама в лог.
+                if percent != last_percent and (now - last_ui_update >= 0.15 or percent >= 100):
+                    mb_done = done / 1024 / 1024
+                    mb_total = total / 1024 / 1024 if total else 0
+
+                    if total:
+                        text = f"{progress_label or 'Скачивание'}: {percent}% — {mb_done:.1f}/{mb_total:.1f} МБ"
+                    else:
+                        text = f"{progress_label or 'Скачивание'}: {mb_done:.1f} МБ"
+
+                    progress(percent, done, total, text)
+                    last_percent = percent
+                    last_ui_update = now
+
+    tmp.rename(dest)
+
+    validate_downloaded_update_file(dest)
+
+    progress(100, dest.stat().st_size, dest.stat().st_size, f"{progress_label or 'Скачивание'}: файл получен")
     log_func(f"Файл скачан: {dest}")
     return dest
+
+
+def u1c_config_version_folder(version: str) -> str:
+    return str(version or "").strip().replace(".", "_").replace("-", "_")
+
+
+def u1c_config_template_paths(item: dict, program: str, release: str):
+    result = []
+
+    def add(path_value):
+        path_value = str(path_value or "").strip().replace("\\", "/").strip("/")
+        if not path_value:
+            return
+
+        path_value = re.sub(r"^tmplts/", "", path_value, flags=re.I)
+        path_value = re.sub(r"^1[cс]/", "1c/", path_value, flags=re.I)
+
+        if not path_value.lower().startswith("1c/"):
+            path_value = "1c/" + path_value
+
+        if path_value not in result:
+            result.append(path_value)
+
+    for key in ("templatePath", "path", "folder", "catalog", "catalogPath"):
+        if isinstance(item, dict):
+            add(item.get(key))
+
+    program = safe_name(program or "").strip()
+    release_folder = u1c_config_version_folder(release)
+
+    if program and release_folder:
+        add(f"1c/{program}/{release_folder}")
+
+    return result
+
+
+def u1c_config_candidate_filenames(item: dict):
+    result = []
+
+    def add(name):
+        name = str(name or "").strip().replace("\\", "/").split("/")[-1]
+        if not name:
+            return
+        if "." not in name:
+            return
+        low = name.lower()
+        if low in ("get", "download"):
+            return
+        if name not in result:
+            result.append(name)
+
+    if isinstance(item, dict):
+        for key in ("updateFileName", "fileName", "name", "filename"):
+            add(item.get(key))
+
+    for name in ("1cv8.cfu", "1Cv8.cfu", "1CV8.CFU", "1cv8.zip", "1Cv8.zip", "1CV8.ZIP"):
+        add(name)
+
+    return result
+
+
+def u1c_config_download_candidate_urls(item: dict, program: str, release: str, primary_url: str):
+    result = []
+
+    def add(url):
+        url = str(url or "").strip()
+        if url and url not in result:
+            result.append(url)
+
+    # Сначала пробуем URL из update-api и варианты endpoint.
+    for url in u1c_download_url_variants(primary_url):
+        add(url)
+
+    # Потом прямой старый механизм downloads.v8.1c.ru/tmplts.
+    for template_path in u1c_config_template_paths(item, program, release):
+        for filename in u1c_config_candidate_filenames(item):
+            add(f"https://downloads.v8.1c.ru/tmplts/{template_path}/{filename}")
+            add(f"http://downloads.v8.1c.ru/tmplts/{template_path}/{filename}")
+
+    return result
+
+
+def download_config_update_file_with_fallback(item: dict, program: str, release: str, primary_url: str, dest: Path, login: str, password: str, log_func, progress_func=None):
+    import zipfile
+
+    dest = Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+
+    errors = []
+    candidates = u1c_config_download_candidate_urls(item, program, release, primary_url)
+
+    if not candidates:
+        raise RuntimeError("Нет URL-кандидатов для скачивания обновления.")
+
+    log_func(f"Кандидатов скачивания: {len(candidates)}")
+
+    for candidate in candidates:
+        candidate_name = Path(candidate.split("?", 1)[0]).name
+        if not candidate_name or candidate_name.lower() in ("get", "download"):
+            candidate_name = dest.name
+
+        attempt_dest = dest
+        if candidate_name.lower().endswith((".zip", ".rar", ".7z", ".tar", ".tar.gz", ".tgz")):
+            attempt_dest = dest.parent / candidate_name
+
+        try:
+            if attempt_dest.exists():
+                try:
+                    validate_downloaded_update_file(attempt_dest)
+                    if attempt_dest.stat().st_size > 1024 * 1024:
+                        log_func(f"Файл уже есть и выглядит нормальным: {attempt_dest}")
+                        return attempt_dest
+                    else:
+                        log_func(f"Файл слишком маленький, перекачиваю: {attempt_dest}")
+                        attempt_dest.unlink()
+                except Exception:
+                    try:
+                        attempt_dest.unlink()
+                    except Exception:
+                        pass
+
+            log_func(f"Пробую скачать: {candidate}")
+            downloaded = download_url_to_file(
+                candidate,
+                attempt_dest,
+                log_func,
+                login,
+                password,
+                progress_func=progress_func,
+                progress_label=f"{program} {release}",
+            )
+            if progress_func:
+                try:
+                    progress_func(100, 0, 0, f"{program} {release}: распаковка")
+                    GLib.idle_add(
+                        self.idle_set_current_operation,
+                        {
+                            "base": name,
+                            "release": release,
+                            "step": "Распаковка",
+                            "action": "Распаковка архива обновления",
+                            "mode": "UNPACK",
+                            "status": f"{program} {release}: распаковка",
+                            "pid": "-",
+                            "started": getattr(self, "_download_operation_started", "-") or "-",
+                        },
+                    )
+                except Exception:
+                    pass
+
+            downloaded = prepare_1c_downloaded_update_file(downloaded, dest, release, log_func)
+
+            if progress_func:
+                try:
+                    progress_func(100, 0, 0, f"{program} {release}: готово")
+                except Exception:
+                    pass
+
+
+            downloaded = prepare_1c_downloaded_update_file(downloaded, dest, release, log_func)
+
+            validate_downloaded_update_file(downloaded)
+
+            if downloaded.stat().st_size < 1024 * 1024:
+                raise RuntimeError(f"Скачанный файл подозрительно маленький: {downloaded.stat().st_size} байт")
+
+            log_func(f"Файл обновления скачан: {downloaded}")
+            return downloaded
+
+        except Exception as e:
+            msg = f"{type(e).__name__}: {e}"
+            errors.append(f"{candidate} -> {msg}")
+            log_func(f"Не удалось скачать по этому URL: {msg}")
+
+            try:
+                if attempt_dest.exists() and attempt_dest.stat().st_size < 1024 * 1024:
+                    attempt_dest.unlink()
+            except Exception:
+                pass
+
+    raise RuntimeError("Не удалось скачать файл обновления ни по одному URL.\n" + "\n".join(errors[-10:]))
+
 
 def find_download_url_recursive(obj):
     if isinstance(obj, dict):
@@ -832,6 +1107,365 @@ def find_download_url_recursive(obj):
 
     return ""
 
+
+
+
+def tail_file(path: Path, max_lines=250) -> str:
+    try:
+        path = Path(path)
+        if not path.exists():
+            return ""
+        return "\n".join(path.read_text(encoding="utf-8", errors="replace").splitlines()[-max_lines:])
+    except Exception as e:
+        return f"Не удалось прочитать лог {path}: {type(e).__name__}: {e}"
+
+
+def looks_like_html_download_file(path: Path) -> bool:
+    try:
+        path = Path(path)
+        if not path.exists() or not path.is_file():
+            return False
+
+        data = path.read_bytes()[:8192]
+        if not data:
+            return False
+
+        raw = data.lstrip().lower()
+
+        if raw.startswith(b"<!doctype html") or raw.startswith(b"<html"):
+            return True
+
+        text = data.decode("utf-8", errors="ignore").lower()
+
+        html_markers = (
+            "<!doctype html",
+            "<html",
+            "</html>",
+            "<head",
+            "<body",
+            "login.1c.ru",
+            "releases.1c.ru",
+            "портал 1с",
+            "авторизац",
+        )
+
+        return any(marker in text for marker in html_markers)
+
+    except Exception:
+        return False
+
+
+def validate_downloaded_update_file(path: Path) -> None:
+    path = Path(path)
+
+    if not path.exists():
+        raise RuntimeError(f"Файл обновления не найден: {path}")
+
+    if path.stat().st_size <= 0:
+        raise RuntimeError(f"Файл обновления пустой: {path}")
+
+    if looks_like_html_download_file(path):
+        head = path.read_text(encoding="utf-8", errors="replace")[:1000]
+        raise RuntimeError(
+            "Вместо файла обновления получена HTML-страница. "
+            f"Файл нельзя использовать как обновление 1С: {path}\n"
+            f"Начало файла:\n{head}"
+        )
+
+
+def is_uuid_value(value: str) -> bool:
+    value = (value or "").strip()
+    return bool(re.fullmatch(
+        r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+        value,
+    ))
+
+
+def is_valid_config_release(value: str) -> bool:
+    value = (value or "").strip().replace("_", ".")
+    if not value or is_uuid_value(value):
+        return False
+    return bool(re.fullmatch(r"\d+\.\d+\.\d+(?:\.\d+)?", value))
+
+
+def release_version_from_text(value: str) -> str:
+    text = str(value or "").strip()
+    if not text or is_uuid_value(text):
+        return ""
+
+    text = text.replace("\\", "/")
+    parts = re.split(r"[/\s]+", text)
+
+    for part in reversed(parts):
+        part = part.strip(" ._-")
+        cand = part.replace("_", ".")
+        if is_valid_config_release(cand):
+            return cand
+
+    for m in re.finditer(r"(?<!\d)(\d+[._]\d+[._]\d+(?:[._]\d+)?)(?!\d)", text):
+        cand = m.group(1).replace("_", ".")
+        if is_valid_config_release(cand):
+            return cand
+
+    return ""
+
+
+def version_to_update_folder(version: str) -> str:
+    return safe_name((version or "").strip().replace(".", "_"))
+
+
+def update_release_folder(value: str, fallback: str = "release") -> str:
+    v = (value or "").strip().replace("\\", "/")
+    if "/" in v:
+        v = v.rstrip("/").split("/")[-1]
+    if not v:
+        v = fallback
+    return safe_name(v.replace(".", "_"))
+
+
+def read_release_version_from_mft(folder: Path) -> str:
+    mft = Path(folder) / "1cv8.mft"
+    if not mft.exists():
+        return ""
+
+    text = mft.read_text(encoding="utf-8", errors="ignore")
+    patterns = [
+        r"Version\s*=\s*\"?([0-9]+(?:[._][0-9]+)+)\"?",
+        r"VersionNumber\s*=\s*\"?([0-9]+(?:[._][0-9]+)+)\"?",
+        r"Версия\s*=\s*\"?([0-9]+(?:[._][0-9]+)+)\"?",
+    ]
+
+    for pattern in patterns:
+        m = re.search(pattern, text, flags=re.I)
+        if m:
+            return m.group(1).replace(".", "_")
+
+    m = re.search(r"([0-9]+[._][0-9]+[._][0-9]+(?:[._][0-9]+)?)", text)
+    if m:
+        return m.group(1).replace(".", "_")
+
+    return ""
+
+
+def find_update_file_in_dir(folder: Path):
+    folder = Path(folder)
+    if not folder.exists():
+        return None
+
+    preferred = [folder / "1cv8.cfu", folder / "1CV8.CFU", folder / "1cv8.cf", folder / "1CV8.CF"]
+    for item in preferred:
+        if item.exists() and item.is_file():
+            try:
+                validate_downloaded_update_file(item)
+                return item
+            except Exception:
+                continue
+
+    files = []
+    for pattern in ("*.cfu", "*.CFU", "*.cf", "*.CF"):
+        files.extend([p for p in folder.rglob(pattern) if p.is_file()])
+
+    valid_files = []
+    for item in files:
+        try:
+            validate_downloaded_update_file(item)
+            valid_files.append(item)
+        except Exception:
+            continue
+
+    valid_files.sort(key=lambda p: (0 if p.name.lower() == "1cv8.cfu" else 1, len(str(p)), str(p)))
+    return valid_files[0] if valid_files else None
+
+
+def update_item_release_version(item, fallback: str = "") -> str:
+    keys = [
+        "versionNumber", "releaseVersion", "release_version", "version",
+        "newVersion", "targetVersion", "targetVersionNumber",
+        "templatePath", "updateTemplatePath", "updateFileName",
+        "fileName", "name", "title",
+    ]
+    values = []
+
+    if isinstance(item, dict):
+        for key in keys:
+            if key in item:
+                values.append(item.get(key))
+
+        for nested_key in ("programVersion", "versionInfo", "release", "update"):
+            nested = item.get(nested_key)
+            if isinstance(nested, dict):
+                for key in keys:
+                    if key in nested:
+                        values.append(nested.get(key))
+    else:
+        values.append(item)
+
+    values.append(fallback)
+
+    for value in values:
+        ver = release_version_from_text(str(value or ""))
+        if ver:
+            return ver
+
+    return ""
+
+
+def release_version_for_downloaded_folder(folder: Path, fallback: str = "") -> str:
+    ver = read_release_version_from_mft(folder).replace("_", ".")
+    if is_valid_config_release(ver):
+        return ver
+
+    ver = release_version_from_text(Path(folder).name)
+    if ver:
+        return ver
+
+    ver = release_version_from_text(fallback)
+    if ver:
+        return ver
+
+    return ""
+
+
+def load_latest_update_metadata(program_dir: Path) -> dict:
+    program_dir = Path(program_dir)
+    metadata_dir = program_dir / "_metadata"
+    result = {}
+
+    candidates = []
+    if (program_dir / "latest_update_info.json").exists():
+        candidates.append(program_dir / "latest_update_info.json")
+    if metadata_dir.exists():
+        candidates.extend(sorted(metadata_dir.glob("download_data_*.json"), key=lambda p: p.stat().st_mtime, reverse=True))
+        candidates.extend(sorted(metadata_dir.glob("update_info_*.json"), key=lambda p: p.stat().st_mtime, reverse=True))
+
+    for path in candidates:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+
+        if isinstance(data, dict):
+            # Предпочитаем файл download_data: в нём есть и info, и files.
+            if data.get("files") or data.get("configurationUpdateDataList"):
+                return data
+            if not result:
+                result = data
+
+    return result
+
+
+def unpack_update_archives_in_folder(folder: Path, log_func=None) -> None:
+    folder = Path(folder)
+    if find_update_file_in_dir(folder):
+        return
+
+    archives = []
+    for pattern in ("*.zip", "*.rar", "*.7z", "*.tar", "*.tar.gz", "*.tgz"):
+        archives.extend([p for p in folder.rglob(pattern) if p.is_file()])
+
+    for archive in sorted(archives, key=lambda p: len(str(p))):
+        if find_update_file_in_dir(folder):
+            return
+
+        target = archive.parent / (archive_output_folder_name(archive) + "_unpacked")
+        if target.exists() and find_update_file_in_dir(target):
+            continue
+
+        try:
+            if log_func:
+                log_func(f"Распаковка архива обновления: {archive}")
+            unpack_platform_archive(archive, target, log_func)
+        except Exception as e:
+            if log_func:
+                log_func(f"Не удалось распаковать {archive}: {type(e).__name__}: {e}")
+
+
+def find_downloaded_update_steps(settings: dict, program: str, current_version: str = "", log_func=None):
+    root = update_program_dir(settings, program)
+    if not root.exists():
+        return []
+
+    info = load_latest_update_metadata(root)
+    seq = []
+    data_list = []
+
+    if isinstance(info, dict):
+        info_block = info.get("info") if isinstance(info.get("info"), dict) else info
+        if isinstance(info_block, dict):
+            seq = info_block.get("upgradeSequence") or []
+        data_list = info.get("files") or info.get("configurationUpdateDataList") or []
+
+    result = []
+    used = set()
+
+    def add_folder(folder: Path, fallback: str = "") -> bool:
+        if not folder.exists() or not folder.is_dir():
+            return False
+
+        if "_metadata" in folder.parts or "_archives" in folder.parts:
+            return False
+
+        unpack_update_archives_in_folder(folder, log_func)
+
+        key = str(folder.resolve())
+        if key in used:
+            return False
+
+        update_file = find_update_file_in_dir(folder)
+        if not update_file:
+            return False
+
+        rel_ver = release_version_for_downloaded_folder(update_file.parent, fallback)
+        if not rel_ver:
+            rel_ver = release_version_for_downloaded_folder(folder, fallback)
+        if not rel_ver:
+            if is_uuid_value(folder.name) or is_uuid_value(str(fallback)):
+                return False
+            rel_ver = folder.name.replace("_", ".")
+
+        if not is_valid_config_release(rel_ver):
+            return False
+
+        used.add(key)
+        result.append((rel_ver, update_file, update_file.parent))
+        return True
+
+    def add_release(value: str) -> bool:
+        rel_ver = release_version_from_text(value)
+        if not rel_ver:
+            return False
+
+        folder_name = version_to_update_folder(rel_ver)
+        candidates = [root / folder_name, root / rel_ver]
+        candidates.extend([p for p in root.rglob(folder_name) if p.is_dir()])
+        candidates.extend([p for p in root.rglob(rel_ver) if p.is_dir()])
+
+        for folder in candidates:
+            if add_folder(folder, rel_ver):
+                return True
+        return False
+
+    if isinstance(data_list, list):
+        for n, item in enumerate(data_list):
+            fallback = seq[n] if n < len(seq) else ""
+            rel_ver = update_item_release_version(item, str(fallback))
+            if rel_ver:
+                add_release(rel_ver)
+
+    for item in seq:
+        rel_ver = update_item_release_version(item, str(item))
+        if rel_ver:
+            add_release(rel_ver)
+
+    if result:
+        result.sort(key=lambda x: version_key(x[0]))
+        return result
+
+    for folder in sorted([p for p in root.iterdir() if p.is_dir() and not p.name.startswith("_")], key=lambda p: p.name):
+        add_folder(folder, "")
+
+    result.sort(key=lambda x: version_key(x[0]))
+    return result
 
 
 
@@ -1718,25 +2352,36 @@ class AutoUpdateDialog(Gtk.Dialog):
 
         info = Ui.label(
             "Автообновление выполняется только пакетными командами 1С без ручного выбора релиза и без нажатия кнопок.\n"
-            "Последовательность: /UpdateCfg конкретного 1cv8.cfu → /UpdateDBCfg → ENTERPRISE /C ЗапуститьОбновлениеИнформационнойБазы."
+            "Последовательность: /UpdateCfg конкретного 1cv8.cfu → /UpdateDBCfg → ENTERPRISE /C ВыполнитьОбновлениеИЗавершитьРаботу."
         )
         grid.attach(info, 0, 0, 2, 1)
 
+        self.backup_mode = Ui.combo(["Сделать резервную копию перед обновлением", "Не делать резервную копию"])
+        self.backup_type = Ui.combo([
+            "Авто: файловая=архив 1Cv8.1CD, серверная=.dt",
+            "Файловый архив 1Cv8.1CD; для серверной будет .dt",
+            "Выгрузка .dt через конфигуратор",
+        ])
+        self.restore_on_error = Ui.check("При ошибке попытаться автоматически откатить базу из созданной копии", True)
+        self.update_db_cfg = Ui.check("После /UpdateCfg отдельной командой выполнять /UpdateDBCfg", True)
+        self.dynamic_update = Ui.check("Для /UpdateDBCfg пробовать динамическое применение изменений (-Dynamic+)", True)
+        self.server_update = Ui.check("Для серверной базы добавлять к /UpdateDBCfg ключ -Server", False)
+        self.run_handlers = Ui.check("После каждого релиза запускать обработчики обновления в режиме 1С:Предприятие", True)
+        self.stop_on_error = Ui.check("Остановить цепочку при первой ошибке", True)
+        self.hidden_xvfb = Ui.check("Скрытый пакетный запуск через xvfb-run, если установлен", bool(shutil.which("xvfb-run")))
+        self.timeout_minutes = Ui.entry("120")
+
         rows = [
-            ("Резервная копия:", Ui.combo(["Сделать резервную копию перед обновлением", "Не делать резервную копию"])),
-            ("Тип резервной копии:", Ui.combo([
-                "Авто: файловая=архив 1Cv8.1CD, серверная=.dt",
-                "Файловый архив 1Cv8.1CD / PostgreSQL pg_dump / MSSQL .bak",
-                "Выгрузка .dt через конфигуратор",
-            ])),
-            ("", Ui.check("При ошибке попытаться автоматически откатить базу из созданной копии", True)),
-            ("", Ui.check("После /UpdateCfg отдельной командой выполнять /UpdateDBCfg", True)),
-            ("", Ui.check("Для /UpdateDBCfg пробовать динамическое применение изменений (-Dynamic+)", True)),
-            ("", Ui.check("Для серверной базы добавлять к /UpdateDBCfg ключ -Server", False)),
-            ("", Ui.check("После каждого релиза запускать обработчики обновления в режиме 1С:Предприятие", True)),
-            ("", Ui.check("Остановить цепочку при первой ошибке", True)),
-            ("", Ui.check("Скрытый пакетный запуск через xvfb-run, если установлен", True)),
-            ("Таймаут одной операции, минут:", Ui.entry("120")),
+            ("Резервная копия:", self.backup_mode),
+            ("Тип резервной копии:", self.backup_type),
+            ("", self.restore_on_error),
+            ("", self.update_db_cfg),
+            ("", self.dynamic_update),
+            ("", self.server_update),
+            ("", self.run_handlers),
+            ("", self.stop_on_error),
+            ("", self.hidden_xvfb),
+            ("Таймаут одной операции, минут:", self.timeout_minutes),
         ]
 
         for i, (label, widget) in enumerate(rows, 1):
@@ -1745,6 +2390,27 @@ class AutoUpdateDialog(Gtk.Dialog):
 
         self.show_all()
 
+    def get_values(self):
+        try:
+            timeout_minutes = int((self.timeout_minutes.get_text() or "120").strip())
+        except Exception:
+            timeout_minutes = 120
+
+        timeout_minutes = max(1, timeout_minutes)
+
+        return {
+            "make_backup": self.backup_mode.get_active() == 0,
+            "backup_type": self.backup_type.get_active(),
+            "restore_on_error": self.restore_on_error.get_active(),
+            "update_db_cfg": self.update_db_cfg.get_active(),
+            "dynamic_update": self.dynamic_update.get_active(),
+            "server_update": self.server_update.get_active(),
+            "run_handlers": self.run_handlers.get_active(),
+            "stop_on_error": self.stop_on_error.get_active(),
+            "hidden_xvfb": self.hidden_xvfb.get_active(),
+            "timeout_minutes": timeout_minutes,
+            "timeout_seconds": timeout_minutes * 60,
+        }
 
 
 
@@ -9695,6 +10361,41 @@ class MainWindow(Gtk.Window):
         except Exception:
             pass
 
+    def set_download_operation_progress(
+        self,
+        percent,
+        text="",
+        base="-",
+        release="-",
+        step="-",
+        action="Скачивание файла обновления",
+    ):
+        """Обновляет нижний progressbar и правую панель 'Текущая операция'."""
+        try:
+            from datetime import datetime
+
+            if not getattr(self, "_download_operation_started", ""):
+                self._download_operation_started = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+            value = max(0, min(100, int(percent or 0)))
+            status_text = text or f"{value}%"
+
+            self.set_report_progress(value, status_text)
+
+            self.set_current_operation(
+                base=base or "-",
+                release=release or "-",
+                step=step or "-",
+                action=action or "Скачивание файла обновления",
+                mode="DOWNLOAD",
+                status=status_text,
+                pid="-",
+                started=getattr(self, "_download_operation_started", "-") or "-",
+            )
+
+        except Exception:
+            pass
+
     def open_reports_dir(self, *_):
         try:
             path = self.settings.get("reports_dir") or self.settings.get("report_dir") or str(Path.home() / "1c-update-reports")
@@ -9764,6 +10465,16 @@ class MainWindow(Gtk.Window):
 
         api = GtkOneCUpdateApi(login, password)
 
+        self._download_operation_started = ""
+        GLib.idle_add(
+            self.set_download_operation_progress,
+            0,
+            "Скачивание обновлений: подготовка",
+            "-",
+            "-",
+            "Подготовка",
+            "Скачивание обновлений",
+        )
         self._append_log("=== Скачивание обновлений конфигураций ===")
         self._append_log(f"Баз к обработке: {len(indexes)}")
 
@@ -9892,7 +10603,7 @@ class MainWindow(Gtk.Window):
 
                 for n, item in enumerate(files, 1):
                     release = update_item_release_version(item, target_version) or target_version or f"step_{n}"
-                    release_dir = program_root / safe_name(release)
+                    release_dir = update_release_dir(self.settings, program, release)
 
                     url = update_item_url(item) or find_download_url_recursive(item)
                     if not url:
@@ -9918,11 +10629,56 @@ class MainWindow(Gtk.Window):
                     if url != _old_url:
                         self._append_log(f"URL нормализован: {url}")
                     if dest.exists() and dest.stat().st_size > 0:
-                        self._append_log(f"Файл уже есть: {dest}")
-                    else:
-                        download_url_to_file(url, dest, self._append_log, login, password)
+                        try:
+                            validate_downloaded_update_file(dest)
+                            if dest.stat().st_size > 1024 * 1024:
+                                self._append_log(f"Файл уже есть: {dest}")
+                            else:
+                                self._append_log(f"Файл обновления слишком маленький, удаляю: {dest}")
+                                dest.unlink()
+                        except Exception as e:
+                            self._append_log(f"Найден битый файл обновления, удаляю: {dest}")
+                            self._append_log(str(e))
+                            try:
+                                dest.unlink()
+                            except Exception:
+                                pass
 
+                    if not dest.exists():
+                        download_config_update_file_with_fallback(
+                            item=item,
+                            program=program,
+                            release=release,
+                            primary_url=url,
+                            dest=dest,
+                            login=login,
+                            password=password,
+                            log_func=self._append_log,
+                            progress_func=lambda percent, done=0, total=0, text="": GLib.idle_add(
+                                self.set_download_operation_progress,
+                                percent,
+                                text or f"{program} {release}: {percent}%",
+                                name,
+                                release,
+                                "Скачивание",
+                                "Скачивание файла обновления",
+                            ),
+                        )
                 self._append_log(f"Скачивание обновлений: база {name} завершено")
+                GLib.idle_add(
+                    self.idle_set_current_operation,
+                    {
+                        "base": name,
+                        "release": release if "release" in locals() else "-",
+                        "step": "Готово",
+                        "action": "Скачивание обновлений",
+                        "mode": "DOWNLOAD",
+                        "status": "Скачивание завершено",
+                        "pid": "-",
+                        "started": getattr(self, "_download_operation_started", "-") or "-",
+                    },
+                )
+                GLib.idle_add(self.set_report_progress, 100, f"Скачивание обновлений: {name} завершено")
 
             except Exception as e:
                 self._append_log(f"ОШИБКА скачивания обновлений для {name}: {type(e).__name__}: {e}")
@@ -9982,10 +10738,417 @@ class MainWindow(Gtk.Window):
     def on_stub(self, *_):
         self._append_log("GTK preview: обработчик будет подключен на следующем этапе переноса логики.")
 
-    def on_auto_update(self, *_):
-        dlg = AutoUpdateDialog(self)
-        dlg.run()
+    def ask_yes_no(self, title, message, default_no=True):
+        dlg = Gtk.MessageDialog(
+            transient_for=self,
+            flags=0,
+            message_type=Gtk.MessageType.WARNING,
+            buttons=Gtk.ButtonsType.YES_NO,
+            text=title,
+        )
+        dlg.format_secondary_text(message)
+        try:
+            dlg.set_default_response(Gtk.ResponseType.NO if default_no else Gtk.ResponseType.YES)
+        except Exception:
+            pass
+        response = dlg.run()
         dlg.destroy()
+        return response == Gtk.ResponseType.YES
+
+    def prepared_base_for_update(self, idx: int) -> dict:
+        base = dict(self.bases[idx])
+        user = str(base.get("user") or base.get("username") or base.get("login") or "").strip()
+        password = self.get_base_password(self.bases[idx])
+        base["user"] = user
+        base["password"] = password
+        return base
+
+    def guess_update_program_for_base(self, base: dict) -> str:
+        program = str(base.get("update_program_name") or base.get("program") or "").strip()
+        if program:
+            return program
+        return self.guess_update_program_name_from_metadata(
+            base.get("config_name") or "",
+            base.get("config_synonym") or "",
+            base.get("name") or "",
+        )
+
+    def update_base_version_after_release(self, idx: int, release_version: str, log):
+        new_version = (release_version or "").replace("_", ".").strip()
+        if not new_version:
+            return
+        try:
+            if 0 <= idx < len(self.bases) and isinstance(self.bases[idx], dict):
+                self.bases[idx]["config_version"] = new_version
+                self.config["bases"] = self.bases
+                save_json(self.config_path, self.config)
+                GLib.idle_add(self.refresh_bases_tree_keep_selected, self.bases[idx])
+                log(f"Версия конфигурации в карточке базы обновлена: {new_version}")
+            else:
+                log(f"Не удалось сохранить версию {new_version}: индекс базы не найден.")
+        except Exception as e:
+            log(f"Не удалось сохранить новую версию конфигурации {new_version}: {type(e).__name__}: {e}")
+
+    def run_1c_update_batch(self, log, base: dict, mode: str, extra_args: list, timeout: int, hidden_xvfb: bool = False):
+        args = build_1c_args(base, self.settings, mode)
+        args.extend(extra_args)
+
+        final_args = list(args)
+        if hidden_xvfb:
+            xvfb = shutil.which("xvfb-run")
+            if xvfb:
+                final_args = [xvfb, "-a", "-s", "-screen 0 1280x1024x24"] + final_args
+                log("Скрытый запуск через xvfb-run включен.")
+            else:
+                log("xvfb-run не найден. Запуск будет обычным. Установить можно: sudo apt install xvfb -y")
+
+        env = self.onec_command_env_for_maintenance()
+        log("Команда: " + self.mask_1c_command_for_log(final_args))
+        if env.get("LD_PRELOAD"):
+            log("LD_PRELOAD: " + env.get("LD_PRELOAD", ""))
+
+        proc = subprocess.Popen(
+            final_args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            errors="replace",
+            env=env,
+        )
+        try:
+            out, _ = proc.communicate(timeout=max(1, int(timeout)))
+        except subprocess.TimeoutExpired:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            out, _ = proc.communicate()
+            if out and out.strip():
+                log(out.strip()[-6000:])
+            raise RuntimeError(f"Таймаут операции 1С: {timeout} сек.")
+
+        if out and out.strip():
+            log(out.strip()[-6000:])
+
+        log(f"Код завершения: {proc.returncode}")
+        if proc.returncode != 0:
+            raise RuntimeError(f"Команда завершилась с кодом {proc.returncode}")
+
+    def file_base_1cd_path(self, base: dict) -> Path:
+        kind, connect = normalize_base_kind_and_connect(base)
+        if kind != "file":
+            raise RuntimeError("Файловый архив 1Cv8.1CD доступен только для файловой базы.")
+        base_dir = Path(connect).expanduser()
+        one_cd = base_dir / "1Cv8.1CD"
+        if not one_cd.exists():
+            raise RuntimeError(f"Файл базы не найден: {one_cd}")
+        return one_cd
+
+    def make_file_1cd_backup_for_update(self, log, base: dict, release: str) -> Path:
+        import tarfile
+        one_cd = self.file_base_1cd_path(base)
+        backup_root = Path(self.settings.get("backup_dir") or self.settings.get("backups_dir") or "/mnt/DataStore/Updater1C/1c-backups").expanduser()
+        out_dir = backup_root / safe_name(base.get("name") or "base")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        dest = out_dir / f"{safe_name(base.get('name') or 'base')}_before_{safe_name(release)}_{now_stamp()}_1Cv8.1CD.tar.gz"
+        log("=== Архивирование файловой базы 1Cv8.1CD ===")
+        log(f"Источник: {one_cd}")
+        log(f"Архив: {dest}")
+        with tarfile.open(dest, "w:gz") as tar:
+            tar.add(one_cd, arcname="1Cv8.1CD")
+        log(f"Архив создан: {dest}")
+        return dest
+
+    def make_dt_backup_for_update(self, log, base: dict, release: str, vals: dict) -> Path:
+        backup_root = Path(self.settings.get("backup_dir") or self.settings.get("backups_dir") or "/mnt/DataStore/Updater1C/1c-backups").expanduser()
+        out_dir = backup_root / safe_name(base.get("name") or "base")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        dest = out_dir / f"{safe_name(base.get('name') or 'base')}_before_{safe_name(release)}_{now_stamp()}.dt"
+        reports_dir = Path(self.settings.get("reports_dir") or self.settings.get("report_dir") or "/mnt/DataStore/Updater1C/1c-update-reports").expanduser()
+        reports_dir.mkdir(parents=True, exist_ok=True)
+        log_file = reports_dir / f"{safe_name(base.get('name') or 'base')}_DumpIB_before_{safe_name(release)}_{now_stamp()}.log"
+        log("=== Архивирование базы в .dt ===")
+        self.run_1c_update_batch(
+            log,
+            base,
+            "DESIGNER",
+            ["/DumpIB", str(dest), "/Out", str(log_file), "-NoTruncate"],
+            timeout=vals.get("timeout_seconds", 7200),
+            hidden_xvfb=vals.get("hidden_xvfb", False),
+        )
+        if tail_file(log_file).strip():
+            log("Хвост лога DumpIB:")
+            log(tail_file(log_file))
+        log(f"Архив .dt создан: {dest}")
+        return dest
+
+    def make_pre_update_backup(self, log, base: dict, release: str, vals: dict):
+        if not vals.get("make_backup"):
+            log("Резервная копия перед обновлением отключена пользователем.")
+            return None
+
+        kind, _connect = normalize_base_kind_and_connect(base)
+        backup_type = int(vals.get("backup_type", 0))
+
+        if backup_type == 2:
+            return self.make_dt_backup_for_update(log, base, release, vals)
+
+        if backup_type == 1:
+            if kind == "file":
+                return self.make_file_1cd_backup_for_update(log, base, release)
+            log("Для серверной базы файловый архив 1Cv8.1CD недоступен, будет создана .dt.")
+            return self.make_dt_backup_for_update(log, base, release, vals)
+
+        if kind == "file":
+            return self.make_file_1cd_backup_for_update(log, base, release)
+
+        if kind == "server":
+            return self.make_dt_backup_for_update(log, base, release, vals)
+
+        log("Для этого типа базы резервная копия не создается.")
+        return None
+
+    def restore_file_1cd_backup_for_update(self, log, base: dict, backup_file: Path):
+        import tarfile
+        one_cd = self.file_base_1cd_path(base)
+        backup_file = Path(backup_file)
+        if not backup_file.exists():
+            raise RuntimeError(f"Архив отката не найден: {backup_file}")
+        failed = one_cd.with_name(f"1Cv8.1CD.failed_{now_stamp()}")
+        log("=== Откат файловой базы из архива ===")
+        log(f"Текущий файл базы будет сохранен как: {failed}")
+        shutil.move(str(one_cd), str(failed))
+        with tarfile.open(backup_file, "r:gz") as tar:
+            member = tar.getmember("1Cv8.1CD")
+            tar.extract(member, path=str(one_cd.parent))
+        if not one_cd.exists():
+            raise RuntimeError("После распаковки файл 1Cv8.1CD не появился.")
+        log("Откат файловой базы выполнен.")
+
+    def restore_pre_update_backup(self, log, base: dict, backup_file, vals: dict):
+        if not backup_file:
+            log("Откат невозможен: резервная копия не создавалась.")
+            return
+        backup_file = Path(backup_file)
+        if backup_file.name.lower().endswith(".tar.gz"):
+            self.restore_file_1cd_backup_for_update(log, base, backup_file)
+            return
+        if backup_file.suffix.lower() == ".dt":
+            reports_dir = Path(self.settings.get("reports_dir") or self.settings.get("report_dir") or "/mnt/DataStore/Updater1C/1c-update-reports").expanduser()
+            reports_dir.mkdir(parents=True, exist_ok=True)
+            log_file = reports_dir / f"{safe_name(base.get('name') or 'base')}_RestoreIB_{now_stamp()}.log"
+            log(f"Откат через /RestoreIB из {backup_file}")
+            self.run_1c_update_batch(
+                log,
+                base,
+                "DESIGNER",
+                ["/RestoreIB", str(backup_file), "/Out", str(log_file), "-NoTruncate"],
+                timeout=vals.get("timeout_seconds", 7200),
+                hidden_xvfb=vals.get("hidden_xvfb", False),
+            )
+            if tail_file(log_file).strip():
+                log("Хвост лога RestoreIB:")
+                log(tail_file(log_file))
+            return
+        log(f"Автооткат для типа копии {backup_file} не выполняется автоматически.")
+
+    def run_update_handlers_for_base(self, log, base: dict, release_name: str, vals: dict):
+        reports_dir = Path(self.settings.get("reports_dir") or self.settings.get("report_dir") or "/mnt/DataStore/Updater1C/1c-update-reports").expanduser()
+        reports_dir.mkdir(parents=True, exist_ok=True)
+        log_file = reports_dir / f"{safe_name(base.get('name') or 'base')}_03_Handlers_{safe_name(release_name)}_{now_stamp()}.log"
+        extra = [
+            "/DisableStartupDialogs",
+            "/DisableStartupMessages",
+            "/C", "ВыполнитьОбновлениеИЗавершитьРаботу",
+            "/Out", str(log_file),
+            "-NoTruncate",
+        ]
+        log("Шаг 3. Запуск обработчиков обновления в режиме 1С:Предприятие...")
+        self.run_1c_update_batch(
+            log,
+            base,
+            "ENTERPRISE",
+            extra,
+            timeout=vals.get("timeout_seconds", 7200),
+            hidden_xvfb=True,
+        )
+        if tail_file(log_file).strip():
+            log("Хвост лога обработчиков:")
+            log(tail_file(log_file))
+        log(f"Лог обработчиков: {log_file}")
+
+    def on_auto_update(self, *_):
+        indexes = self.gtk_operation_target_indices()
+        if not indexes:
+            self.switch_to_report_tab()
+            self._append_log("ОШИБКА: не выбраны базы для установки обновлений.")
+            return
+
+        dlg = AutoUpdateDialog(self)
+        response = dlg.run()
+        vals = dlg.get_values() if response == Gtk.ResponseType.OK else None
+        dlg.destroy()
+
+        if response != Gtk.ResponseType.OK:
+            self.switch_to_report_tab()
+            self._append_log("Автообновление отменено.")
+            return
+
+        if vals.get("make_backup"):
+            if not self.ask_yes_no("Подтверждение обновления", "Перед обновлением будет создана резервная копия. Продолжить?"):
+                self.switch_to_report_tab()
+                self._append_log("Автообновление отменено пользователем.")
+                return
+        else:
+            if not self.ask_yes_no("Без резервной копии", "Запустить автообновление без резервной копии? Это рискованно."):
+                self.switch_to_report_tab()
+                self._append_log("Автообновление отменено пользователем.")
+                return
+
+        def work(log):
+            log(f"Баз к автообновлению: {len(indexes)}")
+            log("Режим: полностью пакетный. Ручной выбор релиза и ручное нажатие кнопок не используется.")
+            log(f"Таймаут одной операции: {vals.get('timeout_seconds', 7200)} сек.")
+
+            for pos, idx in enumerate(indexes, 1):
+                if not (0 <= idx < len(self.bases)):
+                    continue
+
+                base = self.prepared_base_for_update(idx)
+                name = base.get("name") or f"base_{idx}"
+                program = self.guess_update_program_for_base(base)
+                current_version = str(base.get("config_version") or "").strip()
+                backup_file = None
+
+                log("")
+                log(f"[{pos}/{len(indexes)}] Автообновление базы: {name}")
+                log(f"Код программы обновлений: {program or '<не заполнен>'}")
+                log(f"Текущая версия в карточке базы: {current_version or '<не заполнена>'}")
+
+                try:
+                    kind, _connect = normalize_base_kind_and_connect(base)
+                    if kind == "web":
+                        log("ПРОПУСК: web-базы через DESIGNER по URL не обновляются.")
+                        continue
+
+                    if not program:
+                        log("ПРОПУСК: не заполнен код программы обновлений 1С. Сначала выполните Проверить настройки.")
+                        continue
+
+                    # Проверяем платформу заранее, чтобы ошибка была понятной до резервного копирования.
+                    _ = select_platform_exe_for_base(base, self.settings, "DESIGNER")
+                    if not _:
+                        log("ОШИБКА: платформа 1С не найдена.")
+                        continue
+
+                    steps = find_downloaded_update_steps(self.settings, program, current_version, log)
+                    if not steps:
+                        log(f"Не найдены скачанные релизы в {update_program_dir(self.settings, program)}. Сначала нажми «Скачать обновления».")
+                        continue
+
+                    if current_version:
+                        filtered = []
+                        for rel, cfu, folder in steps:
+                            rel_ver = rel.replace("_", ".")
+                            if version_key(rel_ver) > version_key(current_version):
+                                filtered.append((rel, cfu, folder))
+                            else:
+                                log(f"Пропуск уже примененного/старого релиза: {rel} <= {current_version}")
+                        steps = filtered
+
+                    if not steps:
+                        log("Нет релизов новее текущей версии базы.")
+                        continue
+
+                    log("Последовательность пакетного обновления:")
+                    for rel, cfu, _folder in steps:
+                        log(f"  {rel}: {cfu}")
+
+                    backup_file = self.make_pre_update_backup(log, base, steps[0][0], vals)
+                    last_release = current_version
+
+                    reports_dir = Path(self.settings.get("reports_dir") or self.settings.get("report_dir") or "/mnt/DataStore/Updater1C/1c-update-reports").expanduser()
+                    reports_dir.mkdir(parents=True, exist_ok=True)
+
+                    for rel, cfu, _folder in steps:
+                        rel_safe = safe_name(rel)
+                        log("")
+                        log(f"=== Релиз {rel} ===")
+
+                        log_update_cfg = reports_dir / f"{safe_name(name)}_01_UpdateCfg_{rel_safe}_{now_stamp()}.log"
+                        extra_update = [
+                            "/DisableStartupDialogs",
+                            "/DisableStartupMessages",
+                            "/UpdateCfg", str(cfu),
+                            "/Out", str(log_update_cfg),
+                            "-NoTruncate",
+                        ]
+                        log("Шаг 1. Пакетное обновление конфигурации /UpdateCfg без ручного выбора релиза...")
+                        self.run_1c_update_batch(
+                            log,
+                            base,
+                            "DESIGNER",
+                            extra_update,
+                            timeout=vals.get("timeout_seconds", 7200),
+                            hidden_xvfb=vals.get("hidden_xvfb", False),
+                        )
+                        if tail_file(log_update_cfg).strip():
+                            log("Хвост лога /UpdateCfg:")
+                            log(tail_file(log_update_cfg))
+                        log(f"Лог /UpdateCfg: {log_update_cfg}")
+
+                        if vals.get("update_db_cfg"):
+                            log_update_db = reports_dir / f"{safe_name(name)}_02_UpdateDBCfg_{rel_safe}_{now_stamp()}.log"
+                            extra_db = [
+                                "/DisableStartupDialogs",
+                                "/DisableStartupMessages",
+                                "/UpdateDBCfg",
+                            ]
+                            if vals.get("server_update") and kind == "server":
+                                extra_db.append("-Server")
+                            if vals.get("dynamic_update"):
+                                extra_db.append("-Dynamic+")
+                            extra_db.extend(["/Out", str(log_update_db), "-NoTruncate"])
+
+                            log("Шаг 2. Пакетное обновление конфигурации базы данных /UpdateDBCfg...")
+                            self.run_1c_update_batch(
+                                log,
+                                base,
+                                "DESIGNER",
+                                extra_db,
+                                timeout=vals.get("timeout_seconds", 7200),
+                                hidden_xvfb=vals.get("hidden_xvfb", False),
+                            )
+                            if tail_file(log_update_db).strip():
+                                log("Хвост лога /UpdateDBCfg:")
+                                log(tail_file(log_update_db))
+                            log(f"Лог /UpdateDBCfg: {log_update_db}")
+                        else:
+                            log("Шаг 2 пропущен: /UpdateDBCfg отключен в диалоге.")
+
+                        if vals.get("run_handlers"):
+                            self.run_update_handlers_for_base(log, base, rel, vals)
+                        else:
+                            log("Шаг 3 пропущен: обработчики обновления отключены в диалоге.")
+
+                        last_release = rel.replace("_", ".")
+                        self.update_base_version_after_release(idx, last_release, log)
+                        log(f"Релиз {rel} применен. Версия в карточке обновлена на {last_release}.")
+
+                    log(f"Автообновление базы {name} завершено. Последний примененный релиз: {last_release}")
+
+                except Exception as e:
+                    log(f"ОШИБКА автообновления базы {name}: {type(e).__name__}: {e}")
+                    if vals.get("restore_on_error"):
+                        try:
+                            log("Пробую выполнить откат из резервной копии...")
+                            self.restore_pre_update_backup(log, base, backup_file, vals)
+                        except Exception as rollback_error:
+                            log(f"ОШИБКА отката: {type(rollback_error).__name__}: {rollback_error}")
+                    if vals.get("stop_on_error"):
+                        raise
+
+        self.run_in_background("Автообновление", work)
 
     def on_download_platform(self, *_):
         dlg = PlatformDownloadDialog(self)
@@ -9998,6 +11161,195 @@ class MainWindow(Gtk.Window):
 def main():
     MainWindow()
     Gtk.main()
+
+
+
+# === Canonical 1C updates storage layout ===
+#
+# /mnt/DataStore/Updater1C/1c-updates/
+# └── 1c/
+#     └── AccountingBase/
+#         └── 3_0_199_13/
+#             ├── 1cv8.cfu
+#             ├── 1cv8.mft
+#             ├── ReadMe.txt
+#             └── ...
+#
+# Важно:
+# - vendor хранится отдельной первой папкой: 1c
+# - код конфигурации хранится латиницей: AccountingBase
+# - версия релиза хранится через "_": 3_0_199_13
+# - ZIP от 1С распаковывается прямо в папку релиза
+# - русские имена внутри ZIP восстанавливаются через CP866
+
+
+def update_storage_root_dir(settings: dict) -> Path:
+    return Path(settings.get("updates_dir") or "/mnt/DataStore/Updater1C/1c-updates")
+
+
+def update_vendor_folder(vendor: str = "1c") -> str:
+    value = str(vendor or "1c").strip()
+
+    low = value.lower().replace("с", "c")
+
+    if low in ("1c", "1с", "фирма 1c", 'фирма "1c"', 'фирма "1с"'):
+        return "1c"
+
+    return safe_name(value)
+
+
+def update_program_dir(settings: dict, program: str, vendor: str = "1c") -> Path:
+    root = update_storage_root_dir(settings)
+    return root / update_vendor_folder(vendor) / safe_name(program or "UnknownProgram")
+
+
+def update_release_folder(version: str) -> str:
+    value = str(version or "").strip().replace("\\", "/")
+
+    if "/" in value:
+        value = value.rstrip("/").split("/")[-1]
+
+    value = value.replace(".", "_").replace("-", "_").strip("_")
+
+    return safe_name(value or "unknown_release")
+
+
+def version_to_update_folder(version: str) -> str:
+    return update_release_folder(version)
+
+
+def update_release_dir(settings: dict, program: str, release: str, vendor: str = "1c") -> Path:
+    return update_program_dir(settings, program, vendor) / update_release_folder(release)
+
+
+def decode_1c_zip_member_name(info) -> str:
+    """В ZIP от 1С русские имена часто лежат в DOS/CP866 без UTF-8-флага."""
+    name = info.filename or ""
+
+    if getattr(info, "flag_bits", 0) & 0x800:
+        return name.replace("\\", "/")
+
+    try:
+        raw = name.encode("cp437")
+    except Exception:
+        return name.replace("\\", "/")
+
+    candidates = []
+
+    for enc in ("cp866", "cp1251", "utf-8"):
+        try:
+            candidates.append(raw.decode(enc))
+        except Exception:
+            pass
+
+    def score(value: str) -> int:
+        cyr = sum(1 for ch in value if "А" <= ch <= "я" or ch in "Ёё")
+        bad = sum(1 for ch in value if ch in "╨╩╬╧╠╡░▒▓")
+        return cyr * 10 - bad * 5
+
+    if candidates:
+        return max(candidates, key=score).replace("\\", "/")
+
+    return name.replace("\\", "/")
+
+
+def safe_join_zip_path(root: Path, member_name: str) -> Path:
+    import posixpath
+
+    root = Path(root).resolve()
+    member_name = str(member_name or "").replace("\\", "/")
+    member_name = posixpath.normpath(member_name)
+
+    if member_name in ("", "."):
+        raise RuntimeError("Пустое имя файла в ZIP")
+
+    if member_name.startswith("/") or member_name.startswith("../") or "/../" in member_name:
+        raise RuntimeError(f"Опасный путь в ZIP: {member_name}")
+
+    target = (root / member_name).resolve()
+
+    if target != root and not str(target).startswith(str(root) + "/"):
+        raise RuntimeError(f"Выход за пределы папки распаковки ZIP: {member_name}")
+
+    return target
+
+
+def unpack_1c_zip_preserve_encoding(zip_path: Path, target_dir: Path, log_func=None) -> None:
+    import shutil
+    import zipfile
+
+    zip_path = Path(zip_path)
+    target_dir = Path(target_dir)
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    if log_func:
+        log_func(f"Распаковка ZIP 1С в папку релиза: {zip_path}")
+        log_func(f"Папка релиза: {target_dir}")
+
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        for info in zf.infolist():
+            member_name = decode_1c_zip_member_name(info)
+            target = safe_join_zip_path(target_dir, member_name)
+
+            if info.is_dir() or member_name.endswith("/"):
+                target.mkdir(parents=True, exist_ok=True)
+                continue
+
+            target.parent.mkdir(parents=True, exist_ok=True)
+
+            with zf.open(info, "r") as src, target.open("wb") as dst:
+                shutil.copyfileobj(src, dst)
+
+    if log_func:
+        log_func("ZIP 1С распакован. Русские имена восстановлены.")
+
+
+def prepare_1c_downloaded_update_file(downloaded: Path, dest: Path, release: str, log_func=None) -> Path:
+    """Если dlXX.1c.ru вернул ZIP, распаковываем его прямо в папку релиза."""
+    import shutil
+    import zipfile
+
+    downloaded = Path(downloaded)
+    dest = Path(dest)
+    release_dir = dest.parent
+
+    if not zipfile.is_zipfile(downloaded):
+        return downloaded
+
+    if log_func:
+        log_func(f"Скачанный файл оказался ZIP-архивом: {downloaded}")
+
+    archive_dir = release_dir / "_archives"
+    archive_dir.mkdir(parents=True, exist_ok=True)
+
+    archive_path = archive_dir / f"downloaded_{update_release_folder(release)}.zip"
+
+    if archive_path.exists():
+        archive_path.unlink()
+
+    shutil.move(str(downloaded), str(archive_path))
+
+    unpack_1c_zip_preserve_encoding(archive_path, release_dir, log_func)
+
+    found = find_update_file_in_dir(release_dir)
+
+    if not found:
+        raise RuntimeError(f"После распаковки ZIP не найден файл .cfu/.cf: {archive_path}")
+
+    found = Path(found)
+
+    if found.resolve() != dest.resolve():
+        if dest.exists():
+            dest.unlink()
+        shutil.copy2(found, dest)
+        found = dest
+
+    validate_downloaded_update_file(found)
+
+    if log_func:
+        log_func(f"Файл обновления готов: {found}")
+
+    return found
 
 
 if __name__ == "__main__":
