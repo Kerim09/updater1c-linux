@@ -1872,6 +1872,8 @@ class TemplateSelectDialogGtk(Gtk.Dialog):
             ("1Cv8.cf", "cf", "Чистая конфигурация .cf"),
             ("1cv8.cf", "cf", "Чистая конфигурация .cf"),
             ("1Cv8.1CD", "file", "Готовая файловая база 1Cv8.1CD"),
+            ("1cv8.1CD", "file", "Готовая файловая база 1Cv8.1CD"),
+            ("1cv8.1cd", "file", "Готовая файловая база 1Cv8.1CD"),
         ]
 
         for fn, kind, title in rules:
@@ -1890,81 +1892,67 @@ class TemplateSelectDialogGtk(Gtk.Dialog):
         return variants
 
 
-    def refresh_templates(self, *_):
-        try:
-            items = list(self.scan_templates() or [])
-        except Exception:
-            items = []
+    def load_templates(self):
+        """Загружает локальные шаблоны 1С в плоскую ListStore-модель.
 
-        filter_text = ""
-        try:
-            filter_text = str(self.filter_combo.get_active_text() or "").strip().lower()
-        except Exception:
-            pass
-
-        show_all = not filter_text or "все шаблоны" in filter_text
-
+        В релизах 1.2.2-1.2.4 вызовы self.load_templates() остались,
+        а сам метод был потерян при незавершенной переделке группировки.
+        Плоская модель полностью совместима с accept_selected().
+        """
         self.store.clear()
 
-        groups = {}
-        grouped_items = {}
-
-        for item in items:
-            group_name = self._template_group_name(item)
-            release_name = self._template_release_name(item)
-            type_name = str(item.get("type") or "").strip()
-            version = str(item.get("version") or "").strip()
-            path = str(item.get("path") or "").strip()
-
-            hay = " ".join([
-                group_name,
-                release_name,
-                type_name,
-                version,
-                path,
-                str(item.get("template_name") or ""),
-                str(item.get("product_name") or ""),
-            ]).lower()
-
-            if not show_all and filter_text not in hay:
-                continue
-
-            grouped_items.setdefault(group_name, []).append({
-                "release_name": release_name,
-                "type": type_name,
-                "version": version,
-                "path": path,
-                "item": item,
-            })
-
-        for group_name in sorted(grouped_items.keys(), key=lambda x: x.lower()):
-            parent = self.store.append(
-                None,
-                [group_name, "", "", "", "", True, None]
-            )
-            groups[group_name] = parent
-
-            children = grouped_items[group_name]
-            children.sort(
-                key=lambda x: self._template_version_sort_key(x.get("version")),
-                reverse=True
-            )
-
-            for row in children:
-                self.store.append(parent, [
-                    row["release_name"],
-                    "",
-                    row["type"],
-                    row["version"],
-                    row["path"],
-                    False,
-                    row["item"],
-                ])
-
+        wanted = "all"
         try:
-            self.tree.expand_all()
+            wanted = self.template_filter.get_active_id() or "all"
         except Exception:
             pass
+
+        folders = set()
+        masks = [
+            "1cv8.mft",
+            "1Cv8new.dt", "1cv8new.dt",
+            "1Cv8.dt", "1cv8.dt",
+            "1Cv8.cf", "1cv8.cf",
+            "1Cv8.1CD", "1cv8.1CD", "1cv8.1cd",
+        ]
+
+        for root in self.template_roots():
+            try:
+                for mask in masks:
+                    for marker in root.rglob(mask):
+                        folders.add(marker.parent)
+            except Exception:
+                pass
+
+        for folder in sorted(folders, key=lambda x: str(x).lower()):
+            try:
+                variants = self.template_variants(folder)
+            except Exception:
+                variants = []
+
+            for v in variants:
+                kind = str(v.get("kind") or "")
+                if wanted != "all" and kind != wanted:
+                    continue
+
+                try:
+                    product, conf = self.product_group_name(folder, v.get("name") or "")
+                except Exception:
+                    product, conf = "Шаблоны 1С", v.get("name") or folder.name
+
+                self.store.append([
+                    str(conf or ""),
+                    str(v.get("title") or ""),
+                    str(v.get("version") or ""),
+                    str(v.get("folder") or folder),
+                    str(v.get("payload") or ""),
+                    kind,
+                    str(product or ""),
+                ])
+
+    def refresh_templates(self, *_):
+        """Совместимость со старыми обработчиками кнопок/патчами."""
+        return self.load_templates()
 
     def choose_root(self, *_):
         from pathlib import Path
@@ -11350,6 +11338,37 @@ def prepare_1c_downloaded_update_file(downloaded: Path, dest: Path, release: str
         log_func(f"Файл обновления готов: {found}")
 
     return found
+
+
+
+# === Compatibility binding: MainWindow.idle_set_current_operation ===
+# GLib.idle_add не принимает keyword-аргументы, поэтому текущую операцию
+# обновляем через dict, переданный позиционным аргументом.
+def _updater1c_idle_set_current_operation(self, data):
+    try:
+        data = data or {}
+
+        self.set_current_operation(
+            base=data.get("base", "-"),
+            release=data.get("release", "-"),
+            step=data.get("step", "-"),
+            action=data.get("action", "-"),
+            mode=data.get("mode", "-"),
+            status=data.get("status", "-"),
+            pid=data.get("pid", "-"),
+            started=data.get("started", "-"),
+        )
+
+    except Exception:
+        pass
+
+    return False
+
+
+try:
+    MainWindow.idle_set_current_operation = _updater1c_idle_set_current_operation
+except NameError:
+    pass
 
 
 if __name__ == "__main__":
