@@ -25,7 +25,7 @@ from gi.repository import Gtk, Gdk, GLib
 
 
 APP_NAME = "Обновлятор 1C Linux"
-APP_VERSION = "1.2.4"
+APP_VERSION = "1.2.5"
 CONFIG_DIR = Path.home() / ".config" / "updater1c-linux"
 
 DEFAULT_1CESTART = "/opt/1cv8/common/1cestart"
@@ -1895,9 +1895,9 @@ class TemplateSelectDialogGtk(Gtk.Dialog):
     def load_templates(self):
         """Загружает локальные шаблоны 1С в плоскую ListStore-модель.
 
-        В релизах 1.2.2-1.2.4 вызовы self.load_templates() остались,
-        а сам метод был потерян при незавершенной переделке группировки.
-        Плоская модель полностью совместима с accept_selected().
+        В 1.2.2-1.2.4 вызовы self.load_templates() остались,
+        а сам метод мог пропасть после незавершенной группировки шаблонов.
+        Плоская модель совместима с текущим accept_selected().
         """
         self.store.clear()
 
