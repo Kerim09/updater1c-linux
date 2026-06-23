@@ -1,6 +1,6 @@
-# Обновлятор 1C Linux 1.2.5
+# Обновлятор 1C Linux 1.2.6
 
-## Перезаливка релиза 1.2.5
+## Перезаливка релиза 1.2.6
 
 - Установщик пересобран как slim/self-extracting `.run`: внутри только файлы приложения, без `dist/`, `build/`, `releases/`, `.git`, старых backup-файлов и release-артефактов.
 - Добавлен штатный uninstaller: `/opt/updater1c-linux/uninstall-updater1c-linux.sh`.
@@ -12,8 +12,8 @@
 ## Установка
 
 ```bash
-chmod +x updater1c-linux_1.2.5_installer.run
-./updater1c-linux_1.2.5_installer.run
+chmod +x updater1c-linux_1.2.6_installer.run
+./updater1c-linux_1.2.6_installer.run
 ```
 
 ## Удаление
