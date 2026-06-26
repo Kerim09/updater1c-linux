@@ -63,7 +63,7 @@ datetime = _U1CDateTimeCompat()
 
 
 APP_NAME = "Обновлятор 1C Linux"
-APP_VERSION = "1.2.6"
+APP_VERSION = "1.2.7"
 CONFIG_DIR = Path.home() / ".config" / "updater1c-linux"
 
 DEFAULT_1CESTART = "/opt/1cv8/common/1cestart"
@@ -5557,29 +5557,12 @@ class MainWindow(Gtk.Window):
         return base
 
     def run_base_mode(self, mode: str):
-        base = self.require_current_base_dict()
-        if not base:
-            return
-
-        try:
-            args = build_1c_args(base, self.settings, mode)
-            reports_dir = self.settings.get("reports_dir") or "/mnt/DataStore/Updater1C/1c-update-reports"
-            pid, log_file = start_process_and_log(
-                args,
-                reports_dir=reports_dir,
-                base_name=base.get("name") or "base",
-                suffix=mode.lower(),
-            )
-
-            self._append_log("Запуск: " + command_to_text(args))
-            self._append_log(f"PID={pid}")
-            self._append_log(f"Лог запуска: {log_file}")
-
-        except Exception as e:
-            self._append_log(f"ОШИБКА запуска {mode}: {type(e).__name__}: {e}")
-
-
-
+        # UPDATER1C_DESIGNER_LAUNCH_FIX_20260626
+        # Пункт "Конфигуратор" обязан передавать DESIGNER дальше без потери режима.
+        mode = (mode or "ENTERPRISE").upper()
+        if mode not in ("ENTERPRISE", "DESIGNER"):
+            mode = "ENTERPRISE"
+        return self.launch_selected_base(mode)
 
     def guess_update_program_name_from_metadata(self, config_name="", config_synonym="", base_name=""):
         """Определяет код программы обновлений 1С по имени/синониму конфигурации."""
@@ -5911,14 +5894,10 @@ class MainWindow(Gtk.Window):
         self.run_in_background("Проверка настроек", work)
 
     def on_run_base_real(self, *_):
-        self.run_base_mode("ENTERPRISE")
+        self.launch_selected_base("ENTERPRISE")
 
     def on_designer_base_real(self, *_):
-        self.run_base_mode("DESIGNER")
-
-
-
-
+        self.launch_selected_base("DESIGNER")
 
     def on_base_row_activated(self, tree, path, column):
         """Двойной клик / Enter по строке базы.
@@ -9822,6 +9801,8 @@ class MainWindow(Gtk.Window):
                 pass
 
     def build_1c_launch_args(self, mode="ENTERPRISE"):
+        # UPDATER1C_DESIGNER_LAUNCH_FIX_20260626
+        mode = (mode or "ENTERPRISE").upper()
         import shlex
 
         vals = self.selected_base_values()
@@ -9944,6 +9925,19 @@ class MainWindow(Gtk.Window):
 
         name = vals.get("name") or "-"
         args = self.build_1c_launch_args(mode)
+
+        # UPDATER1C_DESIGNER_LAUNCH_FIX_20260626
+        # Защита от старых веток кода: при запуске конфигуратора не допускаем ENTERPRISE.
+        launch_mode = (mode or "ENTERPRISE").upper()
+        if launch_mode == "DESIGNER" and args:
+            if len(args) == 1:
+                args.append("DESIGNER")
+            else:
+                first_mode = str(args[1]).upper()
+                if first_mode in ("ENTERPRISE", "DESIGNER"):
+                    args[1] = "DESIGNER"
+                else:
+                    args.insert(1, "DESIGNER")
 
         safe_args = []
         user_filled = False
