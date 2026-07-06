@@ -13307,13 +13307,11 @@ except Exception:
 # UPDATER1C_REPORT_TAB_LAYOUT_V2_PATCH_END
 
 # UPDATER1C_BASES_FOOTER_GUARD_PATCH_BEGIN
-# Исправление компоновки вкладки "Базы":
-# - не прокручивать всю форму;
-# - нижний подвал с кнопками держать выше нижней панели COSMIC;
-# - скроллинг только в центральном списке баз;
-# - при растягивании/разворачивании растёт именно таблица баз.
+# Компактная компоновка вкладки "Базы":
+# - растягивается только таблица;
+# - нижние кнопки всегда видны;
+# - без искусственной пустой зоны снизу.
 try:
-    import os as _u1c_fg_os
     import gi as _u1c_fg_gi
 
     try:
@@ -13324,7 +13322,7 @@ try:
     from gi.repository import Gtk as _u1c_fg_Gtk
     from gi.repository import GLib as _u1c_fg_GLib
 
-    _U1C_FOOTER_GUARD_HEIGHT = 76
+    _U1C_FOOTER_MARGIN = 8
 
     def _u1c_fg_children(widget):
         children = []
@@ -13367,10 +13365,9 @@ try:
             ident = id(widget)
             if ident in seen:
                 continue
-
             seen.add(ident)
-            result.append(widget)
 
+            result.append(widget)
             for child in _u1c_fg_children(widget):
                 stack.append(child)
 
@@ -13447,7 +13444,6 @@ try:
                     titles.append(str(col.get_title() or "").lower())
                 except Exception:
                     pass
-
             joined = " ".join(titles)
             return (
                 "база" in joined
@@ -13511,12 +13507,11 @@ try:
             except Exception:
                 continue
 
-            text = _u1c_fg_norm(_u1c_fg_text(widget))
-
+            txt = _u1c_fg_norm(_u1c_fg_text(widget))
             if (
-                "отметить все" in text
-                or "снять все" in text
-                or "синхронизировать со списком баз" in text
+                "отметить все" in txt
+                or "снять все" in txt
+                or "синхронизировать со списком баз" in txt
             ):
                 try:
                     parent = widget.get_parent()
@@ -13528,60 +13523,31 @@ try:
 
         return rows
 
-    def _u1c_fg_add_or_update_footer_guard(page, footer_rows):
-        # Основной вариант: нижний margin у строки подвала.
-        # Это не прокручивает всю форму, а просто оставляет место под нижнюю панель.
+    def _u1c_fg_remove_old_spacer(page):
+        # Удаляем старый spacer, который создавал слишком большую пустую зону.
+        for widget in list(_u1c_fg_children(page)):
+            try:
+                if str(widget.get_name() or "") == "u1c_bases_bottom_panel_guard":
+                    page.remove(widget)
+            except Exception:
+                pass
+
+    def _u1c_fg_tune_footer(page):
+        footer_rows = _u1c_fg_find_footer_rows(page)
+
         for row in footer_rows:
             try:
                 row.set_vexpand(False)
-                row.set_margin_bottom(_U1C_FOOTER_GUARD_HEIGHT)
+                row.set_hexpand(True)
+                row.set_valign(_u1c_fg_Gtk.Align.END)
+                row.set_margin_top(6)
+                row.set_margin_bottom(_U1C_FOOTER_MARGIN)
             except Exception:
                 pass
 
-        # Дополнительно ставим spacer в самый низ вкладки, если вкладка — Box.
-        # Spacer нужен, когда margin строки игнорируется темой/контейнером.
-        try:
-            if not isinstance(page, _u1c_fg_Gtk.Box):
-                return
-        except Exception:
-            return
+        return footer_rows
 
-        existing = None
-        try:
-            for child in page.get_children():
-                try:
-                    if str(child.get_name() or "") == "u1c_bases_bottom_panel_guard":
-                        existing = child
-                        break
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-        if existing is None:
-            spacer = _u1c_fg_Gtk.Box(
-                orientation=_u1c_fg_Gtk.Orientation.VERTICAL,
-                spacing=0,
-            )
-            spacer.set_name("u1c_bases_bottom_panel_guard")
-            spacer.set_size_request(-1, _U1C_FOOTER_GUARD_HEIGHT)
-            spacer.set_vexpand(False)
-            spacer.set_hexpand(True)
-
-            try:
-                page.pack_end(spacer, False, False, 0)
-                spacer.show_all()
-            except Exception:
-                pass
-        else:
-            try:
-                existing.set_size_request(-1, _U1C_FOOTER_GUARD_HEIGHT)
-                existing.set_vexpand(False)
-                existing.show_all()
-            except Exception:
-                pass
-
-    def _u1c_fg_configure_base_scroller(win, page):
+    def _u1c_fg_tune_scroller(win, page):
         tree = _u1c_fg_find_base_tree(win)
         if tree is None:
             return False
@@ -13591,13 +13557,37 @@ try:
             return False
 
         try:
-            scroller.set_policy(_u1c_fg_Gtk.PolicyType.AUTOMATIC, _u1c_fg_Gtk.PolicyType.AUTOMATIC)
+            scroller.set_policy(
+                _u1c_fg_Gtk.PolicyType.AUTOMATIC,
+                _u1c_fg_Gtk.PolicyType.AUTOMATIC
+            )
+        except Exception:
+            pass
+
+        try:
             scroller.set_overlay_scrolling(False)
+        except Exception:
+            pass
+
+        try:
             scroller.set_propagate_natural_height(False)
-            scroller.set_min_content_height(180)
-            scroller.set_size_request(-1, 180)
+        except Exception:
+            pass
+
+        try:
+            scroller.set_min_content_height(220)
+        except Exception:
+            pass
+
+        try:
+            scroller.set_size_request(-1, 220)
+        except Exception:
+            pass
+
+        try:
             scroller.set_vexpand(True)
             scroller.set_hexpand(True)
+            scroller.set_valign(_u1c_fg_Gtk.Align.FILL)
         except Exception:
             pass
 
@@ -13607,12 +13597,12 @@ try:
         except Exception:
             pass
 
-        # Родители до страницы вкладки должны разрешать таблице забирать свободную высоту.
         for parent in _u1c_fg_parent_chain(scroller):
             if parent is page:
                 break
             try:
                 parent.set_vexpand(True)
+                parent.set_hexpand(True)
             except Exception:
                 pass
 
@@ -13633,13 +13623,17 @@ try:
             return False
 
         try:
-            _u1c_fg_configure_base_scroller(win, page)
+            _u1c_fg_remove_old_spacer(page)
         except Exception:
             pass
 
         try:
-            footer_rows = _u1c_fg_find_footer_rows(page)
-            _u1c_fg_add_or_update_footer_guard(page, footer_rows)
+            _u1c_fg_tune_scroller(win, page)
+        except Exception:
+            pass
+
+        try:
+            _u1c_fg_tune_footer(page)
         except Exception:
             pass
 
@@ -13665,9 +13659,8 @@ try:
                 _u1c_fg_apply(self)
                 _u1c_fg_GLib.idle_add(_u1c_fg_apply, self)
                 _u1c_fg_GLib.timeout_add(200, _u1c_fg_apply, self)
-                _u1c_fg_GLib.timeout_add(600, _u1c_fg_apply, self)
-                _u1c_fg_GLib.timeout_add(1200, _u1c_fg_apply, self)
-                _u1c_fg_GLib.timeout_add(2500, _u1c_fg_apply, self)
+                _u1c_fg_GLib.timeout_add(700, _u1c_fg_apply, self)
+                _u1c_fg_GLib.timeout_add(1500, _u1c_fg_apply, self)
             except Exception:
                 pass
 
