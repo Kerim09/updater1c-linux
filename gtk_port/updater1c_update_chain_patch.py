@@ -30,6 +30,210 @@ def install(ns):
 
     ns["UPDATER1C_UPDATE_SINGLE_STEP_MODE"] = True
 
+    # UPDATER1C_UPDATE_CHAIN_STATUS_BRIDGE_BEGIN
+    # Мост статуса для правой панели "Текущая операция".
+    # Новый последовательный алгоритм обновления пишет лог сам, поэтому штатная панель
+    # не всегда видит текущую базу/релиз/шаг. Этот мост обновляет её напрямую через Gtk.
+    def _u1c_status_text(widget):
+        parts = []
+
+        for meth in ("get_text", "get_label", "get_title"):
+            try:
+                value = getattr(widget, meth)()
+                if value:
+                    parts.append(str(value))
+            except Exception:
+                pass
+
+        try:
+            for child in widget.get_children():
+                txt = _u1c_status_text(child)
+                if txt:
+                    parts.append(txt)
+        except Exception:
+            pass
+
+        try:
+            child = widget.get_child()
+            if child is not None:
+                txt = _u1c_status_text(child)
+                if txt:
+                    parts.append(txt)
+        except Exception:
+            pass
+
+        return " ".join(parts)
+
+    def _u1c_status_children(widget):
+        children = []
+
+        try:
+            children.extend(widget.get_children())
+        except Exception:
+            pass
+
+        try:
+            child = widget.get_child()
+            if child is not None and child not in children:
+                children.append(child)
+        except Exception:
+            pass
+
+        try:
+            tmp = []
+            widget.foreach(lambda child, data: data.append(child), tmp)
+            for child in tmp:
+                if child not in children:
+                    children.append(child)
+        except Exception:
+            pass
+
+        return children
+
+    def _u1c_status_collect(root):
+        result = []
+        stack = [root]
+        seen = set()
+
+        while stack:
+            widget = stack.pop()
+            if widget is None:
+                continue
+
+            ident = id(widget)
+            if ident in seen:
+                continue
+
+            seen.add(ident)
+            result.append(widget)
+
+            for child in _u1c_status_children(widget):
+                stack.append(child)
+
+        return result
+
+    def _u1c_status_set_label_near(caption, value):
+        if Gtk is None:
+            return False
+
+        caption_low = str(caption or "").strip().lower()
+        value = str(value if value is not None else "-")
+
+        try:
+            windows = Gtk.Window.list_toplevels()
+        except Exception:
+            windows = []
+
+        changed = False
+
+        for win in windows:
+            try:
+                widgets = _u1c_status_collect(win)
+            except Exception:
+                widgets = []
+
+            for i, widget in enumerate(widgets):
+                try:
+                    if not isinstance(widget, Gtk.Label):
+                        continue
+                except Exception:
+                    continue
+
+                try:
+                    label_text = str(widget.get_text() or widget.get_label() or "").strip().lower()
+                except Exception:
+                    continue
+
+                if label_text != caption_low:
+                    continue
+
+                # В Gtk.Grid значение обычно стоит рядом справа, но из-за обхода дерева
+                # порядок может быть неидеальным. Проверяем ближайшие Label после подписи.
+                for near in widgets[max(0, i - 8): i + 16]:
+                    if near is widget:
+                        continue
+
+                    try:
+                        if not isinstance(near, Gtk.Label):
+                            continue
+                    except Exception:
+                        continue
+
+                    try:
+                        near_text = str(near.get_text() or near.get_label() or "").strip()
+                    except Exception:
+                        near_text = ""
+
+                    near_low = near_text.lower()
+
+                    if near_low in (
+                        "",
+                        "-",
+                    ) or near_low not in (
+                        "база:",
+                        "релиз:",
+                        "шаг:",
+                        "действие:",
+                        "режим:",
+                        "статус:",
+                        "pid процесса:",
+                        "время запуска:",
+                        "текущая операция",
+                    ):
+                        try:
+                            near.set_text(value)
+                            changed = True
+                            break
+                        except Exception:
+                            pass
+
+        return changed
+
+    def _u1c_status_idle_update(base="-", release="-", step="-", action="-", mode="-", status="-", pid="-"):
+        if Gtk is None:
+            return False
+
+        try:
+            _u1c_status_set_label_near("База:", base)
+            _u1c_status_set_label_near("Релиз:", release)
+            _u1c_status_set_label_near("Шаг:", step)
+            _u1c_status_set_label_near("Действие:", action)
+            _u1c_status_set_label_near("Режим:", mode)
+            _u1c_status_set_label_near("Статус:", status)
+            if pid not in (None, ""):
+                _u1c_status_set_label_near("PID процесса:", pid)
+        except Exception:
+            pass
+
+        return False
+
+    def _u1c_status_update(base="-", release="-", step="-", action="-", mode="-", status="-", pid="-"):
+        try:
+            GLib = ns.get("GLib")
+        except Exception:
+            GLib = None
+
+        if GLib is not None:
+            try:
+                GLib.idle_add(
+                    _u1c_status_idle_update,
+                    str(base or "-"),
+                    str(release or "-"),
+                    str(step or "-"),
+                    str(action or "-"),
+                    str(mode or "-"),
+                    str(status or "-"),
+                    str(pid or "-"),
+                )
+                return
+            except Exception:
+                pass
+
+        _u1c_status_idle_update(base, release, step, action, mode, status, pid)
+
+    ns["UPDATER1C_UPDATE_CHAIN_STATUS_UPDATE"] = _u1c_status_update
+    # UPDATER1C_UPDATE_CHAIN_STATUS_BRIDGE_END
+
     def _norm_version(value):
         return str(value or "").strip().replace("_", ".")
 
@@ -304,7 +508,9 @@ def install(ns):
 
         if log_func:
             try:
-                log_func(f"Режим установки: {'только один релиз' if single_step else 'последовательная цепочка до последнего доступного релиза'}")
+                mode_text = 'только один релиз' if single_step else 'цепочка до последнего релиза'
+                log_func(f"Режим установки: {mode_text}")
+                _u1c_status_update(base=getattr(base, "name", "") or getattr(base, "title", "") or "-", release=current_version or "-", step="-", action="Подбор обновлений", mode=mode_text, status="Выполняется")
                 log_func(f"Текущий релиз базы: {current_version or '-'}")
                 log_func("Доступные локальные релизы: " + ", ".join(_step_release(s) for s in all_steps))
             except Exception:
@@ -315,15 +521,20 @@ def install(ns):
         if not first:
             if log_func:
                 log_func("Не найден следующий допустимый релиз по UpdInfo.txt / FromVersions.")
+                _u1c_status_update(base=getattr(base, "name", "") or getattr(base, "title", "") or "-", release=current_version or "-", step="-", action="Подбор обновлений", mode=mode_text if "mode_text" in locals() else "-", status="Не найден следующий релиз")
             return []
 
         if single_step:
             if log_func:
                 meta = _find_updinfo_for_step(first)
                 if meta.get("from_versions"):
-                    log_func(f"Выбран один шаг: {current_version or '-'} -> {_step_release(first)}; FromVersions={';'.join(meta.get('from_versions'))}")
+                    next_rel = _step_release(first)
+                    log_func(f"Выбран один шаг: {current_version or '-'} -> {next_rel}; FromVersions={';'.join(meta.get('from_versions'))}")
+                    _u1c_status_update(base=getattr(base, "name", "") or getattr(base, "title", "") or "-", release=next_rel, step=f"1 / 1", action="Выбран шаг обновления", mode=mode_text if "mode_text" in locals() else "только один релиз", status="Готово к установке")
                 else:
-                    log_func(f"Выбран один шаг: {current_version or '-'} -> {_step_release(first)}; UpdInfo.txt не найден, выбран ближайший релиз.")
+                    next_rel = _step_release(first)
+                    log_func(f"Выбран один шаг: {current_version or '-'} -> {next_rel}; UpdInfo.txt не найден, выбран ближайший релиз.")
+                    _u1c_status_update(base=getattr(base, "name", "") or getattr(base, "title", "") or "-", release=next_rel, step=f"1 / 1", action="Выбран шаг обновления", mode=mode_text if "mode_text" in locals() else "только один релиз", status="Готово к установке")
             return [first]
 
         chain = []
@@ -347,8 +558,10 @@ def install(ns):
                 meta = _find_updinfo_for_step(step)
                 if meta.get("from_versions"):
                     log_func(f"Шаг цепочки: {cur or '-'} -> {rel}; FromVersions={';'.join(meta.get('from_versions'))}")
+                    _u1c_status_update(base=getattr(base, "name", "") or getattr(base, "title", "") or "-", release=rel, step=f"{len(chain) + 1}", action=f"Шаг цепочки {cur or '-'} → {rel}", mode=mode_text if "mode_text" in locals() else "цепочка", status="Подбор цепочки")
                 else:
                     log_func(f"Шаг цепочки: {cur or '-'} -> {rel}; UpdInfo.txt не найден, fallback по версии.")
+                    _u1c_status_update(base=getattr(base, "name", "") or getattr(base, "title", "") or "-", release=rel, step=f"{len(chain) + 1}", action=f"Шаг цепочки {cur or '-'} → {rel}", mode=mode_text if "mode_text" in locals() else "цепочка", status="Подбор цепочки")
 
             cur = rel
 
