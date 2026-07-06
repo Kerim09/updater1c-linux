@@ -13298,8 +13298,10 @@ except Exception:
     pass
 # UPDATER1C_REPORT_TAB_LAYOUT_V2_PATCH_END
 
-# UPDATER1C_MAIN_WINDOW_HEIGHT_MINUS_10_PATCH_BEGIN
-# Уменьшаем стартовую высоту главного окна на 10 px, чтобы окно не заходило за нижнюю панель.
+# UPDATER1C_MAIN_WINDOW_HEIGHT_MINUS_10_V2_PATCH_BEGIN
+# Уменьшаем стартовую высоту главного окна на 10 px.
+# V2: учитывает "Linux/linux", перехватывает set_default_size/resize и дополнительно
+# подрезает уже созданное главное окно.
 try:
     import gi as _u1c_win_gi
     try:
@@ -13310,34 +13312,83 @@ try:
     from gi.repository import Gtk as _u1c_win_Gtk
     from gi.repository import GLib as _u1c_win_GLib
 
-    _U1C_MAIN_WINDOW_HEIGHT_MINUS_10_DONE = False
+    _U1C_MAIN_WINDOW_HEIGHT_MINUS_10_APPLIED_IDS = set()
+    _U1C_MAIN_WINDOW_PATCHED_METHODS = False
 
-    def _u1c_resize_main_window_minus_10():
-        global _U1C_MAIN_WINDOW_HEIGHT_MINUS_10_DONE
+    def _u1c_is_main_updater_window(win):
+        try:
+            title = str(win.get_title() or "").lower()
+        except Exception:
+            title = ""
 
-        if _U1C_MAIN_WINDOW_HEIGHT_MINUS_10_DONE:
-            return False
+        return ("обновлятор" in title and "1c" in title) or ("updater1c" in title)
 
+    def _u1c_minus10_height(width, height):
+        try:
+            width = int(width)
+            height = int(height)
+        except Exception:
+            return width, height
+
+        # Главные окна у нас крупные. Диалоги обычно меньше, их не трогаем.
+        if width >= 900 and height >= 550:
+            return width, max(300, height - 10)
+
+        return width, height
+
+    def _u1c_patch_window_size_methods():
+        global _U1C_MAIN_WINDOW_PATCHED_METHODS
+
+        if _U1C_MAIN_WINDOW_PATCHED_METHODS:
+            return
+
+        _U1C_MAIN_WINDOW_PATCHED_METHODS = True
+
+        try:
+            _orig_set_default_size = _u1c_win_Gtk.Window.set_default_size
+
+            def _patched_set_default_size(self, width, height):
+                try:
+                    width2, height2 = _u1c_minus10_height(width, height)
+                    return _orig_set_default_size(self, width2, height2)
+                except Exception:
+                    return _orig_set_default_size(self, width, height)
+
+            _u1c_win_Gtk.Window.set_default_size = _patched_set_default_size
+        except Exception:
+            pass
+
+        try:
+            _orig_resize = _u1c_win_Gtk.Window.resize
+
+            def _patched_resize(self, width, height):
+                try:
+                    if _u1c_is_main_updater_window(self):
+                        width2, height2 = _u1c_minus10_height(width, height)
+                        return _orig_resize(self, width2, height2)
+                except Exception:
+                    pass
+
+                return _orig_resize(self, width, height)
+
+            _u1c_win_Gtk.Window.resize = _patched_resize
+        except Exception:
+            pass
+
+    def _u1c_resize_existing_main_window_minus10():
         try:
             windows = _u1c_win_Gtk.Window.list_toplevels()
         except Exception:
             windows = []
 
         for win in windows:
-            try:
-                title = str(win.get_title() or "")
-            except Exception:
-                title = ""
-
-            # Только главное окно, не диалоги.
-            if "Обновлятор 1C Linux" not in title:
+            if not _u1c_is_main_updater_window(win):
                 continue
 
-            try:
-                if not win.get_visible():
-                    continue
-            except Exception:
-                pass
+            ident = id(win)
+
+            if ident in _U1C_MAIN_WINDOW_HEIGHT_MINUS_10_APPLIED_IDS:
+                continue
 
             try:
                 width, height = win.get_size()
@@ -13350,34 +13401,56 @@ try:
                 except Exception:
                     width, height = 0, 0
 
-            if width > 0 and height > 100:
-                new_height = max(100, height - 10)
+            if width <= 0 or height <= 0:
+                continue
 
-                try:
-                    win.set_default_size(width, new_height)
-                except Exception:
-                    pass
+            width2, height2 = _u1c_minus10_height(width, height)
 
-                try:
-                    win.resize(width, new_height)
-                except Exception:
-                    pass
+            if height2 == height:
+                continue
 
-                _U1C_MAIN_WINDOW_HEIGHT_MINUS_10_DONE = True
-                return False
+            try:
+                win.set_default_size(width2, height2)
+            except Exception:
+                pass
 
-        return True
+            try:
+                win.resize(width2, height2)
+            except Exception:
+                pass
+
+            try:
+                win.queue_resize()
+            except Exception:
+                pass
+
+            _U1C_MAIN_WINDOW_HEIGHT_MINUS_10_APPLIED_IDS.add(ident)
+
+        return False
+
+    def _u1c_start_main_window_height_patch():
+        _u1c_patch_window_size_methods()
+
+        try:
+            _u1c_resize_existing_main_window_minus10()
+            _u1c_win_GLib.timeout_add(300, _u1c_resize_existing_main_window_minus10)
+            _u1c_win_GLib.timeout_add(800, _u1c_resize_existing_main_window_minus10)
+            _u1c_win_GLib.timeout_add(1500, _u1c_resize_existing_main_window_minus10)
+            _u1c_win_GLib.timeout_add(2500, _u1c_resize_existing_main_window_minus10)
+        except Exception:
+            pass
+
+        return False
 
     try:
-        _u1c_win_GLib.idle_add(_u1c_resize_main_window_minus_10)
-        _u1c_win_GLib.timeout_add(300, _u1c_resize_main_window_minus_10)
-        _u1c_win_GLib.timeout_add(900, _u1c_resize_main_window_minus_10)
+        _u1c_win_GLib.idle_add(_u1c_start_main_window_height_patch)
+        _u1c_win_GLib.timeout_add(100, _u1c_start_main_window_height_patch)
     except Exception:
         pass
 
 except Exception:
     pass
-# UPDATER1C_MAIN_WINDOW_HEIGHT_MINUS_10_PATCH_END
+# UPDATER1C_MAIN_WINDOW_HEIGHT_MINUS_10_V2_PATCH_END
 
 if __name__ == "__main__":
     main()
