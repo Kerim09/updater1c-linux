@@ -4905,6 +4905,13 @@ class MainWindow(Gtk.Window):
         except Exception:
             pass
         self.set_default_size(1320, 720)
+
+        # UPDATER1C_MAIN_WINDOW_CENTER_PATCH_BEGIN
+        try:
+            self.set_position(Gtk.WindowPosition.CENTER)
+        except Exception:
+            pass
+        # UPDATER1C_MAIN_WINDOW_CENTER_PATCH_END
         self.set_position(Gtk.WindowPosition.CENTER)
 
         self.config_path = find_config_file()
@@ -13299,40 +13306,28 @@ except Exception:
     pass
 # UPDATER1C_REPORT_TAB_LAYOUT_V2_PATCH_END
 
-# UPDATER1C_BASE_TAB_PROPORTIONAL_LAYOUT_PATCH_BEGIN
-# Нормальная компоновка главной формы:
-# - НЕ прокручиваем всю форму целиком;
-# - верхние панели и нижний подвал всегда видимы;
-# - скроллинг только у центрального списка баз;
-# - при ручном растягивании/разворачивании растёт именно список баз.
+# UPDATER1C_BASES_FOOTER_GUARD_PATCH_BEGIN
+# Исправление компоновки вкладки "Базы":
+# - не прокручивать всю форму;
+# - нижний подвал с кнопками держать выше нижней панели COSMIC;
+# - скроллинг только в центральном списке баз;
+# - при растягивании/разворачивании растёт именно таблица баз.
 try:
-    import os as _u1c_layout_os
-    import gi as _u1c_layout_gi
+    import os as _u1c_fg_os
+    import gi as _u1c_fg_gi
 
     try:
-        _u1c_layout_gi.require_version("Gtk", "3.0")
+        _u1c_fg_gi.require_version("Gtk", "3.0")
     except Exception:
         pass
 
-    from gi.repository import Gtk as _u1c_layout_Gtk
-    from gi.repository import Gdk as _u1c_layout_Gdk
-    from gi.repository import GLib as _u1c_layout_GLib
+    from gi.repository import Gtk as _u1c_fg_Gtk
+    from gi.repository import GLib as _u1c_fg_GLib
 
-    _U1C_LAYOUT_DESIRED_W = 1320
-    _U1C_LAYOUT_DESIRED_H = 720
-    _U1C_LAYOUT_MARGIN = 8
+    _U1C_FOOTER_GUARD_HEIGHT = 76
 
-    def _u1c_layout_is_main_window(win):
-        try:
-            title = str(win.get_title() or "").lower()
-        except Exception:
-            title = ""
-
-        return ("обновлятор" in title and "1c" in title) or ("updater1c" in title)
-
-    def _u1c_layout_children(widget):
+    def _u1c_fg_children(widget):
         children = []
-
         if widget is None:
             return children
 
@@ -13359,7 +13354,7 @@ try:
 
         return children
 
-    def _u1c_layout_collect(root):
+    def _u1c_fg_collect(root):
         result = []
         stack = [root]
         seen = set()
@@ -13376,12 +13371,12 @@ try:
             seen.add(ident)
             result.append(widget)
 
-            for child in _u1c_layout_children(widget):
+            for child in _u1c_fg_children(widget):
                 stack.append(child)
 
         return result
 
-    def _u1c_layout_widget_text(widget, depth=0):
+    def _u1c_fg_text(widget, depth=0):
         if widget is None or depth > 4:
             return ""
 
@@ -13395,90 +13390,34 @@ try:
             except Exception:
                 pass
 
-        for child in _u1c_layout_children(widget):
-            txt = _u1c_layout_widget_text(child, depth + 1)
+        for child in _u1c_fg_children(widget):
+            txt = _u1c_fg_text(child, depth + 1)
             if txt:
                 parts.append(txt)
 
         return " ".join(parts)
 
-    def _u1c_layout_get_workarea(win):
-        display = _u1c_layout_Gdk.Display.get_default()
-        if display is None:
-            return None
+    def _u1c_fg_norm(text):
+        return str(text or "").lower().replace("ё", "е")
 
-        monitor = None
-
+    def _u1c_fg_is_main_window(win):
         try:
-            gdk_window = win.get_window()
-            if gdk_window is not None:
-                monitor = display.get_monitor_at_window(gdk_window)
+            title = str(win.get_title() or "").lower()
         except Exception:
-            monitor = None
+            title = ""
+        return ("обновлятор" in title and "1c" in title) or ("updater1c" in title)
 
-        if monitor is None:
+    def _u1c_fg_find_notebook(win):
+        for widget in _u1c_fg_collect(win):
             try:
-                monitor = display.get_primary_monitor()
+                if isinstance(widget, _u1c_fg_Gtk.Notebook):
+                    return widget
             except Exception:
-                monitor = None
-
-        if monitor is None:
-            return None
-
-        try:
-            geometry = monitor.get_geometry()
-        except Exception:
-            geometry = None
-
-        try:
-            workarea = monitor.get_workarea()
-        except Exception:
-            workarea = None
-
-        if geometry is None:
-            return workarea
-
-        try:
-            if workarea is not None and (
-                int(workarea.x) != int(geometry.x)
-                or int(workarea.y) != int(geometry.y)
-                or int(workarea.width) != int(geometry.width)
-                or int(workarea.height) != int(geometry.height)
-            ):
-                return workarea
-        except Exception:
-            pass
-
-        # COSMIC часто отдаёт весь монитор как workarea.
-        # Резервируем верхнюю и нижнюю панели вручную.
-        desktop = str(_u1c_layout_os.environ.get("XDG_CURRENT_DESKTOP", "")).lower()
-
-        if "cosmic" in desktop:
-            rect = _u1c_layout_Gdk.Rectangle()
-            rect.x = int(geometry.x)
-            rect.y = int(geometry.y) + 38
-            rect.width = int(geometry.width)
-            rect.height = max(520, int(geometry.height) - 38 - 64)
-            return rect
-
-        return geometry
-
-    def _u1c_layout_find_notebook(win):
-        try:
-            for widget in _u1c_layout_collect(win):
-                try:
-                    if isinstance(widget, _u1c_layout_Gtk.Notebook):
-                        return widget
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
+                pass
         return None
 
-    def _u1c_layout_find_bases_page(win):
-        notebook = _u1c_layout_find_notebook(win)
-
+    def _u1c_fg_find_bases_page(win):
+        notebook = _u1c_fg_find_notebook(win)
         if notebook is None:
             return None
 
@@ -13491,7 +13430,7 @@ try:
             try:
                 page = notebook.get_nth_page(index)
                 tab = notebook.get_tab_label(page)
-                tab_text = _u1c_layout_widget_text(tab).lower().replace("ё", "е")
+                tab_text = _u1c_fg_norm(_u1c_fg_text(tab))
             except Exception:
                 continue
 
@@ -13500,7 +13439,7 @@ try:
 
         return None
 
-    def _u1c_layout_is_base_tree(tree):
+    def _u1c_fg_is_base_tree(tree):
         try:
             titles = []
             for col in tree.get_columns():
@@ -13518,29 +13457,25 @@ try:
         except Exception:
             return False
 
-    def _u1c_layout_find_base_tree(win):
-        # Сначала по атрибутам MainWindow.
+    def _u1c_fg_find_base_tree(win):
         for name in ("base_tree", "bases_tree", "tree_bases"):
             try:
                 candidate = getattr(win, name, None)
-                if isinstance(candidate, _u1c_layout_Gtk.TreeView) and _u1c_layout_is_base_tree(candidate):
+                if isinstance(candidate, _u1c_fg_Gtk.TreeView) and _u1c_fg_is_base_tree(candidate):
                     return candidate
             except Exception:
                 pass
 
-        try:
-            for widget in _u1c_layout_collect(win):
-                try:
-                    if isinstance(widget, _u1c_layout_Gtk.TreeView) and _u1c_layout_is_base_tree(widget):
-                        return widget
-                except Exception:
-                    pass
-        except Exception:
-            pass
+        for widget in _u1c_fg_collect(win):
+            try:
+                if isinstance(widget, _u1c_fg_Gtk.TreeView) and _u1c_fg_is_base_tree(widget):
+                    return widget
+            except Exception:
+                pass
 
         return None
 
-    def _u1c_layout_parent_chain(widget, limit=20):
+    def _u1c_fg_parent_chain(widget, limit=24):
         result = []
         current = widget
 
@@ -13557,35 +13492,110 @@ try:
 
         return result
 
-    def _u1c_layout_find_parent_scroller(widget):
-        for parent in _u1c_layout_parent_chain(widget):
+    def _u1c_fg_find_parent_scroller(widget):
+        for parent in _u1c_fg_parent_chain(widget):
             try:
-                if isinstance(parent, _u1c_layout_Gtk.ScrolledWindow):
+                if isinstance(parent, _u1c_fg_Gtk.ScrolledWindow):
                     return parent
             except Exception:
                 pass
-
         return None
 
-    def _u1c_layout_mark_base_tab_stretch(win):
-        page = _u1c_layout_find_bases_page(win)
-        tree = _u1c_layout_find_base_tree(win)
+    def _u1c_fg_find_footer_rows(page):
+        rows = []
 
-        if page is None or tree is None:
+        for widget in _u1c_fg_collect(page):
+            try:
+                if not isinstance(widget, _u1c_fg_Gtk.Button):
+                    continue
+            except Exception:
+                continue
+
+            text = _u1c_fg_norm(_u1c_fg_text(widget))
+
+            if (
+                "отметить все" in text
+                or "снять все" in text
+                or "синхронизировать со списком баз" in text
+            ):
+                try:
+                    parent = widget.get_parent()
+                except Exception:
+                    parent = None
+
+                if parent is not None and parent not in rows:
+                    rows.append(parent)
+
+        return rows
+
+    def _u1c_fg_add_or_update_footer_guard(page, footer_rows):
+        # Основной вариант: нижний margin у строки подвала.
+        # Это не прокручивает всю форму, а просто оставляет место под нижнюю панель.
+        for row in footer_rows:
+            try:
+                row.set_vexpand(False)
+                row.set_margin_bottom(_U1C_FOOTER_GUARD_HEIGHT)
+            except Exception:
+                pass
+
+        # Дополнительно ставим spacer в самый низ вкладки, если вкладка — Box.
+        # Spacer нужен, когда margin строки игнорируется темой/контейнером.
+        try:
+            if not isinstance(page, _u1c_fg_Gtk.Box):
+                return
+        except Exception:
+            return
+
+        existing = None
+        try:
+            for child in page.get_children():
+                try:
+                    if str(child.get_name() or "") == "u1c_bases_bottom_panel_guard":
+                        existing = child
+                        break
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        if existing is None:
+            spacer = _u1c_fg_Gtk.Box(
+                orientation=_u1c_fg_Gtk.Orientation.VERTICAL,
+                spacing=0,
+            )
+            spacer.set_name("u1c_bases_bottom_panel_guard")
+            spacer.set_size_request(-1, _U1C_FOOTER_GUARD_HEIGHT)
+            spacer.set_vexpand(False)
+            spacer.set_hexpand(True)
+
+            try:
+                page.pack_end(spacer, False, False, 0)
+                spacer.show_all()
+            except Exception:
+                pass
+        else:
+            try:
+                existing.set_size_request(-1, _U1C_FOOTER_GUARD_HEIGHT)
+                existing.set_vexpand(False)
+                existing.show_all()
+            except Exception:
+                pass
+
+    def _u1c_fg_configure_base_scroller(win, page):
+        tree = _u1c_fg_find_base_tree(win)
+        if tree is None:
             return False
 
-        scroller = _u1c_layout_find_parent_scroller(tree)
-
+        scroller = _u1c_fg_find_parent_scroller(tree)
         if scroller is None:
             return False
 
-        # Центральный список баз — единственный элемент, который должен съедать свободную высоту.
         try:
-            scroller.set_policy(_u1c_layout_Gtk.PolicyType.AUTOMATIC, _u1c_layout_Gtk.PolicyType.AUTOMATIC)
+            scroller.set_policy(_u1c_fg_Gtk.PolicyType.AUTOMATIC, _u1c_fg_Gtk.PolicyType.AUTOMATIC)
             scroller.set_overlay_scrolling(False)
             scroller.set_propagate_natural_height(False)
-            scroller.set_min_content_height(260)
-            scroller.set_size_request(-1, 260)
+            scroller.set_min_content_height(180)
+            scroller.set_size_request(-1, 180)
             scroller.set_vexpand(True)
             scroller.set_hexpand(True)
         except Exception:
@@ -13597,105 +13607,39 @@ try:
         except Exception:
             pass
 
-        # Все родители между таблицей и страницей вкладки тоже должны разрешать вертикальное расширение.
-        for parent in _u1c_layout_parent_chain(scroller):
+        # Родители до страницы вкладки должны разрешать таблице забирать свободную высоту.
+        for parent in _u1c_fg_parent_chain(scroller):
             if parent is page:
                 break
-
             try:
                 parent.set_vexpand(True)
             except Exception:
                 pass
 
-        # На самой вкладке Базы разрешаем растягивание.
         try:
             page.set_vexpand(True)
             page.set_hexpand(True)
         except Exception:
             pass
 
-        # Кнопочные ряды не должны забирать вертикальное пространство.
-        try:
-            for widget in _u1c_layout_collect(page):
-                text = _u1c_layout_widget_text(widget).lower().replace("ё", "е")
-
-                if not text:
-                    continue
-
-                is_button_row = (
-                    "добавить базу" in text
-                    or "свойства" in text
-                    or "проверить настройки" in text
-                    or "скачать обновления" in text
-                    or "архивировать базу" in text
-                    or "отметить все" in text
-                    or "снять все" in text
-                    or "синхронизировать со списком баз" in text
-                )
-
-                if is_button_row:
-                    try:
-                        widget.set_vexpand(False)
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-
         return True
 
-    def _u1c_layout_apply_window_geometry(win):
-        if win is None or not _u1c_layout_is_main_window(win):
+    def _u1c_fg_apply(win):
+        if win is None or not _u1c_fg_is_main_window(win):
             return False
 
-        workarea = _u1c_layout_get_workarea(win)
-
-        if workarea is None:
+        page = _u1c_fg_find_bases_page(win)
+        if page is None:
             return False
 
-        margin = _U1C_LAYOUT_MARGIN
-
-        available_w = max(900, int(workarea.width) - margin * 2)
-        available_h = max(560, int(workarea.height) - margin * 2)
-
-        target_w = min(_U1C_LAYOUT_DESIRED_W, available_w)
-        target_h = min(_U1C_LAYOUT_DESIRED_H, available_h)
-
-        target_x = int(workarea.x) + max(margin, int((int(workarea.width) - target_w) / 2))
-        target_y = int(workarea.y) + margin
-
         try:
-            if win.is_maximized():
-                # Не даём WM растянуть окно под панели. Визуально это всё равно почти максимум рабочей области.
-                win.unmaximize()
+            _u1c_fg_configure_base_scroller(win, page)
         except Exception:
             pass
 
         try:
-            geom = _u1c_layout_Gdk.Geometry()
-            geom.min_width = 900
-            geom.min_height = 560
-            geom.max_width = available_w
-            geom.max_height = available_h
-            win.set_geometry_hints(
-                None,
-                geom,
-                _u1c_layout_Gdk.WindowHints.MIN_SIZE | _u1c_layout_Gdk.WindowHints.MAX_SIZE,
-            )
-        except Exception:
-            pass
-
-        try:
-            win.set_default_size(target_w, target_h)
-        except Exception:
-            pass
-
-        try:
-            win.resize(target_w, target_h)
-        except Exception:
-            pass
-
-        try:
-            win.move(target_x, target_y)
+            footer_rows = _u1c_fg_find_footer_rows(page)
+            _u1c_fg_add_or_update_footer_guard(page, footer_rows)
         except Exception:
             pass
 
@@ -13706,47 +13650,34 @@ try:
 
         return False
 
-    def _u1c_layout_apply_all(win):
-        try:
-            _u1c_layout_mark_base_tab_stretch(win)
-        except Exception:
-            pass
-
-        try:
-            _u1c_layout_apply_window_geometry(win)
-        except Exception:
-            pass
-
-        return False
-
     try:
-        _u1c_layout_orig_main_init = MainWindow.__init__
+        _u1c_fg_orig_main_init = MainWindow.__init__
 
-        def _u1c_layout_patched_main_init(self, *args, **kwargs):
-            _u1c_layout_orig_main_init(self, *args, **kwargs)
+        def _u1c_fg_patched_main_init(self, *args, **kwargs):
+            _u1c_fg_orig_main_init(self, *args, **kwargs)
 
             try:
-                self.set_position(_u1c_layout_Gtk.WindowPosition.CENTER)
+                self.set_position(_u1c_fg_Gtk.WindowPosition.CENTER)
             except Exception:
                 pass
 
             try:
-                _u1c_layout_apply_all(self)
-                _u1c_layout_GLib.idle_add(_u1c_layout_apply_all, self)
-                _u1c_layout_GLib.timeout_add(100, _u1c_layout_apply_all, self)
-                _u1c_layout_GLib.timeout_add(400, _u1c_layout_apply_all, self)
-                _u1c_layout_GLib.timeout_add(900, _u1c_layout_apply_all, self)
-                _u1c_layout_GLib.timeout_add(1600, _u1c_layout_apply_all, self)
+                _u1c_fg_apply(self)
+                _u1c_fg_GLib.idle_add(_u1c_fg_apply, self)
+                _u1c_fg_GLib.timeout_add(200, _u1c_fg_apply, self)
+                _u1c_fg_GLib.timeout_add(600, _u1c_fg_apply, self)
+                _u1c_fg_GLib.timeout_add(1200, _u1c_fg_apply, self)
+                _u1c_fg_GLib.timeout_add(2500, _u1c_fg_apply, self)
             except Exception:
                 pass
 
-        MainWindow.__init__ = _u1c_layout_patched_main_init
+        MainWindow.__init__ = _u1c_fg_patched_main_init
     except Exception:
         pass
 
 except Exception:
     pass
-# UPDATER1C_BASE_TAB_PROPORTIONAL_LAYOUT_PATCH_END
+# UPDATER1C_BASES_FOOTER_GUARD_PATCH_END
 
 if __name__ == "__main__":
     main()
