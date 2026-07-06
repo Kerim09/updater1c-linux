@@ -4904,7 +4904,16 @@ class MainWindow(Gtk.Window):
                 self.set_icon_from_file(icon_path)
         except Exception:
             pass
-        self.set_default_size(1320, 810)
+        self.set_default_size(1320, 780)
+
+        # UPDATER1C_MAIN_WINDOW_EXPLICIT_RESIZE_BEGIN
+        # Явно задаём стартовый размер главного окна.
+        # Не используем move()/position: в Wayland/COSMIC позиционирование окна управляется композитором.
+        try:
+            self.resize(1320, 780)
+        except Exception:
+            pass
+        # UPDATER1C_MAIN_WINDOW_EXPLICIT_RESIZE_END
         self.set_position(Gtk.WindowPosition.CENTER)
 
         self.config_path = find_config_file()
