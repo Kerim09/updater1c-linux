@@ -11777,6 +11777,27 @@ except Exception as e:
 # UPDATER1C_DT_AUTOFILL_NO_COMBO_LOCK_END
 
 
+# UPDATER1C_UPDATE_CHAIN_ZIP_SINGLE_PATCH_HOOK_BEGIN
+try:
+    import importlib.util as _u1c_update_chain_importlib_util
+    from pathlib import Path as _u1c_update_chain_Path
+
+    _u1c_update_chain_path = _u1c_update_chain_Path(__file__).with_name("updater1c_update_chain_patch.py")
+    if _u1c_update_chain_path.exists():
+        _u1c_update_chain_spec = _u1c_update_chain_importlib_util.spec_from_file_location(
+            "updater1c_update_chain_patch",
+            str(_u1c_update_chain_path),
+        )
+        _u1c_update_chain_mod = _u1c_update_chain_importlib_util.module_from_spec(_u1c_update_chain_spec)
+        _u1c_update_chain_spec.loader.exec_module(_u1c_update_chain_mod)
+        _u1c_update_chain_mod.install(globals())
+except Exception as _u1c_update_chain_error:
+    try:
+        print("UPDATER1C_UPDATE_CHAIN_ZIP_SINGLE_PATCH_HOOK_ERROR:", repr(_u1c_update_chain_error))
+    except Exception:
+        pass
+# UPDATER1C_UPDATE_CHAIN_ZIP_SINGLE_PATCH_HOOK_END
+
 # UPDATER1C_BACKUP_PLUGIN_HOOK_BEGIN
 # Подключение дополнительного модуля резервного копирования и имени .cf с релизом.
 try:
@@ -11914,6 +11935,542 @@ except Exception as _u1c_backup_combo_error:
         pass
 # UPDATER1C_BACKUP_COMBO_BRIDGE_HOOK_END
 
+# UPDATER1C_ADAPTIVE_LIGHT_CONTENT_THEME_PATCH_BEGIN
+# Адаптивная светлая рабочая область + принудительная перекраска заголовков Gtk.TreeViewColumn.
+try:
+    import html as _u1c_theme_html
+    import gi as _u1c_theme_gi
+
+    try:
+        _u1c_theme_gi.require_version("Gtk", "3.0")
+    except Exception:
+        pass
+
+    from gi.repository import Gtk as _u1c_theme_Gtk
+    from gi.repository import Gdk as _u1c_theme_Gdk
+    from gi.repository import GLib as _u1c_theme_GLib
+
+    _U1C_ADAPTIVE_LIGHT_CONTENT_THEME_DONE = False
+
+    def _u1c_theme_is_dark():
+        try:
+            settings = _u1c_theme_Gtk.Settings.get_default()
+            if settings is None:
+                return False
+
+            try:
+                if bool(settings.get_property("gtk-application-prefer-dark-theme")):
+                    return True
+            except Exception:
+                pass
+
+            try:
+                theme_name = str(settings.get_property("gtk-theme-name") or "").lower()
+                return ("dark" in theme_name) or ("black" in theme_name)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+        return False
+
+    def _u1c_rgba(color):
+        rgba = _u1c_theme_Gdk.RGBA()
+        rgba.parse(color)
+        return rgba
+
+    def _u1c_force_widget_colors(widget, bg="#e7e7e7", fg="#000000"):
+        if widget is None:
+            return
+
+        bg_rgba = _u1c_rgba(bg)
+        fg_rgba = _u1c_rgba(fg)
+
+        states = [
+            _u1c_theme_Gtk.StateFlags.NORMAL,
+            _u1c_theme_Gtk.StateFlags.ACTIVE,
+            _u1c_theme_Gtk.StateFlags.PRELIGHT,
+            _u1c_theme_Gtk.StateFlags.SELECTED,
+            _u1c_theme_Gtk.StateFlags.INSENSITIVE,
+            _u1c_theme_Gtk.StateFlags.BACKDROP,
+        ]
+
+        for state in states:
+            try:
+                widget.override_background_color(state, bg_rgba)
+            except Exception:
+                pass
+
+            try:
+                widget.override_color(state, fg_rgba)
+            except Exception:
+                pass
+
+        try:
+            ctx = widget.get_style_context()
+            ctx.add_class("u1c-force-light-header")
+        except Exception:
+            pass
+
+        try:
+            widget.queue_draw()
+        except Exception:
+            pass
+
+    def _u1c_widget_children(widget):
+        children = []
+
+        try:
+            children.extend(widget.get_children())
+        except Exception:
+            pass
+
+        try:
+            child = widget.get_child()
+            if child is not None and child not in children:
+                children.append(child)
+        except Exception:
+            pass
+
+        try:
+            tmp = []
+            widget.foreach(lambda child, data: data.append(child), tmp)
+            for child in tmp:
+                if child not in children:
+                    children.append(child)
+        except Exception:
+            pass
+
+        return children
+
+    def _u1c_collect_widgets(root):
+        result = []
+        stack = [root]
+        seen = set()
+
+        while stack:
+            widget = stack.pop()
+            if widget is None:
+                continue
+
+            ident = id(widget)
+            if ident in seen:
+                continue
+
+            seen.add(ident)
+            result.append(widget)
+
+            for child in _u1c_widget_children(widget):
+                stack.append(child)
+
+        return result
+
+    def _u1c_find_parent_button(widget):
+        current = widget
+
+        for _ in range(8):
+            try:
+                current = current.get_parent()
+            except Exception:
+                return None
+
+            if current is None:
+                return None
+
+            try:
+                if isinstance(current, _u1c_theme_Gtk.Button):
+                    return current
+            except Exception:
+                pass
+
+        return None
+
+    def _u1c_force_tree_headers():
+        try:
+            windows = _u1c_theme_Gtk.Window.list_toplevels()
+        except Exception:
+            return True
+
+        for win in windows:
+            try:
+                widgets = _u1c_collect_widgets(win)
+            except Exception:
+                widgets = []
+
+            for tree in widgets:
+                try:
+                    if not isinstance(tree, _u1c_theme_Gtk.TreeView):
+                        continue
+                except Exception:
+                    continue
+
+                try:
+                    tree.set_headers_visible(True)
+                except Exception:
+                    pass
+
+                try:
+                    columns = tree.get_columns()
+                except Exception:
+                    columns = []
+
+                for column in columns:
+                    try:
+                        title = str(column.get_title() or " ")
+                    except Exception:
+                        title = " "
+
+                    try:
+                        current_widget = column.get_widget()
+                    except Exception:
+                        current_widget = None
+
+                    need_replace = True
+                    try:
+                        if current_widget is not None and current_widget.get_name() == "u1c_tree_header_fixed":
+                            need_replace = False
+                    except Exception:
+                        pass
+
+                    if need_replace:
+                        try:
+                            label = _u1c_theme_Gtk.Label()
+                            label.set_markup(
+                                '<span foreground="#000000" weight="bold">'
+                                + _u1c_theme_html.escape(title)
+                                + '</span>'
+                            )
+                            label.set_xalign(0.0)
+                            label.set_yalign(0.5)
+                            label.set_margin_start(4)
+                            label.set_margin_end(4)
+                            label.set_margin_top(2)
+                            label.set_margin_bottom(2)
+                            label.set_name("u1c_tree_header_fixed_label")
+
+                            event_box = _u1c_theme_Gtk.EventBox()
+                            event_box.set_visible_window(True)
+                            event_box.set_name("u1c_tree_header_fixed")
+                            event_box.add(label)
+
+                            _u1c_force_widget_colors(event_box, "#e7e7e7", "#000000")
+                            _u1c_force_widget_colors(label, "#e7e7e7", "#000000")
+
+                            column.set_widget(event_box)
+                            event_box.show_all()
+                        except Exception:
+                            pass
+
+                    try:
+                        header_widget = column.get_widget()
+                    except Exception:
+                        header_widget = None
+
+                    _u1c_force_widget_colors(header_widget, "#e7e7e7", "#000000")
+
+                    # Главное: красим родительскую кнопку заголовка, потому что именно она оставалась тёмной.
+                    button = None
+
+                    try:
+                        if hasattr(column, "get_button"):
+                            button = column.get_button()
+                    except Exception:
+                        button = None
+
+                    if button is None and header_widget is not None:
+                        button = _u1c_find_parent_button(header_widget)
+
+                    _u1c_force_widget_colors(button, "#e7e7e7", "#000000")
+
+                    try:
+                        for child in _u1c_collect_widgets(button):
+                            _u1c_force_widget_colors(child, "#e7e7e7", "#000000")
+                    except Exception:
+                        pass
+
+                try:
+                    tree.queue_draw()
+                except Exception:
+                    pass
+
+        return True
+
+    def _u1c_apply_adaptive_light_content_theme():
+        global _U1C_ADAPTIVE_LIGHT_CONTENT_THEME_DONE
+
+        if _U1C_ADAPTIVE_LIGHT_CONTENT_THEME_DONE:
+            return False
+
+        dark = _u1c_theme_is_dark()
+
+        app_bg = "#30343a" if dark else "#eeeeee"
+        app_fg = "#f0f0f0" if dark else "#000000"
+
+        css = f"""
+        * {{
+            text-shadow: none;
+            -gtk-icon-shadow: none;
+            -gtk-icon-effect: none;
+        }}
+
+        window,
+        dialog,
+        .background {{
+            background-color: {app_bg};
+            color: {app_fg};
+        }}
+
+        box,
+        paned,
+        grid,
+        overlay,
+        viewport,
+        scrolledwindow,
+        frame {{
+            background-color: {app_bg};
+            color: {app_fg};
+        }}
+
+        label,
+        checkbutton,
+        radiobutton {{
+            color: {app_fg};
+            opacity: 1;
+        }}
+
+        button,
+        button.flat,
+        button.text-button,
+        button.image-button,
+        combobox button {{
+            background-image: none;
+            background-color: #f5f5f5;
+            color: #000000;
+            border: 1px solid #b8b8b8;
+            border-radius: 4px;
+            box-shadow: none;
+            opacity: 1;
+        }}
+
+        button *,
+        button label,
+        button box,
+        button image,
+        button:disabled *,
+        button:disabled label,
+        button:insensitive *,
+        button:insensitive label,
+        button:backdrop *,
+        button:backdrop label {{
+            color: #000000;
+            opacity: 1;
+        }}
+
+        button:hover {{
+            background-image: none;
+            background-color: #e6e6e6;
+            color: #000000;
+        }}
+
+        button:active,
+        button:checked {{
+            background-image: none;
+            background-color: #ddb1f2;
+            color: #000000;
+        }}
+
+        button:disabled,
+        button:insensitive,
+        button:backdrop {{
+            background-image: none;
+            background-color: #f1f1f1;
+            color: #000000;
+            border-color: #c7c7c7;
+            opacity: 1;
+        }}
+
+        notebook,
+        notebook > header,
+        notebook > stack {{
+            background-color: {app_bg};
+            color: {app_fg};
+        }}
+
+        notebook tab,
+        notebook tab:backdrop,
+        notebook tab:disabled,
+        notebook tab:insensitive {{
+            background-image: none;
+            background-color: #efefef;
+            color: #000000;
+            border: 1px solid #c7c7c7;
+            opacity: 1;
+        }}
+
+        notebook tab label,
+        notebook tab:checked label,
+        notebook tab:disabled label,
+        notebook tab:insensitive label {{
+            color: #000000;
+            opacity: 1;
+        }}
+
+        notebook tab:checked {{
+            background-color: #ffffff;
+            color: #000000;
+        }}
+
+        entry,
+        textview,
+        textview text,
+        spinbutton,
+        combobox,
+        combobox box,
+        combobox entry {{
+            background-color: #f3f3f3;
+            color: #000000;
+            border-color: #bdbdbd;
+            opacity: 1;
+        }}
+
+        entry *,
+        textview *,
+        spinbutton *,
+        combobox * {{
+            color: #000000;
+            opacity: 1;
+        }}
+
+        treeview,
+        treeview.view,
+        .view {{
+            background-color: #f0f0f0;
+            color: #000000;
+            opacity: 1;
+        }}
+
+        treeview.view *,
+        treeview * {{
+            color: #000000;
+            opacity: 1;
+        }}
+
+        treeview header,
+        treeview header button,
+        treeview header button *,
+        treeview.view header,
+        treeview.view header button,
+        treeview.view header button * {{
+            background-image: none;
+            background-color: #e7e7e7;
+            color: #000000;
+            border-color: #bdbdbd;
+            box-shadow: none;
+            opacity: 1;
+        }}
+
+        .u1c-force-light-header,
+        .u1c-force-light-header *,
+        #u1c_tree_header_fixed,
+        #u1c_tree_header_fixed *,
+        #u1c_tree_header_fixed_label {{
+            background-image: none;
+            background-color: #e7e7e7;
+            color: #000000;
+            opacity: 1;
+        }}
+
+        treeview.view:selected,
+        treeview.view:selected:focus,
+        treeview:selected,
+        treeview:selected:focus,
+        row:selected {{
+            background-color: #dda0f2;
+            color: #000000;
+            opacity: 1;
+        }}
+
+        treeview.view:selected *,
+        treeview:selected *,
+        row:selected *,
+        row:selected label {{
+            color: #000000;
+            opacity: 1;
+        }}
+
+        checkbutton check,
+        radiobutton radio {{
+            background-color: #f2f2f2;
+            color: #000000;
+            border: 1px solid #b8b8b8;
+            opacity: 1;
+        }}
+
+        checkbutton check:checked,
+        radiobutton radio:checked {{
+            background-color: #dca2f2;
+            color: #000000;
+            border: 1px solid #9a55b8;
+        }}
+
+        menu,
+        menuitem,
+        popover,
+        popover box {{
+            background-color: #f3f3f3;
+            color: #000000;
+        }}
+
+        menuitem *,
+        popover * {{
+            color: #000000;
+            opacity: 1;
+        }}
+        """
+
+        provider = _u1c_theme_Gtk.CssProvider()
+        provider.load_from_data(css.encode("utf-8"))
+
+        priority = 30000
+        applied = False
+
+        try:
+            screen = _u1c_theme_Gdk.Screen.get_default()
+            if screen is not None:
+                _u1c_theme_Gtk.StyleContext.add_provider_for_screen(screen, provider, priority)
+                applied = True
+        except Exception:
+            pass
+
+        try:
+            display = _u1c_theme_Gdk.Display.get_default()
+            if display is not None and hasattr(_u1c_theme_Gtk.StyleContext, "add_provider_for_display"):
+                _u1c_theme_Gtk.StyleContext.add_provider_for_display(display, provider, priority)
+                applied = True
+        except Exception:
+            pass
+
+        try:
+            _u1c_force_tree_headers()
+            _u1c_theme_GLib.timeout_add(500, _u1c_force_tree_headers)
+            _u1c_theme_GLib.timeout_add(1500, _u1c_force_tree_headers)
+            _u1c_theme_GLib.timeout_add(3000, _u1c_force_tree_headers)
+        except Exception:
+            pass
+
+        _U1C_ADAPTIVE_LIGHT_CONTENT_THEME_DONE = applied
+        return False
+
+    try:
+        _u1c_theme_GLib.idle_add(_u1c_apply_adaptive_light_content_theme)
+        _u1c_theme_GLib.timeout_add(400, _u1c_apply_adaptive_light_content_theme)
+        _u1c_theme_GLib.timeout_add(1500, _u1c_apply_adaptive_light_content_theme)
+    except Exception:
+        pass
+
+except Exception:
+    pass
+# UPDATER1C_ADAPTIVE_LIGHT_CONTENT_THEME_PATCH_END
 
 if __name__ == "__main__":
     main()
