@@ -10038,7 +10038,7 @@ class MainWindow(Gtk.Window):
     # UPDATER1C_BASE_TABLE_INITIAL_HEIGHT_PATCH_BEGIN
     def _u1c_set_base_table_initial_height(self):
         """Задаёт стартовую высоту именно таблицы списка баз, не двигая окно."""
-        target_height = 520
+        target_height = 500
 
         def collect_widgets(root):
             result = []
