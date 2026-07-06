@@ -48,3 +48,11 @@ _patch_backups/
 /backups/
 /legacy/
 *.pyc
+# Local patch/backups
+*.bak_*
+*.backup-*
+*.broken_*
+*before_headless*
+*broken_headless*
+*~
+legacy/patch_backups/
