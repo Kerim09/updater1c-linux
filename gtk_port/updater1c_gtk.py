@@ -12472,5 +12472,506 @@ except Exception:
     pass
 # UPDATER1C_ADAPTIVE_LIGHT_CONTENT_THEME_PATCH_END
 
+# UPDATER1C_REPORT_TAB_CONTROLS_PATCH_BEGIN
+# Правки вкладки "Отчет":
+# - скрыть кнопки действий, привязанные к выбранной базе;
+# - восстановить Отменить / Очистить лог / Сохранить лог / Открыть текущий лог.
+try:
+    import os as _u1c_report_os
+    import re as _u1c_report_re
+    import subprocess as _u1c_report_subprocess
+    import datetime as _u1c_report_datetime
+    from pathlib import Path as _u1c_report_Path
+
+    import gi as _u1c_report_gi
+    try:
+        _u1c_report_gi.require_version("Gtk", "3.0")
+    except Exception:
+        pass
+
+    from gi.repository import Gtk as _u1c_report_Gtk
+    from gi.repository import GLib as _u1c_report_GLib
+    from gi.repository import Gio as _u1c_report_Gio
+
+    _U1C_REPORT_CONTROLS_DONE = False
+    _U1C_REPORT_HOOKED_BUTTONS = set()
+
+    def _u1c_report_widget_children(widget):
+        children = []
+
+        if widget is None:
+            return children
+
+        try:
+            children.extend(widget.get_children())
+        except Exception:
+            pass
+
+        try:
+            child = widget.get_child()
+            if child is not None and child not in children:
+                children.append(child)
+        except Exception:
+            pass
+
+        try:
+            tmp = []
+            widget.foreach(lambda child, data: data.append(child), tmp)
+            for child in tmp:
+                if child not in children:
+                    children.append(child)
+        except Exception:
+            pass
+
+        return children
+
+    def _u1c_report_collect_widgets(root):
+        result = []
+        stack = [root]
+        seen = set()
+
+        while stack:
+            widget = stack.pop()
+            if widget is None:
+                continue
+
+            ident = id(widget)
+            if ident in seen:
+                continue
+
+            seen.add(ident)
+            result.append(widget)
+
+            for child in _u1c_report_widget_children(widget):
+                stack.append(child)
+
+        return result
+
+    def _u1c_report_widget_text(widget, depth=0):
+        if widget is None or depth > 5:
+            return ""
+
+        parts = []
+
+        for meth in ("get_text", "get_label", "get_title"):
+            try:
+                value = getattr(widget, meth)()
+                if value:
+                    parts.append(str(value))
+            except Exception:
+                pass
+
+        try:
+            active_text = widget.get_active_text()
+            if active_text:
+                parts.append(str(active_text))
+        except Exception:
+            pass
+
+        for child in _u1c_report_widget_children(widget):
+            text = _u1c_report_widget_text(child, depth + 1)
+            if text:
+                parts.append(text)
+
+        return " ".join(parts)
+
+    def _u1c_report_norm(text):
+        text = str(text or "").lower()
+        text = text.replace("ё", "е")
+        text = _u1c_report_re.sub(r"\s+", " ", text)
+        return text.strip()
+
+    def _u1c_report_is_report_tab_text(text):
+        text = _u1c_report_norm(text)
+        return "отчет" in text or "отчеты" in text
+
+    def _u1c_report_pages():
+        pages = []
+
+        try:
+            windows = _u1c_report_Gtk.Window.list_toplevels()
+        except Exception:
+            windows = []
+
+        for win in windows:
+            try:
+                widgets = _u1c_report_collect_widgets(win)
+            except Exception:
+                widgets = []
+
+            for widget in widgets:
+                try:
+                    if not isinstance(widget, _u1c_report_Gtk.Notebook):
+                        continue
+                except Exception:
+                    continue
+
+                try:
+                    count = widget.get_n_pages()
+                except Exception:
+                    count = 0
+
+                for index in range(count):
+                    try:
+                        page = widget.get_nth_page(index)
+                        tab = widget.get_tab_label(page)
+                        tab_text = _u1c_report_widget_text(tab)
+                    except Exception:
+                        continue
+
+                    if _u1c_report_is_report_tab_text(tab_text):
+                        pages.append(page)
+
+        return pages
+
+    def _u1c_report_button_text(button):
+        return _u1c_report_norm(_u1c_report_widget_text(button))
+
+    def _u1c_report_should_hide_button(button):
+        text = _u1c_report_button_text(button)
+
+        # Эти действия завязаны на выбранную строку базы и во вкладке отчета выглядят нелогично.
+        targets = (
+            "запустить обновлен",
+            "скачать обновлен",
+            "установить обновлен",
+        )
+
+        return any(target in text for target in targets)
+
+    def _u1c_report_find_largest_textview(page):
+        textviews = []
+
+        try:
+            widgets = _u1c_report_collect_widgets(page)
+        except Exception:
+            widgets = []
+
+        for widget in widgets:
+            try:
+                if isinstance(widget, _u1c_report_Gtk.TextView):
+                    buf = widget.get_buffer()
+                    start = buf.get_start_iter()
+                    end = buf.get_end_iter()
+                    text = buf.get_text(start, end, True)
+                    textviews.append((len(text or ""), widget, text or ""))
+            except Exception:
+                pass
+
+        if not textviews:
+            return None, ""
+
+        textviews.sort(key=lambda x: x[0], reverse=True)
+        return textviews[0][1], textviews[0][2]
+
+    def _u1c_report_current_text(page):
+        _, text = _u1c_report_find_largest_textview(page)
+        return text or ""
+
+    def _u1c_report_set_current_text(page, text):
+        textview, _ = _u1c_report_find_largest_textview(page)
+        if textview is None:
+            return False
+
+        try:
+            textview.get_buffer().set_text(text or "")
+            return True
+        except Exception:
+            return False
+
+    def _u1c_report_default_reports_dir():
+        candidates = [
+            _u1c_report_Path.home() / "Документы" / "Updater1C" / "1c-update-reports",
+            _u1c_report_Path.home() / "Documents" / "Updater1C" / "1c-update-reports",
+            _u1c_report_Path("/mnt/DataStore/Updater1C/1c-update-reports"),
+        ]
+
+        for path in candidates:
+            try:
+                if path.exists():
+                    return path
+            except Exception:
+                pass
+
+        path = _u1c_report_Path.home() / "Документы" / "Updater1C" / "1c-update-reports"
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            path = _u1c_report_Path.home()
+
+        return path
+
+    def _u1c_report_find_current_log_file(text):
+        paths = []
+
+        for match in _u1c_report_re.findall(r"(/[^\s'\"<>]+?\.log)", text or ""):
+            candidate = match.rstrip(".,;:)")
+            try:
+                p = _u1c_report_Path(candidate)
+                if p.exists() and p.is_file():
+                    paths.append(p)
+            except Exception:
+                pass
+
+        if paths:
+            return paths[-1]
+
+        reports_dir = _u1c_report_default_reports_dir()
+
+        try:
+            logs = sorted(
+                [p for p in reports_dir.glob("*.log") if p.is_file()],
+                key=lambda p: p.stat().st_mtime,
+            )
+            if logs:
+                return logs[-1]
+        except Exception:
+            pass
+
+        return None
+
+    def _u1c_report_open_path(path):
+        try:
+            _u1c_report_Gio.AppInfo.launch_default_for_uri(path.as_uri(), None)
+            return True
+        except Exception:
+            pass
+
+        try:
+            _u1c_report_subprocess.Popen(["xdg-open", str(path)])
+            return True
+        except Exception:
+            return False
+
+    def _u1c_report_message(parent, text):
+        try:
+            dialog = _u1c_report_Gtk.MessageDialog(
+                transient_for=parent if isinstance(parent, _u1c_report_Gtk.Window) else None,
+                flags=0,
+                message_type=_u1c_report_Gtk.MessageType.INFO,
+                buttons=_u1c_report_Gtk.ButtonsType.OK,
+                text=str(text),
+            )
+            dialog.run()
+            dialog.destroy()
+        except Exception:
+            pass
+
+    def _u1c_report_clear_clicked(button, page):
+        _u1c_report_set_current_text(page, "")
+
+    def _u1c_report_save_clicked(button, page):
+        text = _u1c_report_current_text(page)
+
+        parent = None
+        try:
+            parent = button.get_toplevel()
+        except Exception:
+            pass
+
+        default_dir = _u1c_report_default_reports_dir()
+        name = "updater1c_report_" + _u1c_report_datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + ".log"
+
+        try:
+            dialog = _u1c_report_Gtk.FileChooserDialog(
+                title="Сохранить лог",
+                transient_for=parent if isinstance(parent, _u1c_report_Gtk.Window) else None,
+                action=_u1c_report_Gtk.FileChooserAction.SAVE,
+            )
+            dialog.add_buttons(
+                "Отмена",
+                _u1c_report_Gtk.ResponseType.CANCEL,
+                "Сохранить",
+                _u1c_report_Gtk.ResponseType.ACCEPT,
+            )
+            dialog.set_do_overwrite_confirmation(True)
+            dialog.set_current_folder(str(default_dir))
+            dialog.set_current_name(name)
+
+            response = dialog.run()
+            filename = dialog.get_filename()
+            dialog.destroy()
+
+            if response != _u1c_report_Gtk.ResponseType.ACCEPT or not filename:
+                return
+
+            path = _u1c_report_Path(filename)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text or "", encoding="utf-8", errors="replace")
+            _u1c_report_message(parent, f"Лог сохранен:\n{path}")
+
+        except Exception as e:
+            _u1c_report_message(parent, f"Не удалось сохранить лог:\n{e}")
+
+    def _u1c_report_open_current_clicked(button, page):
+        text = _u1c_report_current_text(page)
+        parent = None
+
+        try:
+            parent = button.get_toplevel()
+        except Exception:
+            pass
+
+        path = _u1c_report_find_current_log_file(text)
+
+        # Если отдельный log-файл не найден, создаем временный из текущего содержимого окна.
+        if path is None:
+            try:
+                reports_dir = _u1c_report_default_reports_dir()
+                path = reports_dir / ("updater1c_current_log_" + _u1c_report_datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + ".log")
+                path.write_text(text or "", encoding="utf-8", errors="replace")
+            except Exception as e:
+                _u1c_report_message(parent, f"Не удалось подготовить текущий лог:\n{e}")
+                return
+
+        if not _u1c_report_open_path(path):
+            _u1c_report_message(parent, f"Не удалось открыть лог:\n{path}")
+
+    def _u1c_report_cancel_clicked(button, page):
+        parent = None
+
+        try:
+            parent = button.get_toplevel()
+        except Exception:
+            pass
+
+        # В правой панели уже есть штатная кнопка принудительного прерывания.
+        # Кнопка "Отменить" во вкладке "Отчет" должна вызывать именно её.
+        try:
+            windows = _u1c_report_Gtk.Window.list_toplevels()
+        except Exception:
+            windows = []
+
+        for win in windows:
+            try:
+                widgets = _u1c_report_collect_widgets(win)
+            except Exception:
+                widgets = []
+
+            for widget in widgets:
+                try:
+                    if not isinstance(widget, _u1c_report_Gtk.Button):
+                        continue
+                except Exception:
+                    continue
+
+                text = _u1c_report_button_text(widget)
+
+                if "прервать процесс" in text:
+                    try:
+                        widget.clicked()
+                        return
+                    except Exception:
+                        try:
+                            widget.emit("clicked")
+                            return
+                        except Exception:
+                            pass
+
+        _u1c_report_message(parent, "Активный процесс для отмены не найден.")
+
+    def _u1c_report_connect_button(button, page):
+        ident = id(button)
+        if ident in _U1C_REPORT_HOOKED_BUTTONS:
+            return
+
+        text = _u1c_report_button_text(button)
+
+        handler = None
+
+        if "очистить лог" in text:
+            handler = _u1c_report_clear_clicked
+        elif "сохранить лог" in text:
+            handler = _u1c_report_save_clicked
+        elif "открыть текущий лог" in text:
+            handler = _u1c_report_open_current_clicked
+        elif text == "отменить" or " отменить" in text:
+            handler = _u1c_report_cancel_clicked
+
+        if handler is None:
+            return
+
+        try:
+            button.set_sensitive(True)
+            button.set_visible(True)
+            button.set_no_show_all(False)
+        except Exception:
+            pass
+
+        try:
+            button.connect_after("clicked", lambda btn, p=page, h=handler: h(btn, p))
+            _U1C_REPORT_HOOKED_BUTTONS.add(ident)
+        except Exception:
+            pass
+
+    def _u1c_report_patch_page(page):
+        try:
+            widgets = _u1c_report_collect_widgets(page)
+        except Exception:
+            return
+
+        for widget in widgets:
+            try:
+                if not isinstance(widget, _u1c_report_Gtk.Button):
+                    continue
+            except Exception:
+                continue
+
+            text = _u1c_report_button_text(widget)
+
+            if _u1c_report_should_hide_button(widget):
+                try:
+                    widget.set_sensitive(False)
+                    widget.set_no_show_all(True)
+                    widget.hide()
+                    widget.set_visible(False)
+                except Exception:
+                    pass
+                continue
+
+            if (
+                "очистить лог" in text
+                or "сохранить лог" in text
+                or "открыть текущий лог" in text
+                or text == "отменить"
+                or " отменить" in text
+            ):
+                _u1c_report_connect_button(widget, page)
+
+    def _u1c_report_scan():
+        try:
+            for page in _u1c_report_pages():
+                _u1c_report_patch_page(page)
+        except Exception:
+            pass
+
+        return True
+
+    def _u1c_report_start_controls_patch():
+        global _U1C_REPORT_CONTROLS_DONE
+
+        try:
+            _u1c_report_scan()
+
+            if not _U1C_REPORT_CONTROLS_DONE:
+                _u1c_report_GLib.timeout_add(700, _u1c_report_scan)
+                _u1c_report_GLib.timeout_add(1500, _u1c_report_scan)
+                _u1c_report_GLib.timeout_add_seconds(3, _u1c_report_scan)
+                _U1C_REPORT_CONTROLS_DONE = True
+        except Exception:
+            pass
+
+        return False
+
+    try:
+        _u1c_report_GLib.idle_add(_u1c_report_start_controls_patch)
+        _u1c_report_GLib.timeout_add(500, _u1c_report_start_controls_patch)
+    except Exception:
+        pass
+
+except Exception:
+    pass
+# UPDATER1C_REPORT_TAB_CONTROLS_PATCH_END
+
 if __name__ == "__main__":
     main()
