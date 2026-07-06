@@ -4904,7 +4904,7 @@ class MainWindow(Gtk.Window):
                 self.set_icon_from_file(icon_path)
         except Exception:
             pass
-        self.set_default_size(1320, 716)
+        self.set_default_size(1320, 712)
 
         # UPDATER1C_MAIN_WINDOW_CENTER_PATCH_BEGIN
         try:
