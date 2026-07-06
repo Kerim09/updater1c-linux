@@ -4904,7 +4904,7 @@ class MainWindow(Gtk.Window):
                 self.set_icon_from_file(icon_path)
         except Exception:
             pass
-        self.set_default_size(1180, 700)
+        self.set_default_size(1320, 680)
         self.set_position(Gtk.WindowPosition.CENTER)
 
         self.config_path = find_config_file()
@@ -13299,31 +13299,29 @@ except Exception:
     pass
 # UPDATER1C_REPORT_TAB_LAYOUT_V2_PATCH_END
 
-# UPDATER1C_WINDOW_WORKAREA_BEHAVIOR_PATCH_BEGIN
-# Поведение главного окна по рабочей области монитора:
-# - верх окна после верхней панели, если она есть;
-# - если верхней панели нет — по верхней границе;
-# - низ окна не должен заходить за нижнюю панель;
-# - если окно больше доступной области — ужимаем;
-# - если окно меньше — оставляем желаемый размер.
+# UPDATER1C_WORKAREA_SCROLL_ROOT_PATCH_BEGIN
+# Главное окно не должно заходить за панели рабочего стола.
+# Причина прошлых неудач: внутреннее содержимое держит слишком большой minimum size,
+# поэтому обычный set_default_size/resize не может уменьшить окно.
+# Решение: оборачиваем корневой контейнер главного окна в Gtk.ScrolledWindow.
 try:
-    import os as _u1c_wa_os
-    import gi as _u1c_wa_gi
+    import os as _u1c_wr_os
+    import gi as _u1c_wr_gi
 
     try:
-        _u1c_wa_gi.require_version("Gtk", "3.0")
+        _u1c_wr_gi.require_version("Gtk", "3.0")
     except Exception:
         pass
 
-    from gi.repository import Gtk as _u1c_wa_Gtk
-    from gi.repository import Gdk as _u1c_wa_Gdk
-    from gi.repository import GLib as _u1c_wa_GLib
+    from gi.repository import Gtk as _u1c_wr_Gtk
+    from gi.repository import Gdk as _u1c_wr_Gdk
+    from gi.repository import GLib as _u1c_wr_GLib
 
-    _U1C_WORKAREA_DESIRED_W = 1180
-    _U1C_WORKAREA_DESIRED_H = 700
-    _U1C_WORKAREA_MARGIN = 8
+    _U1C_WR_DESIRED_W = 1320
+    _U1C_WR_DESIRED_H = 680
+    _U1C_WR_MARGIN = 8
 
-    def _u1c_wa_is_main_window(win):
+    def _u1c_wr_is_main_window(win):
         try:
             title = str(win.get_title() or "").lower()
         except Exception:
@@ -13331,10 +13329,10 @@ try:
 
         return ("обновлятор" in title and "1c" in title) or ("updater1c" in title)
 
-    def _u1c_wa_get_monitor_rects(win):
-        display = _u1c_wa_Gdk.Display.get_default()
+    def _u1c_wr_get_workarea(win):
+        display = _u1c_wr_Gdk.Display.get_default()
         if display is None:
-            return None, None
+            return None
 
         monitor = None
 
@@ -13352,7 +13350,7 @@ try:
                 monitor = None
 
         if monitor is None:
-            return None, None
+            return None
 
         try:
             geometry = monitor.get_geometry()
@@ -13364,58 +13362,94 @@ try:
         except Exception:
             workarea = None
 
-        return geometry, workarea
-
-    def _u1c_wa_effective_workarea(win):
-        geometry, workarea = _u1c_wa_get_monitor_rects(win)
-
         if geometry is None:
-            return None
+            return workarea
 
-        # Если WM отдал нормальную рабочую область, используем её.
-        if workarea is not None:
-            try:
-                if (
-                    int(workarea.width) > 0
-                    and int(workarea.height) > 0
-                    and (
-                        int(workarea.x) != int(geometry.x)
-                        or int(workarea.y) != int(geometry.y)
-                        or int(workarea.width) != int(geometry.width)
-                        or int(workarea.height) != int(geometry.height)
-                    )
-                ):
-                    return workarea
-            except Exception:
-                pass
+        # Если окружение отдало корректную workarea — используем её.
+        try:
+            if workarea is not None and (
+                int(workarea.x) != int(geometry.x)
+                or int(workarea.y) != int(geometry.y)
+                or int(workarea.width) != int(geometry.width)
+                or int(workarea.height) != int(geometry.height)
+            ):
+                return workarea
+        except Exception:
+            pass
 
-        # Fallback для COSMIC/Wayland, если get_workarea возвращает весь монитор
-        # и не вычитает верхнюю/нижнюю панель.
-        desktop = str(_u1c_wa_os.environ.get("XDG_CURRENT_DESKTOP", "")).lower()
-        session = str(_u1c_wa_os.environ.get("XDG_SESSION_TYPE", "")).lower()
+        # Fallback для COSMIC: вручную резервируем верхнюю и нижнюю панели.
+        desktop = str(_u1c_wr_os.environ.get("XDG_CURRENT_DESKTOP", "")).lower()
 
         if "cosmic" in desktop:
-            top_reserved = 38
-            bottom_reserved = 58
-
-            rect = _u1c_wa_Gdk.Rectangle()
+            rect = _u1c_wr_Gdk.Rectangle()
             rect.x = int(geometry.x)
-            rect.y = int(geometry.y) + top_reserved
+            rect.y = int(geometry.y) + 38
             rect.width = int(geometry.width)
-            rect.height = max(400, int(geometry.height) - top_reserved - bottom_reserved)
+            rect.height = max(420, int(geometry.height) - 38 - 64)
             return rect
 
-        # Для прочих окружений без явной рабочей области — весь монитор.
         return geometry
 
-    def _u1c_wa_apply_geometry(win):
-        if win is None or not _u1c_wa_is_main_window(win):
+    def _u1c_wr_wrap_root(win):
+        if win is None or not _u1c_wr_is_main_window(win):
             return False
 
-        workarea = _u1c_wa_effective_workarea(win)
+        try:
+            child = win.get_child()
+        except Exception:
+            child = None
 
+        if child is None:
+            return False
+
+        try:
+            if isinstance(child, _u1c_wr_Gtk.ScrolledWindow) and str(child.get_name() or "") == "u1c_main_root_scroll":
+                return True
+        except Exception:
+            pass
+
+        scroller = _u1c_wr_Gtk.ScrolledWindow()
+        scroller.set_name("u1c_main_root_scroll")
+        scroller.set_policy(_u1c_wr_Gtk.PolicyType.AUTOMATIC, _u1c_wr_Gtk.PolicyType.AUTOMATIC)
+        scroller.set_overlay_scrolling(False)
+        scroller.set_hexpand(True)
+        scroller.set_vexpand(True)
+
+        try:
+            scroller.set_min_content_width(900)
+            scroller.set_min_content_height(420)
+        except Exception:
+            pass
+
+        try:
+            win.remove(child)
+            scroller.add(child)
+            win.add(scroller)
+            scroller.show_all()
+            return True
+        except Exception:
+            return False
+
+    def _u1c_wr_apply_workarea(win):
+        if win is None or not _u1c_wr_is_main_window(win):
+            return False
+
+        _u1c_wr_wrap_root(win)
+
+        workarea = _u1c_wr_get_workarea(win)
         if workarea is None:
             return False
+
+        margin = _U1C_WR_MARGIN
+
+        available_w = max(900, int(workarea.width) - margin * 2)
+        available_h = max(520, int(workarea.height) - margin * 2)
+
+        target_w = min(_U1C_WR_DESIRED_W, available_w)
+        target_h = min(_U1C_WR_DESIRED_H, available_h)
+
+        target_x = int(workarea.x) + max(margin, int((int(workarea.width) - target_w) / 2))
+        target_y = int(workarea.y) + margin
 
         try:
             if win.is_maximized():
@@ -13423,20 +13457,8 @@ try:
         except Exception:
             pass
 
-        margin = _U1C_WORKAREA_MARGIN
-
-        available_w = max(600, int(workarea.width) - margin * 2)
-        available_h = max(450, int(workarea.height) - margin * 2)
-
-        target_w = min(_U1C_WORKAREA_DESIRED_W, available_w)
-        target_h = min(_U1C_WORKAREA_DESIRED_H, available_h)
-
-        target_x = int(workarea.x) + max(margin, int((int(workarea.width) - target_w) / 2))
-        target_y = int(workarea.y) + margin
-
-        # Ограничиваем максимальный размер, чтобы maximize/ручное растягивание не уводили за панели.
         try:
-            geom = _u1c_wa_Gdk.Geometry()
+            geom = _u1c_wr_Gdk.Geometry()
             geom.min_width = 900
             geom.min_height = 520
             geom.max_width = available_w
@@ -13444,7 +13466,7 @@ try:
             win.set_geometry_hints(
                 None,
                 geom,
-                _u1c_wa_Gdk.WindowHints.MIN_SIZE | _u1c_wa_Gdk.WindowHints.MAX_SIZE,
+                _u1c_wr_Gdk.WindowHints.MIN_SIZE | _u1c_wr_Gdk.WindowHints.MAX_SIZE,
             )
         except Exception:
             pass
@@ -13454,8 +13476,6 @@ try:
         except Exception:
             pass
 
-        # На XWayland move/resize работают. На чистом Wayland могут быть проигнорированы,
-        # но вреда не дают. Launcher ниже принудительно предпочитает x11.
         try:
             win.resize(target_w, target_h)
         except Exception:
@@ -13473,35 +13493,34 @@ try:
 
         return False
 
-    _u1c_wa_orig_main_init = None
-
     try:
-        _u1c_wa_orig_main_init = MainWindow.__init__
+        _u1c_wr_orig_main_init = MainWindow.__init__
 
-        def _u1c_wa_patched_main_init(self, *args, **kwargs):
-            _u1c_wa_orig_main_init(self, *args, **kwargs)
+        def _u1c_wr_patched_main_init(self, *args, **kwargs):
+            _u1c_wr_orig_main_init(self, *args, **kwargs)
 
             try:
-                self.set_position(_u1c_wa_Gtk.WindowPosition.CENTER)
+                self.set_position(_u1c_wr_Gtk.WindowPosition.CENTER)
             except Exception:
                 pass
 
             try:
-                _u1c_wa_GLib.idle_add(_u1c_wa_apply_geometry, self)
-                _u1c_wa_GLib.timeout_add(100, _u1c_wa_apply_geometry, self)
-                _u1c_wa_GLib.timeout_add(400, _u1c_wa_apply_geometry, self)
-                _u1c_wa_GLib.timeout_add(900, _u1c_wa_apply_geometry, self)
-                _u1c_wa_GLib.timeout_add(1600, _u1c_wa_apply_geometry, self)
+                _u1c_wr_apply_workarea(self)
+                _u1c_wr_GLib.idle_add(_u1c_wr_apply_workarea, self)
+                _u1c_wr_GLib.timeout_add(100, _u1c_wr_apply_workarea, self)
+                _u1c_wr_GLib.timeout_add(400, _u1c_wr_apply_workarea, self)
+                _u1c_wr_GLib.timeout_add(900, _u1c_wr_apply_workarea, self)
+                _u1c_wr_GLib.timeout_add(1600, _u1c_wr_apply_workarea, self)
             except Exception:
                 pass
 
-        MainWindow.__init__ = _u1c_wa_patched_main_init
+        MainWindow.__init__ = _u1c_wr_patched_main_init
     except Exception:
         pass
 
 except Exception:
     pass
-# UPDATER1C_WINDOW_WORKAREA_BEHAVIOR_PATCH_END
+# UPDATER1C_WORKAREA_SCROLL_ROOT_PATCH_END
 
 if __name__ == "__main__":
     main()
