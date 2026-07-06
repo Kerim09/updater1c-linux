@@ -63,7 +63,7 @@ datetime = _U1CDateTimeCompat()
 
 
 APP_NAME = "Обновлятор 1C Linux"
-APP_VERSION = "1.2.7"
+APP_VERSION = "1.2.8"
 CONFIG_DIR = Path.home() / ".config" / "updater1c-linux"
 
 DEFAULT_1CESTART = "/opt/1cv8/common/1cestart"
