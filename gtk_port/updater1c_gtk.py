@@ -13298,24 +13298,22 @@ except Exception:
     pass
 # UPDATER1C_REPORT_TAB_LAYOUT_V2_PATCH_END
 
-# UPDATER1C_MAIN_WINDOW_HEIGHT_MINUS_10_V2_PATCH_BEGIN
-# Уменьшаем стартовую высоту главного окна на 10 px.
-# V2: учитывает "Linux/linux", перехватывает set_default_size/resize и дополнительно
-# подрезает уже созданное главное окно.
+# UPDATER1C_TREEVIEW_SCROLLED_HEIGHT_MINUS_10_PATCH_BEGIN
+# Уменьшаем на 10 px именно минимальную высоту основной области TreeView/ScrolledWindow,
+# чтобы главное окно не залезало за нижнюю панель COSMIC/Wayland.
 try:
-    import gi as _u1c_win_gi
+    import gi as _u1c_scroll_gi
     try:
-        _u1c_win_gi.require_version("Gtk", "3.0")
+        _u1c_scroll_gi.require_version("Gtk", "3.0")
     except Exception:
         pass
 
-    from gi.repository import Gtk as _u1c_win_Gtk
-    from gi.repository import GLib as _u1c_win_GLib
+    from gi.repository import Gtk as _u1c_scroll_Gtk
+    from gi.repository import GLib as _u1c_scroll_GLib
 
-    _U1C_MAIN_WINDOW_HEIGHT_MINUS_10_APPLIED_IDS = set()
-    _U1C_MAIN_WINDOW_PATCHED_METHODS = False
+    _U1C_TREEVIEW_SCROLLED_HEIGHT_MINUS_10_DONE = False
 
-    def _u1c_is_main_updater_window(win):
+    def _u1c_scroll_is_main_window(win):
         try:
             title = str(win.get_title() or "").lower()
         except Exception:
@@ -13323,134 +13321,179 @@ try:
 
         return ("обновлятор" in title and "1c" in title) or ("updater1c" in title)
 
-    def _u1c_minus10_height(width, height):
-        try:
-            width = int(width)
-            height = int(height)
-        except Exception:
-            return width, height
+    def _u1c_scroll_children(widget):
+        children = []
 
-        # Главные окна у нас крупные. Диалоги обычно меньше, их не трогаем.
-        if width >= 900 and height >= 550:
-            return width, max(300, height - 10)
-
-        return width, height
-
-    def _u1c_patch_window_size_methods():
-        global _U1C_MAIN_WINDOW_PATCHED_METHODS
-
-        if _U1C_MAIN_WINDOW_PATCHED_METHODS:
-            return
-
-        _U1C_MAIN_WINDOW_PATCHED_METHODS = True
+        if widget is None:
+            return children
 
         try:
-            _orig_set_default_size = _u1c_win_Gtk.Window.set_default_size
-
-            def _patched_set_default_size(self, width, height):
-                try:
-                    width2, height2 = _u1c_minus10_height(width, height)
-                    return _orig_set_default_size(self, width2, height2)
-                except Exception:
-                    return _orig_set_default_size(self, width, height)
-
-            _u1c_win_Gtk.Window.set_default_size = _patched_set_default_size
+            children.extend(widget.get_children())
         except Exception:
             pass
 
         try:
-            _orig_resize = _u1c_win_Gtk.Window.resize
+            child = widget.get_child()
+            if child is not None and child not in children:
+                children.append(child)
+        except Exception:
+            pass
 
-            def _patched_resize(self, width, height):
+        try:
+            tmp = []
+            widget.foreach(lambda child, data: data.append(child), tmp)
+            for child in tmp:
+                if child not in children:
+                    children.append(child)
+        except Exception:
+            pass
+
+        return children
+
+    def _u1c_scroll_collect(root):
+        result = []
+        stack = [root]
+        seen = set()
+
+        while stack:
+            widget = stack.pop()
+            if widget is None:
+                continue
+
+            ident = id(widget)
+            if ident in seen:
+                continue
+
+            seen.add(ident)
+            result.append(widget)
+
+            for child in _u1c_scroll_children(widget):
+                stack.append(child)
+
+        return result
+
+    def _u1c_scroll_has_treeview(widget):
+        try:
+            for child in _u1c_scroll_collect(widget):
                 try:
-                    if _u1c_is_main_updater_window(self):
-                        width2, height2 = _u1c_minus10_height(width, height)
-                        return _orig_resize(self, width2, height2)
+                    if isinstance(child, _u1c_scroll_Gtk.TreeView):
+                        return True
                 except Exception:
                     pass
-
-                return _orig_resize(self, width, height)
-
-            _u1c_win_Gtk.Window.resize = _patched_resize
         except Exception:
             pass
-
-    def _u1c_resize_existing_main_window_minus10():
-        try:
-            windows = _u1c_win_Gtk.Window.list_toplevels()
-        except Exception:
-            windows = []
-
-        for win in windows:
-            if not _u1c_is_main_updater_window(win):
-                continue
-
-            ident = id(win)
-
-            if ident in _U1C_MAIN_WINDOW_HEIGHT_MINUS_10_APPLIED_IDS:
-                continue
-
-            try:
-                width, height = win.get_size()
-            except Exception:
-                width, height = 0, 0
-
-            if width <= 0 or height <= 0:
-                try:
-                    width, height = win.get_default_size()
-                except Exception:
-                    width, height = 0, 0
-
-            if width <= 0 or height <= 0:
-                continue
-
-            width2, height2 = _u1c_minus10_height(width, height)
-
-            if height2 == height:
-                continue
-
-            try:
-                win.set_default_size(width2, height2)
-            except Exception:
-                pass
-
-            try:
-                win.resize(width2, height2)
-            except Exception:
-                pass
-
-            try:
-                win.queue_resize()
-            except Exception:
-                pass
-
-            _U1C_MAIN_WINDOW_HEIGHT_MINUS_10_APPLIED_IDS.add(ident)
 
         return False
 
-    def _u1c_start_main_window_height_patch():
-        _u1c_patch_window_size_methods()
+    def _u1c_scroll_reduce_main_tree_area():
+        global _U1C_TREEVIEW_SCROLLED_HEIGHT_MINUS_10_DONE
+
+        if _U1C_TREEVIEW_SCROLLED_HEIGHT_MINUS_10_DONE:
+            return False
 
         try:
-            _u1c_resize_existing_main_window_minus10()
-            _u1c_win_GLib.timeout_add(300, _u1c_resize_existing_main_window_minus10)
-            _u1c_win_GLib.timeout_add(800, _u1c_resize_existing_main_window_minus10)
-            _u1c_win_GLib.timeout_add(1500, _u1c_resize_existing_main_window_minus10)
-            _u1c_win_GLib.timeout_add(2500, _u1c_resize_existing_main_window_minus10)
+            windows = _u1c_scroll_Gtk.Window.list_toplevels()
+        except Exception:
+            windows = []
+
+        best = None
+        best_score = -1
+
+        for win in windows:
+            if not _u1c_scroll_is_main_window(win):
+                continue
+
+            try:
+                widgets = _u1c_scroll_collect(win)
+            except Exception:
+                widgets = []
+
+            for widget in widgets:
+                try:
+                    is_scroll = isinstance(widget, _u1c_scroll_Gtk.ScrolledWindow)
+                except Exception:
+                    is_scroll = False
+
+                if not is_scroll:
+                    continue
+
+                if not _u1c_scroll_has_treeview(widget):
+                    continue
+
+                try:
+                    width = int(widget.get_allocated_width())
+                    height = int(widget.get_allocated_height())
+                except Exception:
+                    width, height = 0, 0
+
+                # Берём самую большую прокручиваемую область с TreeView.
+                # Это основная таблица баз, а не мелкие списки/диалоги.
+                score = width * height
+
+                if width >= 700 and height >= 250 and score > best_score:
+                    best = widget
+                    best_score = score
+
+        if best is None:
+            return True
+
+        try:
+            width = int(best.get_allocated_width())
+            height = int(best.get_allocated_height())
+        except Exception:
+            width, height = 0, 0
+
+        if height <= 0:
+            return True
+
+        new_height = max(250, height - 10)
+
+        try:
+            best.set_size_request(-1, new_height)
+        except Exception:
+            pass
+
+        try:
+            best.set_min_content_height(new_height)
+        except Exception:
+            pass
+
+        try:
+            child = best.get_child()
+            if child is not None:
+                child.set_size_request(-1, new_height)
+        except Exception:
+            pass
+
+        try:
+            best.queue_resize()
+        except Exception:
+            pass
+
+        _U1C_TREEVIEW_SCROLLED_HEIGHT_MINUS_10_DONE = True
+        return False
+
+    def _u1c_scroll_start_patch():
+        try:
+            _u1c_scroll_reduce_main_tree_area()
+            _u1c_scroll_GLib.timeout_add(300, _u1c_scroll_reduce_main_tree_area)
+            _u1c_scroll_GLib.timeout_add(800, _u1c_scroll_reduce_main_tree_area)
+            _u1c_scroll_GLib.timeout_add(1500, _u1c_scroll_reduce_main_tree_area)
+            _u1c_scroll_GLib.timeout_add(2500, _u1c_scroll_reduce_main_tree_area)
         except Exception:
             pass
 
         return False
 
     try:
-        _u1c_win_GLib.idle_add(_u1c_start_main_window_height_patch)
-        _u1c_win_GLib.timeout_add(100, _u1c_start_main_window_height_patch)
+        _u1c_scroll_GLib.idle_add(_u1c_scroll_start_patch)
+        _u1c_scroll_GLib.timeout_add(200, _u1c_scroll_start_patch)
     except Exception:
         pass
 
 except Exception:
     pass
-# UPDATER1C_MAIN_WINDOW_HEIGHT_MINUS_10_V2_PATCH_END
+# UPDATER1C_TREEVIEW_SCROLLED_HEIGHT_MINUS_10_PATCH_END
 
 if __name__ == "__main__":
     main()
