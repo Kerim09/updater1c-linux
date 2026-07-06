@@ -4919,6 +4919,14 @@ class MainWindow(Gtk.Window):
         self.add(self.notebook)
 
         self._build_bases_tab()
+
+        # UPDATER1C_BASE_TABLE_INITIAL_HEIGHT_CALL_BEGIN
+        try:
+            self._u1c_set_base_table_initial_height()
+            GLib.idle_add(self._u1c_set_base_table_initial_height)
+        except Exception:
+            pass
+        # UPDATER1C_BASE_TABLE_INITIAL_HEIGHT_CALL_END
         self._build_settings_tab()
         self._build_scripts_tab()
         self._build_report_tab()
@@ -10027,6 +10035,151 @@ class MainWindow(Gtk.Window):
             self.update_bases_status()
             self._append_log(f"Удалено из списка: {name}")
 
+    # UPDATER1C_BASE_TABLE_INITIAL_HEIGHT_PATCH_BEGIN
+    def _u1c_set_base_table_initial_height(self):
+        """Задаёт стартовую высоту именно таблицы списка баз, не двигая окно."""
+        target_height = 520
+
+        def collect_widgets(root):
+            result = []
+            stack = [root]
+            seen = set()
+
+            while stack:
+                widget = stack.pop()
+                if widget is None:
+                    continue
+
+                ident = id(widget)
+                if ident in seen:
+                    continue
+
+                seen.add(ident)
+                result.append(widget)
+
+                try:
+                    stack.extend(widget.get_children())
+                except Exception:
+                    pass
+
+                try:
+                    child = widget.get_child()
+                    if child is not None:
+                        stack.append(child)
+                except Exception:
+                    pass
+
+                try:
+                    tmp = []
+                    widget.foreach(lambda child, data: data.append(child), tmp)
+                    stack.extend(tmp)
+                except Exception:
+                    pass
+
+            return result
+
+        def is_base_tree(tree):
+            try:
+                titles = []
+                for col in tree.get_columns():
+                    try:
+                        titles.append(str(col.get_title() or "").lower())
+                    except Exception:
+                        pass
+
+                joined = " ".join(titles)
+                return (
+                    "база" in joined
+                    and "конфигурац" in joined
+                    and ("путь" in joined or "сервер" in joined)
+                )
+            except Exception:
+                return False
+
+        def find_parent_scrolled(widget):
+            current = widget
+            for _ in range(12):
+                try:
+                    current = current.get_parent()
+                except Exception:
+                    return None
+
+                if current is None:
+                    return None
+
+                try:
+                    if isinstance(current, Gtk.ScrolledWindow):
+                        return current
+                except Exception:
+                    pass
+
+            return None
+
+        base_tree = None
+
+        # Сначала пробуем типовые имена.
+        for name in ("base_tree", "bases_tree", "tree_bases", "tree"):
+            try:
+                candidate = getattr(self, name, None)
+                if isinstance(candidate, Gtk.TreeView) and is_base_tree(candidate):
+                    base_tree = candidate
+                    break
+            except Exception:
+                pass
+
+        # Если имя другое — ищем по заголовкам колонок.
+        if base_tree is None:
+            try:
+                for widget in collect_widgets(self):
+                    try:
+                        if isinstance(widget, Gtk.TreeView) and is_base_tree(widget):
+                            base_tree = widget
+                            break
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        if base_tree is None:
+            return False
+
+        scroller = find_parent_scrolled(base_tree)
+        if scroller is None:
+            return False
+
+        try:
+            scroller.set_propagate_natural_height(False)
+        except Exception:
+            pass
+
+        try:
+            scroller.set_min_content_height(target_height)
+        except Exception:
+            pass
+
+        try:
+            scroller.set_size_request(-1, target_height)
+        except Exception:
+            pass
+
+        # Сам TreeView не фиксируем навсегда по максимуму, только стартовый минимум.
+        try:
+            base_tree.set_vexpand(True)
+        except Exception:
+            pass
+
+        try:
+            scroller.set_vexpand(True)
+        except Exception:
+            pass
+
+        try:
+            scroller.queue_resize()
+        except Exception:
+            pass
+
+        return False
+    # UPDATER1C_BASE_TABLE_INITIAL_HEIGHT_PATCH_END
 
     def _build_settings_tab(self):
         tab = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
