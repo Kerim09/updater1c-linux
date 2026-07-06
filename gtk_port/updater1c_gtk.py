@@ -12886,6 +12886,8 @@ try:
                 buttons.setdefault("open_reports", widget)
             elif "открыть текущий лог" in text:
                 buttons.setdefault("open_current_log", widget)
+            elif "открыть папку с платформ" in text:
+                buttons.setdefault("open_platforms", widget)
 
         return buttons
 
@@ -12897,6 +12899,7 @@ try:
             "save_log",
             "open_reports",
             "open_current_log",
+            "open_platforms",
         }
 
         for key in hide_keys:
@@ -13046,6 +13049,39 @@ try:
 
         _u1c_report_message(_u1c_report_parent(button), "Кнопка скачивания платформы не найдена.")
 
+    def _u1c_report_action_open_platforms(button, page):
+        source_buttons = _u1c_report_find_buttons_in_page(page)
+        open_platforms = source_buttons.get("open_platforms")
+
+        if open_platforms is not None and _u1c_report_click_button(open_platforms):
+            return
+
+        # Fallback: открываем стандартную папку платформ, если штатная кнопка не найдена.
+        candidates = [
+            _u1c_report_Path("/mnt/DataStore/Updater1C/1c-platforms"),
+            _u1c_report_Path.home() / "Документы" / "Updater1C" / "1c-platforms",
+            _u1c_report_Path.home() / "Documents" / "Updater1C" / "1c-platforms",
+            _u1c_report_Path.home() / "Документы" / "1c-platforms",
+            _u1c_report_Path.home() / "Documents" / "1c-platforms",
+        ]
+
+        for path in candidates:
+            try:
+                if path.exists():
+                    _u1c_report_open_path(path)
+                    return
+            except Exception:
+                pass
+
+        try:
+            candidates[0].mkdir(parents=True, exist_ok=True)
+            _u1c_report_open_path(candidates[0])
+            return
+        except Exception:
+            pass
+
+        _u1c_report_message(_u1c_report_parent(button), "Кнопка открытия папки платформ не найдена.")
+
     def _u1c_report_patch_report_page(page):
         source_buttons = _u1c_report_find_buttons_in_page(page)
 
@@ -13103,8 +13139,16 @@ try:
                 page,
             )
 
+            btn_open_platforms = _u1c_report_make_button(
+                "u1c_report_btn_open_platforms_bottom",
+                "📂 Открыть папку с платформами",
+                _u1c_report_action_open_platforms,
+                page,
+            )
+
             try:
                 bottom_row.pack_start(btn_platform, False, False, 0)
+                bottom_row.pack_start(btn_open_platforms, False, False, 0)
             except Exception:
                 pass
 
