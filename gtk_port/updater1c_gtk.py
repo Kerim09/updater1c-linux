@@ -4904,7 +4904,7 @@ class MainWindow(Gtk.Window):
                 self.set_icon_from_file(icon_path)
         except Exception:
             pass
-        self.set_default_size(1200, 700)
+        self.set_default_size(1320, 780)
         self.set_position(Gtk.WindowPosition.CENTER)
 
         self.config_path = find_config_file()
@@ -13299,6 +13299,133 @@ except Exception:
     pass
 # UPDATER1C_REPORT_TAB_LAYOUT_V2_PATCH_END
 
+# UPDATER1C_BOTTOM_SAFE_AREA_PATCH_BEGIN
+# Нижняя безопасная окантовка для COSMIC/Wayland.
+# Панель COSMIC может перекрывать нижнюю часть окна, особенно при разворачивании.
+# Вместо принудительного resize/move добавляем внутренний нижний отступ.
+try:
+    import gi as _u1c_bottom_gi
+    try:
+        _u1c_bottom_gi.require_version("Gtk", "3.0")
+    except Exception:
+        pass
+
+    from gi.repository import Gtk as _u1c_bottom_Gtk
+    from gi.repository import GLib as _u1c_bottom_GLib
+
+    def _u1c_bottom_is_main_window(win):
+        try:
+            title = str(win.get_title() or "").lower()
+        except Exception:
+            title = ""
+
+        return ("обновлятор" in title and "1c" in title) or ("updater1c" in title)
+
+    def _u1c_bottom_has_spacer(container):
+        try:
+            for child in container.get_children():
+                try:
+                    if str(child.get_name() or "") == "u1c_bottom_safe_area_spacer":
+                        return True
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        return False
+
+    def _u1c_bottom_add_safe_area_to_window(win):
+        if win is None or not _u1c_bottom_is_main_window(win):
+            return False
+
+        try:
+            root = win.get_child()
+        except Exception:
+            root = None
+
+        if root is None:
+            return False
+
+        try:
+            is_box = isinstance(root, _u1c_bottom_Gtk.Box)
+        except Exception:
+            is_box = False
+
+        if not is_box:
+            return False
+
+        if _u1c_bottom_has_spacer(root):
+            return False
+
+        spacer = _u1c_bottom_Gtk.Box(
+            orientation=_u1c_bottom_Gtk.Orientation.VERTICAL,
+            spacing=0,
+        )
+        spacer.set_name("u1c_bottom_safe_area_spacer")
+        spacer.set_size_request(-1, 48)
+        spacer.set_hexpand(True)
+        spacer.set_vexpand(False)
+        spacer.set_margin_top(0)
+        spacer.set_margin_bottom(0)
+
+        try:
+            root.pack_end(spacer, False, False, 0)
+        except Exception:
+            return False
+
+        try:
+            spacer.show_all()
+            root.queue_resize()
+            win.queue_resize()
+        except Exception:
+            pass
+
+        return True
+
+    def _u1c_bottom_scan_windows():
+        try:
+            windows = _u1c_bottom_Gtk.Window.list_toplevels()
+        except Exception:
+            windows = []
+
+        for win in windows:
+            try:
+                _u1c_bottom_add_safe_area_to_window(win)
+            except Exception:
+                pass
+
+        return True
+
+    _orig_main_init = None
+
+    try:
+        _orig_main_init = MainWindow.__init__
+
+        def _u1c_bottom_patched_main_init(self, *args, **kwargs):
+            _orig_main_init(self, *args, **kwargs)
+
+            try:
+                _u1c_bottom_add_safe_area_to_window(self)
+                _u1c_bottom_GLib.idle_add(_u1c_bottom_add_safe_area_to_window, self)
+                _u1c_bottom_GLib.timeout_add(300, _u1c_bottom_add_safe_area_to_window, self)
+                _u1c_bottom_GLib.timeout_add(1000, _u1c_bottom_add_safe_area_to_window, self)
+            except Exception:
+                pass
+
+        MainWindow.__init__ = _u1c_bottom_patched_main_init
+    except Exception:
+        pass
+
+    try:
+        _u1c_bottom_GLib.idle_add(_u1c_bottom_scan_windows)
+        _u1c_bottom_GLib.timeout_add(500, _u1c_bottom_scan_windows)
+        _u1c_bottom_GLib.timeout_add(1500, _u1c_bottom_scan_windows)
+    except Exception:
+        pass
+
+except Exception:
+    pass
+# UPDATER1C_BOTTOM_SAFE_AREA_PATCH_END
 
 if __name__ == "__main__":
     main()
