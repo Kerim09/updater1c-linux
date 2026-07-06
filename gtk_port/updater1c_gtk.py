@@ -13298,5 +13298,86 @@ except Exception:
     pass
 # UPDATER1C_REPORT_TAB_LAYOUT_V2_PATCH_END
 
+# UPDATER1C_MAIN_WINDOW_HEIGHT_MINUS_10_PATCH_BEGIN
+# Уменьшаем стартовую высоту главного окна на 10 px, чтобы окно не заходило за нижнюю панель.
+try:
+    import gi as _u1c_win_gi
+    try:
+        _u1c_win_gi.require_version("Gtk", "3.0")
+    except Exception:
+        pass
+
+    from gi.repository import Gtk as _u1c_win_Gtk
+    from gi.repository import GLib as _u1c_win_GLib
+
+    _U1C_MAIN_WINDOW_HEIGHT_MINUS_10_DONE = False
+
+    def _u1c_resize_main_window_minus_10():
+        global _U1C_MAIN_WINDOW_HEIGHT_MINUS_10_DONE
+
+        if _U1C_MAIN_WINDOW_HEIGHT_MINUS_10_DONE:
+            return False
+
+        try:
+            windows = _u1c_win_Gtk.Window.list_toplevels()
+        except Exception:
+            windows = []
+
+        for win in windows:
+            try:
+                title = str(win.get_title() or "")
+            except Exception:
+                title = ""
+
+            # Только главное окно, не диалоги.
+            if "Обновлятор 1C Linux" not in title:
+                continue
+
+            try:
+                if not win.get_visible():
+                    continue
+            except Exception:
+                pass
+
+            try:
+                width, height = win.get_size()
+            except Exception:
+                width, height = 0, 0
+
+            if width <= 0 or height <= 0:
+                try:
+                    width, height = win.get_default_size()
+                except Exception:
+                    width, height = 0, 0
+
+            if width > 0 and height > 100:
+                new_height = max(100, height - 10)
+
+                try:
+                    win.set_default_size(width, new_height)
+                except Exception:
+                    pass
+
+                try:
+                    win.resize(width, new_height)
+                except Exception:
+                    pass
+
+                _U1C_MAIN_WINDOW_HEIGHT_MINUS_10_DONE = True
+                return False
+
+        return True
+
+    try:
+        _u1c_win_GLib.idle_add(_u1c_resize_main_window_minus_10)
+        _u1c_win_GLib.timeout_add(300, _u1c_resize_main_window_minus_10)
+        _u1c_win_GLib.timeout_add(900, _u1c_resize_main_window_minus_10)
+    except Exception:
+        pass
+
+except Exception:
+    pass
+# UPDATER1C_MAIN_WINDOW_HEIGHT_MINUS_10_PATCH_END
+
 if __name__ == "__main__":
     main()
