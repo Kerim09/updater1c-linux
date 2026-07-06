@@ -4904,7 +4904,7 @@ class MainWindow(Gtk.Window):
                 self.set_icon_from_file(icon_path)
         except Exception:
             pass
-        self.set_default_size(1320, 680)
+        self.set_default_size(1320, 720)
         self.set_position(Gtk.WindowPosition.CENTER)
 
         self.config_path = find_config_file()
@@ -13299,29 +13299,30 @@ except Exception:
     pass
 # UPDATER1C_REPORT_TAB_LAYOUT_V2_PATCH_END
 
-# UPDATER1C_WORKAREA_SCROLL_ROOT_PATCH_BEGIN
-# Главное окно не должно заходить за панели рабочего стола.
-# Причина прошлых неудач: внутреннее содержимое держит слишком большой minimum size,
-# поэтому обычный set_default_size/resize не может уменьшить окно.
-# Решение: оборачиваем корневой контейнер главного окна в Gtk.ScrolledWindow.
+# UPDATER1C_BASE_TAB_PROPORTIONAL_LAYOUT_PATCH_BEGIN
+# Нормальная компоновка главной формы:
+# - НЕ прокручиваем всю форму целиком;
+# - верхние панели и нижний подвал всегда видимы;
+# - скроллинг только у центрального списка баз;
+# - при ручном растягивании/разворачивании растёт именно список баз.
 try:
-    import os as _u1c_wr_os
-    import gi as _u1c_wr_gi
+    import os as _u1c_layout_os
+    import gi as _u1c_layout_gi
 
     try:
-        _u1c_wr_gi.require_version("Gtk", "3.0")
+        _u1c_layout_gi.require_version("Gtk", "3.0")
     except Exception:
         pass
 
-    from gi.repository import Gtk as _u1c_wr_Gtk
-    from gi.repository import Gdk as _u1c_wr_Gdk
-    from gi.repository import GLib as _u1c_wr_GLib
+    from gi.repository import Gtk as _u1c_layout_Gtk
+    from gi.repository import Gdk as _u1c_layout_Gdk
+    from gi.repository import GLib as _u1c_layout_GLib
 
-    _U1C_WR_DESIRED_W = 1320
-    _U1C_WR_DESIRED_H = 680
-    _U1C_WR_MARGIN = 8
+    _U1C_LAYOUT_DESIRED_W = 1320
+    _U1C_LAYOUT_DESIRED_H = 720
+    _U1C_LAYOUT_MARGIN = 8
 
-    def _u1c_wr_is_main_window(win):
+    def _u1c_layout_is_main_window(win):
         try:
             title = str(win.get_title() or "").lower()
         except Exception:
@@ -13329,8 +13330,80 @@ try:
 
         return ("обновлятор" in title and "1c" in title) or ("updater1c" in title)
 
-    def _u1c_wr_get_workarea(win):
-        display = _u1c_wr_Gdk.Display.get_default()
+    def _u1c_layout_children(widget):
+        children = []
+
+        if widget is None:
+            return children
+
+        try:
+            children.extend(widget.get_children())
+        except Exception:
+            pass
+
+        try:
+            child = widget.get_child()
+            if child is not None and child not in children:
+                children.append(child)
+        except Exception:
+            pass
+
+        try:
+            tmp = []
+            widget.foreach(lambda child, data: data.append(child), tmp)
+            for child in tmp:
+                if child not in children:
+                    children.append(child)
+        except Exception:
+            pass
+
+        return children
+
+    def _u1c_layout_collect(root):
+        result = []
+        stack = [root]
+        seen = set()
+
+        while stack:
+            widget = stack.pop()
+            if widget is None:
+                continue
+
+            ident = id(widget)
+            if ident in seen:
+                continue
+
+            seen.add(ident)
+            result.append(widget)
+
+            for child in _u1c_layout_children(widget):
+                stack.append(child)
+
+        return result
+
+    def _u1c_layout_widget_text(widget, depth=0):
+        if widget is None or depth > 4:
+            return ""
+
+        parts = []
+
+        for meth in ("get_text", "get_label", "get_title"):
+            try:
+                value = getattr(widget, meth)()
+                if value:
+                    parts.append(str(value))
+            except Exception:
+                pass
+
+        for child in _u1c_layout_children(widget):
+            txt = _u1c_layout_widget_text(child, depth + 1)
+            if txt:
+                parts.append(txt)
+
+        return " ".join(parts)
+
+    def _u1c_layout_get_workarea(win):
+        display = _u1c_layout_Gdk.Display.get_default()
         if display is None:
             return None
 
@@ -13365,7 +13438,6 @@ try:
         if geometry is None:
             return workarea
 
-        # Если окружение отдало корректную workarea — используем её.
         try:
             if workarea is not None and (
                 int(workarea.x) != int(geometry.x)
@@ -13377,96 +13449,237 @@ try:
         except Exception:
             pass
 
-        # Fallback для COSMIC: вручную резервируем верхнюю и нижнюю панели.
-        desktop = str(_u1c_wr_os.environ.get("XDG_CURRENT_DESKTOP", "")).lower()
+        # COSMIC часто отдаёт весь монитор как workarea.
+        # Резервируем верхнюю и нижнюю панели вручную.
+        desktop = str(_u1c_layout_os.environ.get("XDG_CURRENT_DESKTOP", "")).lower()
 
         if "cosmic" in desktop:
-            rect = _u1c_wr_Gdk.Rectangle()
+            rect = _u1c_layout_Gdk.Rectangle()
             rect.x = int(geometry.x)
             rect.y = int(geometry.y) + 38
             rect.width = int(geometry.width)
-            rect.height = max(420, int(geometry.height) - 38 - 64)
+            rect.height = max(520, int(geometry.height) - 38 - 64)
             return rect
 
         return geometry
 
-    def _u1c_wr_wrap_root(win):
-        if win is None or not _u1c_wr_is_main_window(win):
-            return False
-
+    def _u1c_layout_find_notebook(win):
         try:
-            child = win.get_child()
-        except Exception:
-            child = None
-
-        if child is None:
-            return False
-
-        try:
-            if isinstance(child, _u1c_wr_Gtk.ScrolledWindow) and str(child.get_name() or "") == "u1c_main_root_scroll":
-                return True
+            for widget in _u1c_layout_collect(win):
+                try:
+                    if isinstance(widget, _u1c_layout_Gtk.Notebook):
+                        return widget
+                except Exception:
+                    pass
         except Exception:
             pass
 
-        scroller = _u1c_wr_Gtk.ScrolledWindow()
-        scroller.set_name("u1c_main_root_scroll")
-        scroller.set_policy(_u1c_wr_Gtk.PolicyType.AUTOMATIC, _u1c_wr_Gtk.PolicyType.AUTOMATIC)
-        scroller.set_overlay_scrolling(False)
-        scroller.set_hexpand(True)
-        scroller.set_vexpand(True)
+        return None
+
+    def _u1c_layout_find_bases_page(win):
+        notebook = _u1c_layout_find_notebook(win)
+
+        if notebook is None:
+            return None
 
         try:
-            scroller.set_min_content_width(900)
-            scroller.set_min_content_height(420)
+            count = notebook.get_n_pages()
+        except Exception:
+            count = 0
+
+        for index in range(count):
+            try:
+                page = notebook.get_nth_page(index)
+                tab = notebook.get_tab_label(page)
+                tab_text = _u1c_layout_widget_text(tab).lower().replace("ё", "е")
+            except Exception:
+                continue
+
+            if "баз" in tab_text:
+                return page
+
+        return None
+
+    def _u1c_layout_is_base_tree(tree):
+        try:
+            titles = []
+            for col in tree.get_columns():
+                try:
+                    titles.append(str(col.get_title() or "").lower())
+                except Exception:
+                    pass
+
+            joined = " ".join(titles)
+            return (
+                "база" in joined
+                and "конфигурац" in joined
+                and ("путь" in joined or "сервер" in joined)
+            )
+        except Exception:
+            return False
+
+    def _u1c_layout_find_base_tree(win):
+        # Сначала по атрибутам MainWindow.
+        for name in ("base_tree", "bases_tree", "tree_bases"):
+            try:
+                candidate = getattr(win, name, None)
+                if isinstance(candidate, _u1c_layout_Gtk.TreeView) and _u1c_layout_is_base_tree(candidate):
+                    return candidate
+            except Exception:
+                pass
+
+        try:
+            for widget in _u1c_layout_collect(win):
+                try:
+                    if isinstance(widget, _u1c_layout_Gtk.TreeView) and _u1c_layout_is_base_tree(widget):
+                        return widget
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        return None
+
+    def _u1c_layout_parent_chain(widget, limit=20):
+        result = []
+        current = widget
+
+        for _ in range(limit):
+            try:
+                current = current.get_parent()
+            except Exception:
+                break
+
+            if current is None:
+                break
+
+            result.append(current)
+
+        return result
+
+    def _u1c_layout_find_parent_scroller(widget):
+        for parent in _u1c_layout_parent_chain(widget):
+            try:
+                if isinstance(parent, _u1c_layout_Gtk.ScrolledWindow):
+                    return parent
+            except Exception:
+                pass
+
+        return None
+
+    def _u1c_layout_mark_base_tab_stretch(win):
+        page = _u1c_layout_find_bases_page(win)
+        tree = _u1c_layout_find_base_tree(win)
+
+        if page is None or tree is None:
+            return False
+
+        scroller = _u1c_layout_find_parent_scroller(tree)
+
+        if scroller is None:
+            return False
+
+        # Центральный список баз — единственный элемент, который должен съедать свободную высоту.
+        try:
+            scroller.set_policy(_u1c_layout_Gtk.PolicyType.AUTOMATIC, _u1c_layout_Gtk.PolicyType.AUTOMATIC)
+            scroller.set_overlay_scrolling(False)
+            scroller.set_propagate_natural_height(False)
+            scroller.set_min_content_height(260)
+            scroller.set_size_request(-1, 260)
+            scroller.set_vexpand(True)
+            scroller.set_hexpand(True)
         except Exception:
             pass
 
         try:
-            win.remove(child)
-            scroller.add(child)
-            win.add(scroller)
-            scroller.show_all()
-            return True
+            tree.set_vexpand(True)
+            tree.set_hexpand(True)
         except Exception:
+            pass
+
+        # Все родители между таблицей и страницей вкладки тоже должны разрешать вертикальное расширение.
+        for parent in _u1c_layout_parent_chain(scroller):
+            if parent is page:
+                break
+
+            try:
+                parent.set_vexpand(True)
+            except Exception:
+                pass
+
+        # На самой вкладке Базы разрешаем растягивание.
+        try:
+            page.set_vexpand(True)
+            page.set_hexpand(True)
+        except Exception:
+            pass
+
+        # Кнопочные ряды не должны забирать вертикальное пространство.
+        try:
+            for widget in _u1c_layout_collect(page):
+                text = _u1c_layout_widget_text(widget).lower().replace("ё", "е")
+
+                if not text:
+                    continue
+
+                is_button_row = (
+                    "добавить базу" in text
+                    or "свойства" in text
+                    or "проверить настройки" in text
+                    or "скачать обновления" in text
+                    or "архивировать базу" in text
+                    or "отметить все" in text
+                    or "снять все" in text
+                    or "синхронизировать со списком баз" in text
+                )
+
+                if is_button_row:
+                    try:
+                        widget.set_vexpand(False)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        return True
+
+    def _u1c_layout_apply_window_geometry(win):
+        if win is None or not _u1c_layout_is_main_window(win):
             return False
 
-    def _u1c_wr_apply_workarea(win):
-        if win is None or not _u1c_wr_is_main_window(win):
-            return False
+        workarea = _u1c_layout_get_workarea(win)
 
-        _u1c_wr_wrap_root(win)
-
-        workarea = _u1c_wr_get_workarea(win)
         if workarea is None:
             return False
 
-        margin = _U1C_WR_MARGIN
+        margin = _U1C_LAYOUT_MARGIN
 
         available_w = max(900, int(workarea.width) - margin * 2)
-        available_h = max(520, int(workarea.height) - margin * 2)
+        available_h = max(560, int(workarea.height) - margin * 2)
 
-        target_w = min(_U1C_WR_DESIRED_W, available_w)
-        target_h = min(_U1C_WR_DESIRED_H, available_h)
+        target_w = min(_U1C_LAYOUT_DESIRED_W, available_w)
+        target_h = min(_U1C_LAYOUT_DESIRED_H, available_h)
 
         target_x = int(workarea.x) + max(margin, int((int(workarea.width) - target_w) / 2))
         target_y = int(workarea.y) + margin
 
         try:
             if win.is_maximized():
+                # Не даём WM растянуть окно под панели. Визуально это всё равно почти максимум рабочей области.
                 win.unmaximize()
         except Exception:
             pass
 
         try:
-            geom = _u1c_wr_Gdk.Geometry()
+            geom = _u1c_layout_Gdk.Geometry()
             geom.min_width = 900
-            geom.min_height = 520
+            geom.min_height = 560
             geom.max_width = available_w
             geom.max_height = available_h
             win.set_geometry_hints(
                 None,
                 geom,
-                _u1c_wr_Gdk.WindowHints.MIN_SIZE | _u1c_wr_Gdk.WindowHints.MAX_SIZE,
+                _u1c_layout_Gdk.WindowHints.MIN_SIZE | _u1c_layout_Gdk.WindowHints.MAX_SIZE,
             )
         except Exception:
             pass
@@ -13493,34 +13706,47 @@ try:
 
         return False
 
+    def _u1c_layout_apply_all(win):
+        try:
+            _u1c_layout_mark_base_tab_stretch(win)
+        except Exception:
+            pass
+
+        try:
+            _u1c_layout_apply_window_geometry(win)
+        except Exception:
+            pass
+
+        return False
+
     try:
-        _u1c_wr_orig_main_init = MainWindow.__init__
+        _u1c_layout_orig_main_init = MainWindow.__init__
 
-        def _u1c_wr_patched_main_init(self, *args, **kwargs):
-            _u1c_wr_orig_main_init(self, *args, **kwargs)
+        def _u1c_layout_patched_main_init(self, *args, **kwargs):
+            _u1c_layout_orig_main_init(self, *args, **kwargs)
 
             try:
-                self.set_position(_u1c_wr_Gtk.WindowPosition.CENTER)
+                self.set_position(_u1c_layout_Gtk.WindowPosition.CENTER)
             except Exception:
                 pass
 
             try:
-                _u1c_wr_apply_workarea(self)
-                _u1c_wr_GLib.idle_add(_u1c_wr_apply_workarea, self)
-                _u1c_wr_GLib.timeout_add(100, _u1c_wr_apply_workarea, self)
-                _u1c_wr_GLib.timeout_add(400, _u1c_wr_apply_workarea, self)
-                _u1c_wr_GLib.timeout_add(900, _u1c_wr_apply_workarea, self)
-                _u1c_wr_GLib.timeout_add(1600, _u1c_wr_apply_workarea, self)
+                _u1c_layout_apply_all(self)
+                _u1c_layout_GLib.idle_add(_u1c_layout_apply_all, self)
+                _u1c_layout_GLib.timeout_add(100, _u1c_layout_apply_all, self)
+                _u1c_layout_GLib.timeout_add(400, _u1c_layout_apply_all, self)
+                _u1c_layout_GLib.timeout_add(900, _u1c_layout_apply_all, self)
+                _u1c_layout_GLib.timeout_add(1600, _u1c_layout_apply_all, self)
             except Exception:
                 pass
 
-        MainWindow.__init__ = _u1c_wr_patched_main_init
+        MainWindow.__init__ = _u1c_layout_patched_main_init
     except Exception:
         pass
 
 except Exception:
     pass
-# UPDATER1C_WORKAREA_SCROLL_ROOT_PATCH_END
+# UPDATER1C_BASE_TAB_PROPORTIONAL_LAYOUT_PATCH_END
 
 if __name__ == "__main__":
     main()
