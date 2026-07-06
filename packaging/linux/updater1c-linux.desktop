@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Обновлятор 1C Linux
+Comment=Обновление баз 1С в Linux
+Exec=/usr/local/bin/updater1c-linux
+Terminal=false
+Categories=Office;Development;
+Icon=/opt/updater1c-linux/resources/icons/updater1c-linux.png
+StartupNotify=true
