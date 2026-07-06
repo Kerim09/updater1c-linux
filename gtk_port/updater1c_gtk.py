@@ -4377,26 +4377,6 @@ class PlatformDownloadDialog(Gtk.Dialog):
 
     def _scrolled(self, child):
         sw = Gtk.ScrolledWindow()
-
-        # UPDATER1C_BASES_SCROLLER_COMPACT_PATCH_BEGIN
-        # Стартовая высота именно списка баз. При ручном растягивании окна область растягивается.
-        try:
-            sw.set_propagate_natural_height(False)
-        except Exception:
-            pass
-        try:
-            sw.set_min_content_height(420)
-        except Exception:
-            pass
-        try:
-            sw.set_size_request(-1, 420)
-        except Exception:
-            pass
-        try:
-            sw.set_vexpand(True)
-        except Exception:
-            pass
-        # UPDATER1C_BASES_SCROLLER_COMPACT_PATCH_END
         sw.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
         sw.set_size_request(-1, 150)
         sw.add(child)
@@ -4924,15 +4904,7 @@ class MainWindow(Gtk.Window):
                 self.set_icon_from_file(icon_path)
         except Exception:
             pass
-        self.set_default_size(1120, 660)
-
-        # UPDATER1C_MAIN_WINDOW_CENTER_PATCH_BEGIN
-        # На Wayland это hint, на XWayland обычно центрируется корректнее.
-        try:
-            self.set_position(Gtk.WindowPosition.CENTER)
-        except Exception:
-            pass
-        # UPDATER1C_MAIN_WINDOW_CENTER_PATCH_END
+        self.set_default_size(1180, 700)
         self.set_position(Gtk.WindowPosition.CENTER)
 
         self.config_path = find_config_file()
@@ -13327,6 +13299,209 @@ except Exception:
     pass
 # UPDATER1C_REPORT_TAB_LAYOUT_V2_PATCH_END
 
+# UPDATER1C_WINDOW_WORKAREA_BEHAVIOR_PATCH_BEGIN
+# Поведение главного окна по рабочей области монитора:
+# - верх окна после верхней панели, если она есть;
+# - если верхней панели нет — по верхней границе;
+# - низ окна не должен заходить за нижнюю панель;
+# - если окно больше доступной области — ужимаем;
+# - если окно меньше — оставляем желаемый размер.
+try:
+    import os as _u1c_wa_os
+    import gi as _u1c_wa_gi
+
+    try:
+        _u1c_wa_gi.require_version("Gtk", "3.0")
+    except Exception:
+        pass
+
+    from gi.repository import Gtk as _u1c_wa_Gtk
+    from gi.repository import Gdk as _u1c_wa_Gdk
+    from gi.repository import GLib as _u1c_wa_GLib
+
+    _U1C_WORKAREA_DESIRED_W = 1180
+    _U1C_WORKAREA_DESIRED_H = 700
+    _U1C_WORKAREA_MARGIN = 8
+
+    def _u1c_wa_is_main_window(win):
+        try:
+            title = str(win.get_title() or "").lower()
+        except Exception:
+            title = ""
+
+        return ("обновлятор" in title and "1c" in title) or ("updater1c" in title)
+
+    def _u1c_wa_get_monitor_rects(win):
+        display = _u1c_wa_Gdk.Display.get_default()
+        if display is None:
+            return None, None
+
+        monitor = None
+
+        try:
+            gdk_window = win.get_window()
+            if gdk_window is not None:
+                monitor = display.get_monitor_at_window(gdk_window)
+        except Exception:
+            monitor = None
+
+        if monitor is None:
+            try:
+                monitor = display.get_primary_monitor()
+            except Exception:
+                monitor = None
+
+        if monitor is None:
+            return None, None
+
+        try:
+            geometry = monitor.get_geometry()
+        except Exception:
+            geometry = None
+
+        try:
+            workarea = monitor.get_workarea()
+        except Exception:
+            workarea = None
+
+        return geometry, workarea
+
+    def _u1c_wa_effective_workarea(win):
+        geometry, workarea = _u1c_wa_get_monitor_rects(win)
+
+        if geometry is None:
+            return None
+
+        # Если WM отдал нормальную рабочую область, используем её.
+        if workarea is not None:
+            try:
+                if (
+                    int(workarea.width) > 0
+                    and int(workarea.height) > 0
+                    and (
+                        int(workarea.x) != int(geometry.x)
+                        or int(workarea.y) != int(geometry.y)
+                        or int(workarea.width) != int(geometry.width)
+                        or int(workarea.height) != int(geometry.height)
+                    )
+                ):
+                    return workarea
+            except Exception:
+                pass
+
+        # Fallback для COSMIC/Wayland, если get_workarea возвращает весь монитор
+        # и не вычитает верхнюю/нижнюю панель.
+        desktop = str(_u1c_wa_os.environ.get("XDG_CURRENT_DESKTOP", "")).lower()
+        session = str(_u1c_wa_os.environ.get("XDG_SESSION_TYPE", "")).lower()
+
+        if "cosmic" in desktop:
+            top_reserved = 38
+            bottom_reserved = 58
+
+            rect = _u1c_wa_Gdk.Rectangle()
+            rect.x = int(geometry.x)
+            rect.y = int(geometry.y) + top_reserved
+            rect.width = int(geometry.width)
+            rect.height = max(400, int(geometry.height) - top_reserved - bottom_reserved)
+            return rect
+
+        # Для прочих окружений без явной рабочей области — весь монитор.
+        return geometry
+
+    def _u1c_wa_apply_geometry(win):
+        if win is None or not _u1c_wa_is_main_window(win):
+            return False
+
+        workarea = _u1c_wa_effective_workarea(win)
+
+        if workarea is None:
+            return False
+
+        try:
+            if win.is_maximized():
+                win.unmaximize()
+        except Exception:
+            pass
+
+        margin = _U1C_WORKAREA_MARGIN
+
+        available_w = max(600, int(workarea.width) - margin * 2)
+        available_h = max(450, int(workarea.height) - margin * 2)
+
+        target_w = min(_U1C_WORKAREA_DESIRED_W, available_w)
+        target_h = min(_U1C_WORKAREA_DESIRED_H, available_h)
+
+        target_x = int(workarea.x) + max(margin, int((int(workarea.width) - target_w) / 2))
+        target_y = int(workarea.y) + margin
+
+        # Ограничиваем максимальный размер, чтобы maximize/ручное растягивание не уводили за панели.
+        try:
+            geom = _u1c_wa_Gdk.Geometry()
+            geom.min_width = 900
+            geom.min_height = 520
+            geom.max_width = available_w
+            geom.max_height = available_h
+            win.set_geometry_hints(
+                None,
+                geom,
+                _u1c_wa_Gdk.WindowHints.MIN_SIZE | _u1c_wa_Gdk.WindowHints.MAX_SIZE,
+            )
+        except Exception:
+            pass
+
+        try:
+            win.set_default_size(target_w, target_h)
+        except Exception:
+            pass
+
+        # На XWayland move/resize работают. На чистом Wayland могут быть проигнорированы,
+        # но вреда не дают. Launcher ниже принудительно предпочитает x11.
+        try:
+            win.resize(target_w, target_h)
+        except Exception:
+            pass
+
+        try:
+            win.move(target_x, target_y)
+        except Exception:
+            pass
+
+        try:
+            win.queue_resize()
+        except Exception:
+            pass
+
+        return False
+
+    _u1c_wa_orig_main_init = None
+
+    try:
+        _u1c_wa_orig_main_init = MainWindow.__init__
+
+        def _u1c_wa_patched_main_init(self, *args, **kwargs):
+            _u1c_wa_orig_main_init(self, *args, **kwargs)
+
+            try:
+                self.set_position(_u1c_wa_Gtk.WindowPosition.CENTER)
+            except Exception:
+                pass
+
+            try:
+                _u1c_wa_GLib.idle_add(_u1c_wa_apply_geometry, self)
+                _u1c_wa_GLib.timeout_add(100, _u1c_wa_apply_geometry, self)
+                _u1c_wa_GLib.timeout_add(400, _u1c_wa_apply_geometry, self)
+                _u1c_wa_GLib.timeout_add(900, _u1c_wa_apply_geometry, self)
+                _u1c_wa_GLib.timeout_add(1600, _u1c_wa_apply_geometry, self)
+            except Exception:
+                pass
+
+        MainWindow.__init__ = _u1c_wa_patched_main_init
+    except Exception:
+        pass
+
+except Exception:
+    pass
+# UPDATER1C_WINDOW_WORKAREA_BEHAVIOR_PATCH_END
 
 if __name__ == "__main__":
     main()
