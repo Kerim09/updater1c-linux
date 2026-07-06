@@ -4377,6 +4377,26 @@ class PlatformDownloadDialog(Gtk.Dialog):
 
     def _scrolled(self, child):
         sw = Gtk.ScrolledWindow()
+
+        # UPDATER1C_BASES_SCROLLER_COMPACT_PATCH_BEGIN
+        # Стартовая высота именно списка баз. При ручном растягивании окна область растягивается.
+        try:
+            sw.set_propagate_natural_height(False)
+        except Exception:
+            pass
+        try:
+            sw.set_min_content_height(420)
+        except Exception:
+            pass
+        try:
+            sw.set_size_request(-1, 420)
+        except Exception:
+            pass
+        try:
+            sw.set_vexpand(True)
+        except Exception:
+            pass
+        # UPDATER1C_BASES_SCROLLER_COMPACT_PATCH_END
         sw.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
         sw.set_size_request(-1, 150)
         sw.add(child)
@@ -4904,11 +4924,10 @@ class MainWindow(Gtk.Window):
                 self.set_icon_from_file(icon_path)
         except Exception:
             pass
-        self.set_default_size(1120, 680)
+        self.set_default_size(1120, 660)
 
         # UPDATER1C_MAIN_WINDOW_CENTER_PATCH_BEGIN
-        # Просим GTK/композитор открыть главное окно по центру.
-        # На Wayland/COSMIC это именно hint, без принудительного move().
+        # На Wayland это hint, на XWayland обычно центрируется корректнее.
         try:
             self.set_position(Gtk.WindowPosition.CENTER)
         except Exception:
