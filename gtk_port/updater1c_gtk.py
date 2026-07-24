@@ -63,7 +63,7 @@ datetime = _U1CDateTimeCompat()
 
 
 APP_NAME = "Обновлятор 1C Linux"
-APP_VERSION = "1.2.8"
+APP_VERSION = "1.2.9"
 CONFIG_DIR = Path.home() / ".config" / "updater1c-linux"
 
 DEFAULT_1CESTART = "/opt/1cv8/common/1cestart"
@@ -116,6 +116,50 @@ def normalize_base_kind_and_connect(base: dict) -> tuple[str, str]:
 
 
 
+
+
+# UPDATER1C_EMPTY_BASE_LIST_FIX_20260710
+def u1c_file_base_path_exists(connect: str) -> bool:
+    """Проверяет существование каталога файловой базы без изменения списка 1С."""
+    try:
+        value = str(connect or "").strip()
+
+        match = re.search(
+            r'(?i)(?:^|;)\s*File\s*=\s*"((?:[^"]|"")*)"',
+            value,
+        )
+        if match:
+            value = match.group(1).replace('""', '"')
+
+        value = value.strip().strip('"').strip()
+        if not value:
+            return False
+
+        return Path(value).expanduser().is_dir()
+    except Exception:
+        return False
+
+
+def u1c_base_record_is_available(base) -> bool:
+    """
+    Серверные и web-базы сохраняем всегда.
+    Файловые базы показываем только при существующем каталоге.
+    """
+    if not isinstance(base, dict):
+        return False
+
+    try:
+        kind, connect = normalize_base_kind_and_connect(base)
+    except Exception:
+        kind = str(base.get("kind") or base.get("type") or "file").strip().lower()
+        connect = str(base.get("connect") or "").strip()
+
+    kind = str(kind or "").strip().lower()
+
+    if kind not in ("file", "файловая", "filesystem"):
+        return True
+
+    return u1c_file_base_path_exists(connect)
 
 
 def platform_search_roots():
@@ -4916,7 +4960,23 @@ class MainWindow(Gtk.Window):
 
         self.config_path = find_config_file()
         self.config = load_json(self.config_path, {})
-        self.bases = self.config.get("bases", [])
+        # UPDATER1C_EMPTY_BASE_LIST_LOAD_FILTER_20260710
+        _stored_bases = self.config.get("bases", [])
+        if not isinstance(_stored_bases, list):
+            _stored_bases = []
+
+        self.bases = [
+            base
+            for base in _stored_bases
+            if u1c_base_record_is_available(base)
+        ]
+
+        if len(self.bases) != len(_stored_bases):
+            self.config["bases"] = self.bases
+            try:
+                save_json(self.config_path, self.config)
+            except Exception:
+                pass
         self.settings = self.config.get("settings", {})
 
         self.connect("destroy", Gtk.main_quit)
@@ -5178,17 +5238,6 @@ class MainWindow(Gtk.Window):
 
                 group = b.get("group") or "Без группы"
                 parent = get_group_iter(group)
-                append_base(parent, b, idx)
-        else:
-            demo = [
-                {"name": "AccountingBase", "kind": "file", "connect": "/mnt/Data/bases/AccountingBase", "platform_version": "8.3", "group": "Мое"},
-                {"name": "Conversion", "kind": "file", "config_synonym": "Конвертация данных, редакция 2.1", "config_version": "2.1.8.2", "connect": "/mnt/Data/bases/Conversion", "platform_version": "8.3", "group": "Мое"},
-            ]
-
-            self.bases = demo
-
-            for idx, b in enumerate(self.bases):
-                parent = get_group_iter(b.get("group") or "Мое")
                 append_base(parent, b, idx)
 
         def expand_all(parent=None):
@@ -5571,44 +5620,214 @@ class MainWindow(Gtk.Window):
             mode = "ENTERPRISE"
         return self.launch_selected_base(mode)
 
-    def guess_update_program_name_from_metadata(self, config_name="", config_synonym="", base_name=""):
-        """Определяет код программы обновлений 1С по имени/синониму конфигурации."""
-        raw = " ".join(str(x or "") for x in [config_name, config_synonym, base_name])
-        hay = raw.lower()
-        compact = hay.replace(" ", "").replace("_", "").replace("-", "").replace(",", "")
 
-        # Базовую бухгалтерию проверяем раньше обычной.
-        if (
-            "бухгалтерияпредприятиябазовая" in compact
-            or "бухгалтерияпредприятиябаз" in compact
-            or ("бухгалтер" in hay and "базов" in hay)
-            or "accountingbase" in compact
+    def guess_update_program_name_from_metadata(
+        self,
+        config_name="",
+        config_synonym="",
+        base_name="",
+        config_version="",
+    ):
+        # Определяет programName update-api с учетом Базовая/ПРОФ/КОРП.
+        raw = " ".join(
+            str(value or "")
+            for value in (
+                config_name,
+                config_synonym,
+                base_name,
+            )
+        )
+        hay = raw.casefold().replace("ё", "е")
+        compact = re.sub(r"[^0-9a-zа-я]+", "", hay)
+
+        match = re.match(r"\s*(\d+)", str(config_version or ""))
+        major = int(match.group(1)) if match else 0
+
+        is_basic = any(
+            token in compact
+            for token in ("базовая", "базовый", "base")
+        )
+        is_corp = any(
+            token in compact
+            for token in ("корп", "corp")
+        )
+
+        # БГУ раньше общей бухгалтерии.
+        if any(
+            token in compact
+            for token in (
+                "бухгалтериягосударственногоучреждения",
+                "stateaccounting",
+            )
         ):
-            return "AccountingBase"
+            if is_basic:
+                return "StateAccountingBase"
+            if is_corp:
+                return "StateAccountingCorp"
+            return "StateAccounting"
 
-        if "бухгалтер" in hay or "accounting" in compact:
+        # Бухгалтерия предприятия.
+        if any(
+            token in compact
+            for token in (
+                "бухгалтерияпредприятия",
+                "accounting",
+            )
+        ):
+            if is_basic or "accountingbase" in compact:
+                return "AccountingBase"
+            if is_corp or "бухгалтерияпредприятиякорп" in compact:
+                return "AccountingCorp"
             return "Accounting"
 
-        if (
-            "управлениеторговлей" in compact
-            or "торговл" in hay
-            or "trade" in compact
+        # ЗКГУ раньше общей ЗУП.
+        if any(
+            token in compact
+            for token in (
+                "зарплатаикадрыгосударственногоучреждения",
+                "зарплатакадрыгосударственногоучреждения",
+                "statehrm",
+            )
         ):
-            return "Trade"
+            return "StateHRM"
 
-        if "документооборот" in hay or "document" in compact or "docmng" in compact:
-            return "DocumentManagement"
-
-        if "зарплата" in hay or "зуп" in hay or "hrm" in compact or "salary" in compact:
+        # ЗУП.
+        if any(
+            token in compact
+            for token in (
+                "зарплатаиуправлениеперсоналом",
+                "зарплатауправлениеперсоналом",
+                "зуп",
+                "hrm",
+            )
+        ):
+            if is_basic or "hrmbase" in compact:
+                return "HRMBase"
+            if is_corp or "hrmcorp" in compact:
+                return "HRMCorp"
             return "HRM"
 
-        if "управлениенашейфирмой" in compact or "унф" in hay or "smallbusiness" in compact:
+        # Документооборот государственного учреждения.
+        if any(
+            token in compact
+            for token in (
+                "документооборотгосударственногоучреждения",
+                "budgetdocmng",
+            )
+        ):
+            return "BudgetDocMng"
+
+        # Документооборот.
+        if any(
+            token in compact
+            for token in (
+                "документооборот",
+                "docmng",
+                "documentmanagement",
+            )
+        ):
+            if is_corp:
+                if (
+                    "docmngcorp3" in compact
+                    or "редакция30" in compact
+                    or "ред30" in compact
+                    or major >= 3
+                ):
+                    return "DocMngCorp3"
+                return "DocMngCorp"
+            return "DocMng"
+
+        # Управление торговлей.
+        if any(
+            token in compact
+            for token in ("управлениеторговлей", "trade")
+        ):
+            if is_basic or "tradebase" in compact:
+                return "TradeBase"
+            return "Trade"
+
+        # Розница.
+        if any(
+            token in compact
+            for token in ("розница", "retail")
+        ):
+            if is_basic or "retailbase" in compact:
+                return "RetailBase"
+            return "Retail"
+
+        # УНФ.
+        if any(
+            token in compact
+            for token in (
+                "управлениенашейфирмой",
+                "управлениенебольшойфирмой",
+                "унф",
+                "smallbusiness",
+            )
+        ):
+            if is_basic or "smallbusinessbase" in compact:
+                return "SmallBusinessBase"
             return "SmallBusiness"
 
+        # Бюджет.
+        if any(
+            token in compact
+            for token in ("бюджет", "budget")
+        ):
+            if is_basic or "budgetbase" in compact:
+                return "BudgetBase"
+            return "Budget"
+
+        # Комплексная автоматизация 2.
+        if any(
+            token in compact
+            for token in (
+                "комплекснаяавтоматизация",
+                "enterprise20",
+            )
+        ):
+            return "Enterprise20"
+
+        # ERP / холдинг.
+        if any(
+            token in compact
+            for token in (
+                "erpуправлениехолдингом",
+                "управлениехолдингомerp",
+                "erpholding",
+            )
+        ):
+            if "33" in compact:
+                return "ERPHolding33"
+            if "32" in compact:
+                return "ERPHolding32"
+            if "31" in compact:
+                return "ERPHolding31"
+            return "ERPHolding"
+
+        if any(
+            token in compact
+            for token in (
+                "управлениехолдингом",
+                "holdingmanagement",
+            )
+        ):
+            return "HoldingManagement"
+
         if "erp" in compact:
-            return "ERP"
+            return "EnterpriseERP20"
+
+        if any(
+            token in compact
+            for token in (
+                "управлениенормативносправочнойинформацией",
+                "mdmcorp",
+            )
+        ):
+            return "MDMCorp"
 
         return ""
+
 
     def refresh_bases_tree_keep_selected(self, base):
         """Сохраняет конфиг и перерисовывает список баз после проверки настроек."""
@@ -9653,6 +9872,12 @@ class MainWindow(Gtk.Window):
         if kind == "file":
             connect = str(Path(connect).expanduser()) if connect else ""
 
+            # UPDATER1C_EMPTY_BASE_LIST_SYNC_FILTER_20260710
+            # В списке 1С могут оставаться записи от удалённых каталогов.
+            # Такие базы в Обновлятор не импортируем.
+            if not u1c_file_base_path_exists(connect):
+                return None
+
         item = {
             "name": name,
             "group": group,
@@ -10512,7 +10737,7 @@ class MainWindow(Gtk.Window):
 
             base = self.bases[idx]
             name = base.get("name") or f"base_{idx}"
-            program = base.get("update_program_name") or ""
+            program = self.guess_update_program_for_base(base)
             version = base.get("config_version") or ""
             platform_version = base.get("platform_version") or "8.3"
 
@@ -10791,15 +11016,46 @@ class MainWindow(Gtk.Window):
         base["password"] = password
         return base
 
+
     def guess_update_program_for_base(self, base: dict) -> str:
-        program = str(base.get("update_program_name") or base.get("program") or "").strip()
-        if program:
-            return program
-        return self.guess_update_program_name_from_metadata(
-            base.get("config_name") or "",
-            base.get("config_synonym") or "",
-            base.get("name") or "",
+        # Автоматический код перепроверяется по метаданным перед операцией.
+        current = str(
+            base.get("update_program_name")
+            or base.get("program")
+            or ""
+        ).strip()
+
+        if bool(base.get("update_program_manual")) and current:
+            return current
+
+        detected = self.guess_update_program_name_from_metadata(
+            base.get("config_name")
+            or base.get("configuration_name")
+            or "",
+            base.get("config_synonym")
+            or base.get("configuration_synonym")
+            or "",
+            base.get("name")
+            or "",
+            base.get("config_version")
+            or base.get("configuration_version")
+            or base.get("version")
+            or "",
         )
+
+        program = detected or current
+
+        if program:
+            for field in (
+                "update_program_name",
+                "update_code",
+                "program_name",
+                "program_code",
+            ):
+                base[field] = program
+
+        return program
+
 
     def update_base_version_after_release(self, idx: int, release_version: str, log):
         new_version = (release_version or "").replace("_", ".").strip()
@@ -13671,6 +13927,35 @@ try:
 except Exception:
     pass
 # UPDATER1C_BASES_FOOTER_GUARD_PATCH_END
+
+# UPDATER1C_IBASES_HOOK_BEGIN_20260710_V2
+try:
+    from u1c_ibases_bidirectional import install as _u1c_install_ibases_sync
+    _u1c_install_ibases_sync(MainWindow)
+except Exception as _u1c_ibases_hook_error:
+    print(
+        "UPDATER1C: не удалось установить двустороннюю синхронизацию:",
+        type(_u1c_ibases_hook_error).__name__,
+        _u1c_ibases_hook_error,
+    )
+    import traceback as _u1c_traceback
+    _u1c_traceback.print_exc()
+# UPDATER1C_IBASES_HOOK_END_20260710_V2
+
+
+# UPDATER1C_CREDENTIAL_SESSION_HOOK_BEGIN_20260723_V1
+try:
+    from u1c_credentials_session import install as _u1c_install_credentials_session
+    _u1c_install_credentials_session(MainWindow)
+except Exception as _u1c_credentials_session_error:
+    print(
+        "UPDATER1C: не удалось установить работу с защищённым хранилищем:",
+        type(_u1c_credentials_session_error).__name__,
+        _u1c_credentials_session_error,
+    )
+    import traceback as _u1c_credentials_traceback
+    _u1c_credentials_traceback.print_exc()
+# UPDATER1C_CREDENTIAL_SESSION_HOOK_END_20260723_V1
 
 if __name__ == "__main__":
     main()

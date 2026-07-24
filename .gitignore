@@ -56,3 +56,6 @@ _patch_backups/
 *broken_headless*
 *~
 legacy/patch_backups/
+*.before_*
+*.backup
+*.backup_*

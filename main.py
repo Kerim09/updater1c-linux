@@ -8591,4 +8591,167 @@ def main():
         win.setWindowIcon(QIcon(icon_path))
     win.show()
     sys.exit(app.exec())
+
+
+# UPDATER1C_NO_GHOST_BASES_PATCH_BEGIN
+# Не показываем и не сохраняем "призрачные" файловые базы.
+# После чистой установки список баз должен быть пустым, пока пользователь сам не добавит
+# базу или явно не нажмёт "Синхронизировать со списком баз 1С".
+def _u1c_is_existing_file_base_record(record):
+    import os
+
+    if not isinstance(record, dict):
+        return True
+
+    base_type = str(
+        record.get("type")
+        or record.get("Тип")
+        or record.get("ТипБазы")
+        or record.get("kind")
+        or ""
+    ).lower()
+
+    path_value = (
+        record.get("path")
+        or record.get("Путь")
+        or record.get("ПутьКБазе")
+        or record.get("ПутьСервер")
+        or record.get("server_path")
+        or record.get("connection")
+        or ""
+    )
+
+    path_value = str(path_value).strip()
+
+    # Серверные базы и подключения без локального пути не проверяем через os.path.exists.
+    if base_type and base_type not in ("file", "файловая", "filesystem"):
+        return True
+
+    if not path_value.startswith("/"):
+        return True
+
+    return os.path.isdir(path_value) or os.path.isfile(path_value)
+
+
+def _u1c_drop_ghost_file_bases_from_list(items):
+    if not isinstance(items, list):
+        return items
+
+    cleaned = []
+    changed = False
+
+    for item in items:
+        if isinstance(item, dict) and not _u1c_is_existing_file_base_record(item):
+            changed = True
+            continue
+        cleaned.append(item)
+
+    if changed:
+        items[:] = cleaned
+
+    return items
+
+
+def _u1c_drop_ghost_file_bases_from_object(obj):
+    # Чистим типовые структуры self.bases / self.config["bases"] / settings["bases"].
+    for attr_name in (
+        "bases",
+        "base_list",
+        "databases",
+        "ibases",
+        "settings",
+        "config",
+        "data",
+    ):
+        try:
+            value = getattr(obj, attr_name)
+        except Exception:
+            continue
+
+        if isinstance(value, list):
+            _u1c_drop_ghost_file_bases_from_list(value)
+
+        if isinstance(value, dict):
+            for key in ("bases", "base_list", "databases", "ibases"):
+                if isinstance(value.get(key), list):
+                    _u1c_drop_ghost_file_bases_from_list(value[key])
+
+    return obj
+
+
+def _u1c_install_no_ghost_bases_runtime_patch():
+    import inspect
+
+    current_globals = globals()
+
+    for _, cls in list(current_globals.items()):
+        if not inspect.isclass(cls):
+            continue
+
+        module_name = getattr(cls, "__module__", "")
+        if module_name != __name__:
+            continue
+
+        # После инициализации окна/приложения чистим внутренний список.
+        original_init = getattr(cls, "__init__", None)
+        if callable(original_init) and not getattr(original_init, "_u1c_no_ghost_wrapped", False):
+            def make_init_wrapper(fn):
+                def wrapped(self, *args, **kwargs):
+                    result = fn(self, *args, **kwargs)
+                    try:
+                        _u1c_drop_ghost_file_bases_from_object(self)
+                    except Exception:
+                        pass
+                    return result
+                wrapped._u1c_no_ghost_wrapped = True
+                return wrapped
+
+            try:
+                cls.__init__ = make_init_wrapper(original_init)
+            except Exception:
+                pass
+
+        # После загрузки/синхронизации/обновления списка тоже чистим.
+        for method_name in dir(cls):
+            lower = method_name.lower()
+            if not any(word in lower for word in (
+                "load",
+                "read",
+                "sync",
+                "refresh",
+                "update",
+                "save",
+                "populate",
+                "fill",
+            )):
+                continue
+
+            try:
+                method = getattr(cls, method_name)
+            except Exception:
+                continue
+
+            if not callable(method) or getattr(method, "_u1c_no_ghost_wrapped", False):
+                continue
+
+            def make_method_wrapper(fn):
+                def wrapped(self, *args, **kwargs):
+                    result = fn(self, *args, **kwargs)
+                    try:
+                        _u1c_drop_ghost_file_bases_from_object(self)
+                    except Exception:
+                        pass
+                    return result
+                wrapped._u1c_no_ghost_wrapped = True
+                return wrapped
+
+            try:
+                setattr(cls, method_name, make_method_wrapper(method))
+            except Exception:
+                pass
+
+# UPDATER1C_NO_GHOST_BASES_PATCH_END
+
+_u1c_install_no_ghost_bases_runtime_patch()
+
 if __name__ == '__main__': main()
