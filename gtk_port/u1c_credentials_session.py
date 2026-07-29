@@ -97,29 +97,17 @@ def _persistent_collection():
             break
 
     if chosen is None:
-        for collection in candidates:
-            if not _is_session_collection(collection):
-                chosen = collection
-                break
-
-    if chosen is None:
         raise RuntimeError(
-            "Постоянная коллекция Secret Service не найдена."
+            "Постоянная login-коллекция Secret Service не найдена."
         )
 
-    try:
-        if chosen.is_locked():
+    if chosen.is_locked():
+        try:
             chosen.unlock()
-    except Exception:
-        pass
-
-    try:
+        except Exception as exc:
+            raise RuntimeError("Постоянная login-коллекция заблокирована.") from exc
         if chosen.is_locked():
-            raise RuntimeError(
-                "Постоянная коллекция защищенного хранилища заблокирована."
-            )
-    except AttributeError:
-        pass
+            raise RuntimeError("Постоянная login-коллекция заблокирована.")
 
     if _is_session_collection(chosen):
         raise RuntimeError(
@@ -190,24 +178,8 @@ def _stable_base_secret_id(base):
 
 
 def _stable_its_secret_id(window):
-    login = str(
-        getattr(window, "settings", {}).get("its_login")
-        or ""
-    ).strip().casefold()
-
-    try:
-        if hasattr(window, "its_login_entry"):
-            current = str(
-                window.its_login_entry.get_text()
-                or ""
-            ).strip().casefold()
-            if current:
-                login = current
-    except Exception:
-        pass
-
     digest = hashlib.sha256(
-        login.encode("utf-8", errors="replace")
+        b"updater1c-linux:its-password-v1"
     ).hexdigest()
 
     return f"its:{digest}"
@@ -328,7 +300,7 @@ def _python_keyring_store(account: str, password: str) -> bool:
     try:
         import keyring
         keyring.set_password(SERVICE, account, password)
-        return True
+        return (keyring.get_password(SERVICE, account) or "") == password
     except Exception:
         return False
 

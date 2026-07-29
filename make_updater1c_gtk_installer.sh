@@ -34,6 +34,15 @@ if [ -d "$PROJECT_DIR/gtk_app" ]; then
   cp -a "$PROJECT_DIR/gtk_app" "$STAGE_DIR$APP_DIR/app/"
 fi
 
+# Полный GTK-контур, включая Secret Service, синхронизацию ibases.v8i,
+# запуск 1С и остальные подключаемые runtime-модули.
+if [ -d "$PROJECT_DIR/gtk_port" ]; then
+  cp -a "$PROJECT_DIR/gtk_port" "$STAGE_DIR$APP_DIR/app/"
+else
+  echo "ОШИБКА: не найден каталог gtk_port"
+  exit 1
+fi
+
 # Кладем рядом текущие runtime-модули, которые могут понадобиться при переносе функций.
 for f in secret_store.py ibases_v8i_guard.py structured_log.py structured_log_qt_inline.py; do
   if [ -f "$PROJECT_DIR/$f" ]; then
