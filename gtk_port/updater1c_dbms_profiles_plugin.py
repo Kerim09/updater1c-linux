@@ -30,6 +30,10 @@ _BACKUP_PATCHED = False
 
 CONFIG_DIR = Path.home() / ".config" / "updater1c-linux"
 PROFILES_FILE = CONFIG_DIR / "dbms_profiles.json"
+PROFILE_FIELDS = (
+    "id", "name", "dbms_type", "host", "port", "database_or_template",
+    "username", "password_saved", "comment", "is_default",
+)
 
 
 def install(globals_dict: dict):
@@ -71,6 +75,33 @@ def _ensure_config_dir():
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 
 
+def _normalize_profile(profile: dict) -> dict:
+    """Convert both legacy and current profile records to the 1.2.12 schema."""
+    source = profile if isinstance(profile, dict) else {}
+    dbms_type = source.get("dbms_type") or source.get("type") or "PostgreSQL"
+    host = (
+        source.get("host") or source.get("ops_address")
+        or source.get("new_base_address") or source.get("server") or ""
+    )
+    database = (
+        source.get("database_or_template") or source.get("db_name")
+        or source.get("service_db") or source.get("template") or ""
+    )
+    username = source.get("username") or source.get("admin") or source.get("user") or ""
+    return {
+        "id": str(source.get("id") or uuid.uuid4()),
+        "name": _safe_text(source.get("name") or host or dbms_type),
+        "dbms_type": _safe_text(dbms_type),
+        "host": _safe_text(host),
+        "port": _safe_text(source.get("port")),
+        "database_or_template": _safe_text(database),
+        "username": _safe_text(username),
+        "password_saved": bool(source.get("password_saved")),
+        "comment": str(source.get("comment") or ""),
+        "is_default": bool(source.get("is_default") or source.get("default")),
+    }
+
+
 def _load_profiles() -> list[dict]:
     _ensure_config_dir()
 
@@ -80,9 +111,9 @@ def _load_profiles() -> list[dict]:
     try:
         data = json.loads(PROFILES_FILE.read_text(encoding="utf-8"))
         if isinstance(data, list):
-            return data
+            return [_normalize_profile(item) for item in data if isinstance(item, dict)]
         if isinstance(data, dict) and isinstance(data.get("profiles"), list):
-            return data["profiles"]
+            return [_normalize_profile(item) for item in data["profiles"] if isinstance(item, dict)]
     except Exception as e:
         print("UPDATER1C_DBMS_LOAD_ERROR:", repr(e))
 
@@ -92,13 +123,13 @@ def _load_profiles() -> list[dict]:
 def _save_profiles(profiles: list[dict]):
     _ensure_config_dir()
 
-    clean = []
-
-    for p in profiles:
-        item = dict(p)
-        item.pop("password", None)
-        item["password_saved"] = bool(item.get("password_saved"))
-        clean.append(item)
+    clean = [_normalize_profile(p) for p in profiles]
+    default_seen = False
+    for item in clean:
+        if item["is_default"] and not default_seen:
+            default_seen = True
+        elif item["is_default"]:
+            item["is_default"] = False
 
     PROFILES_FILE.write_text(
         json.dumps(clean, ensure_ascii=False, indent=2),
@@ -385,27 +416,11 @@ def _message(parent, title: str, text: str, level: str = "info"):
 
 
 def _new_profile() -> dict:
-    return {
-        "id": str(uuid.uuid4()),
-        "name": "",
-        "type": "PostgreSQL",
-        "ops_address": "",
-        "new_base_address": "",
-        "port": "",
-        "admin": "",
-        "password_saved": False,
-        "db_name": "",
-        "service_db": "postgres",
-        "date_offset": "0",
-        "bin_path": "",
-        "remote_server": False,
-        "linked_bases": "",
-        "comment": "",
-    }
+    return _normalize_profile({"id": str(uuid.uuid4())})
 
 
 def _profile_display_db(p: dict) -> str:
-    return p.get("db_name") or p.get("service_db") or ""
+    return p.get("database_or_template") or ""
 
 
 def _fill_store(store, profiles):
@@ -415,11 +430,11 @@ def _fill_store(store, profiles):
         store.append([
             p.get("id", ""),
             p.get("name", ""),
-            p.get("type", ""),
-            p.get("ops_address", ""),
+            p.get("dbms_type", ""),
+            p.get("host", ""),
             _profile_display_db(p),
-            p.get("admin", ""),
-            p.get("linked_bases", ""),
+            p.get("username", ""),
+            "★" if p.get("is_default") else "",
         ])
 
 
@@ -480,10 +495,10 @@ def _open_profiles_dialog(parent):
         ("ID", 0, False),
         ("Название", 1, True),
         ("Тип", 2, True),
-        ("Адрес операций", 3, True),
-        ("БД / service DB", 4, True),
-        ("Администратор", 5, True),
-        ("Связанные базы 1С", 6, True),
+        ("Хост", 3, True),
+        ("База / шаблон", 4, True),
+        ("Пользователь", 5, True),
+        ("По умолчанию", 6, True),
     ]
 
     for title, idx, visible in columns:
@@ -501,10 +516,7 @@ def _open_profiles_dialog(parent):
 
     hint = Gtk.Label()
     hint.set_xalign(0)
-    hint.set_markup(
-        "<b>Подсказка:</b> в поле «Связанные базы 1С» укажи имена баз из списка через запятую. "
-        "При архивировании база сможет автоматически подхватить нужный профиль СУБД."
-    )
+    hint.set_markup("<b>Подсказка:</b> пароль хранится только в системном Secret Service.")
     box.pack_start(hint, False, False, 0)
 
     def reload_store():
@@ -529,6 +541,9 @@ def _open_profiles_dialog(parent):
         p = _new_profile()
         edited = _edit_profile_dialog(dlg, p, is_new=True)
         if edited:
+            if edited.get("is_default"):
+                for item in profiles:
+                    item["is_default"] = False
             profiles.append(edited)
             save_and_reload()
 
@@ -540,6 +555,9 @@ def _open_profiles_dialog(parent):
 
         edited = _edit_profile_dialog(dlg, dict(p), is_new=False)
         if edited:
+            if edited.get("is_default"):
+                for item in profiles:
+                    item["is_default"] = False
             for i, item in enumerate(profiles):
                 if item.get("id") == edited.get("id"):
                     profiles[i] = edited
@@ -640,34 +658,26 @@ def _edit_profile_dialog(parent, profile: dict, is_new: bool) -> dict | None:
     for t in ("PostgreSQL", "MS SQL Server", "Oracle Database", "IBM DB2"):
         type_combo.append_text(t)
 
-    current_type = profile.get("type") or "PostgreSQL"
+    current_type = profile.get("dbms_type") or "PostgreSQL"
     idx = {"PostgreSQL": 0, "MS SQL Server": 1, "Oracle Database": 2, "IBM DB2": 3}.get(current_type, 0)
     type_combo.set_active(idx)
     grid.attach(type_combo, 1, row, 2, 1)
     row += 1
 
-    label("Адрес для операций:")
-    ops_entry = entry(profile.get("ops_address", ""))
+    label("Хост:")
+    ops_entry = entry(profile.get("host", ""))
     row += 1
 
     label("Порт:")
     port_entry = entry(profile.get("port", ""))
     row += 1
 
-    label("Адрес для новой базы:")
-    new_base_entry = entry(profile.get("new_base_address", ""))
+    label("База / шаблон:")
+    db_name_entry = entry(profile.get("database_or_template", ""))
     row += 1
 
-    label("DB name / имя базы СУБД:")
-    db_name_entry = entry(profile.get("db_name", ""))
-    row += 1
-
-    label("Service DB:")
-    service_db_entry = entry(profile.get("service_db", "postgres"))
-    row += 1
-
-    label("Администратор:")
-    admin_entry = entry(profile.get("admin", ""))
+    label("Пользователь:")
+    admin_entry = entry(profile.get("username", ""))
     row += 1
 
     label("Пароль:")
@@ -684,47 +694,10 @@ def _edit_profile_dialog(parent, profile: dict, is_new: bool) -> dict | None:
         pwd_entry.set_placeholder_text("Пароль будет сохранен в системном хранилище")
     row += 1
 
-    label("Смещение дат:")
-    date_offset_entry = entry(profile.get("date_offset", "0"))
-    row += 1
-
-    label("Путь к bin СУБД:")
-    bin_entry = entry(profile.get("bin_path", ""), width=1)
-    bin_btn = Gtk.Button(label="...")
-    grid.attach(bin_btn, 2, row, 1, 1)
-    row += 1
-
-    def choose_bin(_btn):
-        dlg2 = Gtk.FileChooserDialog(
-            title="Выбери папку bin СУБД",
-            transient_for=dlg,
-            action=Gtk.FileChooserAction.SELECT_FOLDER,
-        )
-        dlg2.add_buttons("Отмена", Gtk.ResponseType.CANCEL, "Выбрать", Gtk.ResponseType.OK)
-
-        current = bin_entry.get_text().strip()
-        if current:
-            try:
-                dlg2.set_filename(current)
-            except Exception:
-                pass
-
-        resp = dlg2.run()
-        if resp == Gtk.ResponseType.OK:
-            bin_entry.set_text(dlg2.get_filename())
-        dlg2.destroy()
-
-    bin_btn.connect("clicked", choose_bin)
-
-    label("Сервер на другом компьютере:")
-    remote_check = Gtk.CheckButton()
-    remote_check.set_active(bool(profile.get("remote_server")))
-    grid.attach(remote_check, 1, row, 2, 1)
-    row += 1
-
-    label("Связанные базы 1С:")
-    linked_entry = entry(profile.get("linked_bases", ""))
-    linked_entry.set_placeholder_text("например: AccountingBase, dev_prod_anon")
+    label("Использовать по умолчанию:")
+    default_check = Gtk.CheckButton()
+    default_check.set_active(bool(profile.get("is_default")))
+    grid.attach(default_check, 1, row, 2, 1)
     row += 1
 
     label("Комментарий:")
@@ -763,19 +736,14 @@ def _edit_profile_dialog(parent, profile: dict, is_new: bool) -> dict | None:
     result = {
         "id": pid,
         "name": _safe_text(name_entry.get_text()) or _safe_text(ops_entry.get_text()) or pid,
-        "type": type_combo.get_active_text() or "PostgreSQL",
-        "ops_address": _safe_text(ops_entry.get_text()),
-        "new_base_address": _safe_text(new_base_entry.get_text()),
+        "dbms_type": type_combo.get_active_text() or "PostgreSQL",
+        "host": _safe_text(ops_entry.get_text()),
         "port": _safe_text(port_entry.get_text()),
-        "admin": _safe_text(admin_entry.get_text()),
+        "username": _safe_text(admin_entry.get_text()),
         "password_saved": bool(profile.get("password_saved")),
-        "db_name": _safe_text(db_name_entry.get_text()),
-        "service_db": _safe_text(service_db_entry.get_text()),
-        "date_offset": _safe_text(date_offset_entry.get_text()) or "0",
-        "bin_path": _safe_text(bin_entry.get_text()),
-        "remote_server": bool(remote_check.get_active()),
-        "linked_bases": _safe_text(linked_entry.get_text()),
+        "database_or_template": _safe_text(db_name_entry.get_text()),
         "comment": comment,
+        "is_default": bool(default_check.get_active()),
     }
 
     new_password = pwd_entry.get_text()
@@ -790,14 +758,7 @@ def _edit_profile_dialog(parent, profile: dict, is_new: bool) -> dict | None:
 
 
 def _cmd_from_bin(profile: dict, command: str) -> str:
-    bin_path = profile.get("bin_path") or ""
-
-    if bin_path:
-        p = Path(bin_path) / command
-        if p.exists():
-            return str(p)
-
-    return shutil.which(command) or command
+    return shutil.which(command) or ""
 
 
 def _test_profile_thread(parent, profile: dict):
@@ -810,16 +771,18 @@ def _test_profile_thread(parent, profile: dict):
             _message(parent, title, text, level)
 
     try:
-        typ = (profile.get("type") or "").lower()
+        typ = (profile.get("dbms_type") or "").lower()
         password = _secret_lookup(profile.get("id", ""))
         env = os.environ.copy()
 
         if "postgres" in typ:
             cmd_bin = _cmd_from_bin(profile, "pg_isready")
-            host = profile.get("ops_address") or "localhost"
+            if not cmd_bin:
+                raise FileNotFoundError("pg_isready")
+            host = profile.get("host") or "localhost"
             port = profile.get("port") or "5432"
-            user = profile.get("admin") or ""
-            db = profile.get("service_db") or profile.get("db_name") or "postgres"
+            user = profile.get("username") or ""
+            db = profile.get("database_or_template") or "postgres"
 
             cmd = [cmd_bin, "-h", host, "-p", str(port), "-d", db]
             if user:
@@ -831,7 +794,9 @@ def _test_profile_thread(parent, profile: dict):
 
         elif "sql" in typ:
             cmd_bin = _cmd_from_bin(profile, "sqlcmd")
-            server = profile.get("ops_address") or "localhost"
+            if not cmd_bin:
+                raise FileNotFoundError("sqlcmd")
+            server = profile.get("host") or "localhost"
             port = profile.get("port") or ""
 
             if port and "," not in server:
@@ -839,7 +804,7 @@ def _test_profile_thread(parent, profile: dict):
 
             cmd = [cmd_bin, "-S", server, "-Q", "SELECT 1"]
 
-            user = profile.get("admin") or ""
+            user = profile.get("username") or ""
             if user:
                 cmd += ["-U", user, "-P", password or ""]
             else:
@@ -849,8 +814,10 @@ def _test_profile_thread(parent, profile: dict):
 
         elif "oracle" in typ:
             cmd_bin = _cmd_from_bin(profile, "sqlplus")
-            user = profile.get("admin") or ""
-            db = profile.get("db_name") or profile.get("service_db") or profile.get("ops_address") or ""
+            if not cmd_bin:
+                raise FileNotFoundError("sqlplus")
+            user = profile.get("username") or ""
+            db = profile.get("database_or_template") or profile.get("host") or ""
             conn = f"{user}/{password}@{db}" if user else db
 
             result = subprocess.run(
@@ -864,7 +831,9 @@ def _test_profile_thread(parent, profile: dict):
 
         elif "db2" in typ:
             cmd_bin = _cmd_from_bin(profile, "db2cli")
-            db = profile.get("db_name") or profile.get("ops_address") or ""
+            if not cmd_bin:
+                raise FileNotFoundError("db2cli")
+            db = profile.get("database_or_template") or profile.get("host") or ""
 
             result = subprocess.run(
                 [cmd_bin, "validate", "-dsn", db],
@@ -875,7 +844,7 @@ def _test_profile_thread(parent, profile: dict):
             )
 
         else:
-            done("Тест СУБД", f"Неизвестный тип СУБД: {profile.get('type')}", "warning")
+            done("Тест СУБД", f"Неизвестный тип СУБД: {profile.get('dbms_type')}", "warning")
             return
 
         out = (result.stdout or "").strip()
@@ -896,30 +865,7 @@ def _test_profile_thread(parent, profile: dict):
 
 
 def _profile_matches_base(profile: dict, base: dict) -> bool:
-    linked = profile.get("linked_bases") or ""
-
-    if not linked.strip():
-        return False
-
-    tokens = [x.strip().lower() for x in re.split(r"[,;\n]+", linked) if x.strip()]
-
-    if not tokens:
-        return False
-
-    base_values = [
-        base.get("name", ""),
-        base.get("path", ""),
-        base.get("config", ""),
-    ]
-
-    base_values = [str(x).lower() for x in base_values if x]
-
-    for token in tokens:
-        for value in base_values:
-            if token == value or token in value:
-                return True
-
-    return False
+    return bool(profile.get("is_default"))
 
 
 def _patch_backup_plugin_timer():
@@ -1061,7 +1007,7 @@ def _enhanced_backup_dialog(backup_mod, parent, base: dict):
 
     for p in ordered_profiles:
         mark = "★ " if p in matched else ""
-        profile_combo.append_text(f"{mark}{p.get('name')} — {p.get('type')} — {p.get('ops_address')}")
+        profile_combo.append_text(f"{mark}{p.get('name')} — {p.get('dbms_type')} — {p.get('host')}")
         profile_ids.append(p.get("id", ""))
 
     profile_combo.set_active(1 if matched else 0)
@@ -1157,17 +1103,17 @@ def _enhanced_backup_dialog(backup_mod, parent, base: dict):
         if not p:
             return
 
-        db_host_entry.set_text(p.get("ops_address") or "")
+        db_host_entry.set_text(p.get("host") or "")
         db_port_entry.set_text(p.get("port") or "")
-        db_name_entry.set_text(p.get("db_name") or p.get("service_db") or "")
-        db_user_entry.set_text(p.get("admin") or "")
+        db_name_entry.set_text(p.get("database_or_template") or "")
+        db_user_entry.set_text(p.get("username") or "")
 
         pwd = _secret_lookup(p.get("id", ""))
 
         if pwd:
             db_pwd_entry.set_text(pwd)
 
-        typ = (p.get("type") or "").lower()
+        typ = (p.get("dbms_type") or "").lower()
 
         if "postgres" in typ:
             for i in range(3):

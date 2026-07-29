@@ -63,7 +63,7 @@ datetime = _U1CDateTimeCompat()
 
 
 APP_NAME = "Обновлятор 1C Linux"
-APP_VERSION = "1.2.9"
+APP_VERSION = "1.2.12"
 CONFIG_DIR = Path.home() / ".config" / "updater1c-linux"
 
 DEFAULT_1CESTART = "/opt/1cv8/common/1cestart"
@@ -72,6 +72,15 @@ DEFAULT_1CESTART = "/opt/1cv8/common/1cestart"
 def save_json(path: Path, data: dict):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def load_cluster_profiles() -> list[dict]:
+    """Read cluster choices without making the main GTK module depend on the plugin."""
+    path = CONFIG_DIR / "clusters.json"
+    data = load_json(path, [])
+    if isinstance(data, dict):
+        data = data.get("clusters", [])
+    return [item for item in data if isinstance(item, dict)] if isinstance(data, list) else []
 
 
 def safe_name(value: str) -> str:
@@ -2191,7 +2200,34 @@ class BaseDialog(Gtk.Dialog):
         self.kind = Ui.combo(["file", "server", "web"])
         combo_set_values(self.kind, ["file", "server", "web"], self.base.get("kind") or "file")
 
+        self.cluster_profiles = load_cluster_profiles()
+        self.cluster_profile_ids = [""]
+        cluster_labels = ["Не выбран"]
+        selected_cluster_id = self.base.get("cluster_profile_id") or ""
+        selected_cluster_label = "Не выбран"
+        for profile in self.cluster_profiles:
+            profile_id = str(profile.get("id") or "")
+            label = str(profile.get("name") or profile.get("cluster_host") or profile_id)
+            if profile.get("is_default"):
+                label = "★ " + label
+            self.cluster_profile_ids.append(profile_id)
+            cluster_labels.append(label)
+            if profile_id == selected_cluster_id:
+                selected_cluster_label = label
+        if not selected_cluster_id:
+            for index, profile in enumerate(self.cluster_profiles, 1):
+                if profile.get("is_default"):
+                    selected_cluster_label = cluster_labels[index]
+                    break
+        self.cluster_profile = Ui.combo(cluster_labels)
+        combo_set_values(self.cluster_profile, cluster_labels, selected_cluster_label)
+        self.cluster_hint = Ui.label(
+            "<small>Профиль задаёт подключение к кластеру. Автоматическая регистрация и управление через rac "
+            "пока ограничены и не имитируются.</small>"
+        )
+
         kind, connect = normalize_base_kind_and_connect(self.base)
+        combo_set_values(self.kind, ["file", "server", "web"], kind or "file")
         self.connect = Ui.entry(connect or self.base.get("connect", ""))
 
         self.template = Ui.entry(self.base.get("template", ""))
@@ -2232,6 +2268,8 @@ class BaseDialog(Gtk.Dialog):
             ("Имя базы:", self.name),
             ("Группа:", self.group),
             ("Тип:", self.kind),
+            ("Кластер 1С:", self.cluster_profile),
+            ("", self.cluster_hint),
             ("Путь / server\\base / URL:", self._entry_with_button(self.connect, self.on_browse_connect)),
             ("Шаблон 1С (.dt/.cf/папка):", self._entry_with_button(self.template, self.on_browse_template)),
             ("Пользователь:", self.user),
@@ -2247,10 +2285,24 @@ class BaseDialog(Gtk.Dialog):
         ]
 
         for i, (label, widget) in enumerate(rows):
-            grid.attach(Ui.label(label), 0, i, 1, 1)
+            label_widget = Ui.label(label)
+            grid.attach(label_widget, 0, i, 1, 1)
             grid.attach(widget, 1, i, 1, 1)
+            if widget is self.cluster_profile:
+                self.cluster_profile_label = label_widget
+            elif widget is self.cluster_hint:
+                self.cluster_hint_label = label_widget
 
+        self.kind.connect("changed", self._update_cluster_visibility)
         self.show_all()
+        self._update_cluster_visibility()
+
+    def _update_cluster_visibility(self, *_args):
+        visible = combo_get_text(self.kind).strip() == "server"
+        self.cluster_profile.set_visible(visible)
+        self.cluster_hint.set_visible(visible)
+        self.cluster_profile_label.set_visible(visible)
+        self.cluster_hint_label.set_visible(visible)
 
     def _entry_with_button(self, entry, handler=None):
         box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
@@ -2373,10 +2425,18 @@ class BaseDialog(Gtk.Dialog):
         client_mode = "thick" if client_caption == "Толстый клиент" else "thin"
 
         result = dict(self.base)
+        kind = combo_get_text(self.kind).strip() or "file"
+        cluster_index = self.cluster_profile.get_active()
+        cluster_profile_id = (
+            self.cluster_profile_ids[cluster_index]
+            if kind == "server" and 0 <= cluster_index < len(self.cluster_profile_ids)
+            else ""
+        )
         result.update({
             "name": self.name.get_text().strip(),
             "group": combo_get_text(self.group).strip(),
-            "kind": combo_get_text(self.kind).strip() or "file",
+            "kind": kind,
+            "cluster_profile_id": cluster_profile_id,
             "connect": self.connect.get_text().strip(),
             "template": self.template.get_text().strip(),
             "user": self.user.get_text().strip(),
@@ -10288,12 +10348,8 @@ class MainWindow(Gtk.Window):
         inner.append_page(self._build_its_tab(), Ui.label("ИТС"))
 
         service = [
-            ("pg_dump:", self.settings.get("pg_dump_path", "")),
-            ("rac:", self.settings.get("rac_path", "")),
             ("Внешняя обработка проверки метаданных .epf:", self.settings.get("metadata_probe_path", "/opt/updater1c-linux/tools/metadata_probe/DbInfo.epf")),
             ("Метод определения конфигурации:", self.settings.get("metadata_detection_method", "auto")),
-            ("RAS адрес:", self.settings.get("ras_address", "localhost")),
-            ("RAS порт:", self.settings.get("ras_port", "1545")),
         ]
         inner.append_page(self._form_tab(service, service=True), Ui.label("Служебное"))
 
@@ -10439,7 +10495,7 @@ class MainWindow(Gtk.Window):
                 w = Ui.entry(value)
                 if "Пароль" in label:
                     w.set_visibility(False)
-            if service and label in ("pg_dump:", "rac:", "Внешняя обработка проверки метаданных .epf:"):
+            if service and label == "Внешняя обработка проверки метаданных .epf:":
                 row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
                 row.pack_start(w, True, True, 0)
                 row.pack_start(Gtk.Button(label="..."), False, False, 0)
@@ -12106,6 +12162,23 @@ except Exception as _u1c_dbms_plugin_error:
     except Exception:
         pass
 # UPDATER1C_DBMS_PROFILES_PLUGIN_HOOK_END
+
+# UPDATER1C_CLUSTERS_PLUGIN_HOOK_BEGIN
+try:
+    import importlib.util as _u1c_clusters_importlib_util
+    from pathlib import Path as _u1c_clusters_Path
+
+    _u1c_clusters_plugin_path = _u1c_clusters_Path(__file__).with_name("updater1c_clusters_plugin.py")
+    if _u1c_clusters_plugin_path.exists():
+        _u1c_clusters_spec = _u1c_clusters_importlib_util.spec_from_file_location(
+            "updater1c_clusters_plugin", str(_u1c_clusters_plugin_path)
+        )
+        _u1c_clusters_mod = _u1c_clusters_importlib_util.module_from_spec(_u1c_clusters_spec)
+        _u1c_clusters_spec.loader.exec_module(_u1c_clusters_mod)
+        _u1c_clusters_mod.install(globals())
+except Exception as _u1c_clusters_plugin_error:
+    print("UPDATER1C_CLUSTERS_PLUGIN_HOOK_ERROR:", repr(_u1c_clusters_plugin_error))
+# UPDATER1C_CLUSTERS_PLUGIN_HOOK_END
 
 
 # UPDATER1C_BACKUP_HOTFIX_HOOK_BEGIN

@@ -6,7 +6,7 @@ import subprocess
 from pathlib import Path
 
 
-APP_ID = "io.github.kerim1c.updater1clinux.gtk"
+APP_ID = "io.github.kerim.updater1clinux"
 APP_NAME = "Обновлятор 1С Linux GTK"
 
 OPT_DIR = Path("/opt/updater1c-linux")

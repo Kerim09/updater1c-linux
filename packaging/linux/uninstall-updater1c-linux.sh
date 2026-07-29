@@ -115,9 +115,12 @@ rm -f \
   /usr/bin/updater1c-gtk-gui
 
 rm -f \
+  /usr/share/applications/io.github.kerim.updater1clinux.desktop \
   /usr/share/applications/updater1c-linux.desktop \
   /usr/share/applications/io.github.kerim1c.updater1clinux.desktop \
-  /usr/share/applications/io.github.kerim1c.updater1clinux.gtk.desktop
+  /usr/share/applications/io.github.kerim1c.updater1clinux.gtk.desktop \
+  /usr/share/applications/updater1c-linux-gtk.desktop \
+  /usr/share/applications/updater1c-gtk.desktop
 
 rm -f \
   /usr/share/pixmaps/updater1c-linux.png \
@@ -139,9 +142,12 @@ echo "=== Удаление пользовательских ярлыков и н
 for home in /home/* /root; do
   [ -d "$home" ] || continue
   rm -f \
+    "$home/.local/share/applications/io.github.kerim.updater1clinux.desktop" \
     "$home/.local/share/applications/updater1c-linux.desktop" \
     "$home/.local/share/applications/io.github.kerim1c.updater1clinux.desktop" \
-    "$home/.local/share/applications/io.github.kerim1c.updater1clinux.gtk.desktop"
+    "$home/.local/share/applications/io.github.kerim1c.updater1clinux.gtk.desktop" \
+    "$home/.local/share/applications/updater1c-linux-gtk.desktop" \
+    "$home/.local/share/applications/updater1c-gtk.desktop"
 
   rm -f \
     "$home/.local/share/icons/hicolor/256x256/apps/updater1c-linux.png" \
@@ -158,7 +164,14 @@ done
 
 echo
 echo "=== Обновление кэшей ярлыков/иконок ==="
-update-desktop-database /usr/share/applications >/dev/null 2>&1 || true
+if command -v update-desktop-database >/dev/null 2>&1; then
+  update-desktop-database /usr/share/applications >/dev/null 2>&1 || true
+fi
+if command -v kbuildsycoca6 >/dev/null 2>&1; then
+  kbuildsycoca6 >/dev/null 2>&1 || true
+elif command -v kbuildsycoca5 >/dev/null 2>&1; then
+  kbuildsycoca5 >/dev/null 2>&1 || true
+fi
 gtk-update-icon-cache -q -t -f /usr/share/icons/hicolor >/dev/null 2>&1 || true
 
 echo
