@@ -2,15 +2,16 @@
 set -Eeuo pipefail
 
 APP_ID="updater1c-linux"
+DESKTOP_ID="io.github.kerim.updater1clinux"
 APP_NAME="Обновлятор 1С Linux"
 APP_COMMENT="Linux updater for 1C infobases"
 INSTALL_DIR="/opt/${APP_ID}"
-BIN_PATH="/usr/bin/${APP_ID}"
-DESKTOP_PATH="/usr/share/applications/${APP_ID}.desktop"
+BIN_PATH="/usr/local/bin/${APP_ID}"
+DESKTOP_PATH="/usr/share/applications/${DESKTOP_ID}.desktop"
 ICON_NAME="${APP_ID}"
-TAG="STAGE18_POLKIT_INSTALLER"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TAG="$(<"$ROOT/VERSION")"
 STAMP="$(date +%Y%m%d_%H%M%S)"
 
 DIST_DIR="${ROOT}/dist"
@@ -36,6 +37,8 @@ need_file() {
 
 need_file "main.py"
 need_file "requirements.txt"
+need_file "VERSION"
+need_file "packaging/linux/io.github.kerim.updater1clinux.desktop"
 
 if [ ! -f "$ASSETS_DIR/${APP_ID}.svg" ]; then
     cat > "$ASSETS_DIR/${APP_ID}.svg" <<'SVG'
@@ -101,11 +104,12 @@ cat > "$PAYLOAD_DIR/root-install.sh" <<'ROOT_INSTALL'
 set -Eeuo pipefail
 
 APP_ID="updater1c-linux"
+DESKTOP_ID="io.github.kerim.updater1clinux"
 APP_NAME="Обновлятор 1С Linux"
 APP_COMMENT="Linux updater for 1C infobases"
 INSTALL_DIR="/opt/${APP_ID}"
-BIN_PATH="/usr/bin/${APP_ID}"
-DESKTOP_PATH="/usr/share/applications/${APP_ID}.desktop"
+BIN_PATH="/usr/local/bin/${APP_ID}"
+DESKTOP_PATH="/usr/share/applications/${DESKTOP_ID}.desktop"
 ICON_NAME="${APP_ID}"
 
 APP_SRC="${1:-}"
@@ -145,7 +149,7 @@ install_pkg_if_available() {
 
     if apt-cache show "$pkg" >/dev/null 2>&1; then
         echo "Installing package: $pkg"
-        apt-get install -y "$pkg"
+        apt-get install -y -o Dpkg::Progress-Fancy=1 "$pkg"
     else
         echo "WARN: apt package not found, skipped: $pkg"
     fi
@@ -153,7 +157,8 @@ install_pkg_if_available() {
 
 echo
 echo "== apt update =="
-apt-get update -y
+echo "Предварительная проверка и обновление индексов пакетов..."
+apt-get update
 
 echo
 echo "== installing system dependencies =="
@@ -210,15 +215,15 @@ fi
 echo
 echo "== creating python venv =="
 
-python3 -m venv "$INSTALL_DIR/.venv"
+python3 -m venv "$INSTALL_DIR/venv"
 
-"$INSTALL_DIR/.venv/bin/python" -m pip install --upgrade pip setuptools wheel
-"$INSTALL_DIR/.venv/bin/python" -m pip install -r "$INSTALL_DIR/requirements.txt"
+"$INSTALL_DIR/venv/bin/python" -m pip install --upgrade pip setuptools wheel
+"$INSTALL_DIR/venv/bin/python" -m pip install -r "$INSTALL_DIR/requirements.txt"
 
 echo
 echo "== python syntax check =="
 
-"$INSTALL_DIR/.venv/bin/python" -m py_compile "$INSTALL_DIR/main.py"
+"$INSTALL_DIR/venv/bin/python" -m py_compile "$INSTALL_DIR/main.py"
 
 echo
 echo "== creating launcher =="
@@ -229,7 +234,7 @@ set -Eeuo pipefail
 
 APP_DIR="/opt/updater1c-linux"
 APP_MAIN="$APP_DIR/main.py"
-APP_PY="$APP_DIR/.venv/bin/python"
+APP_PY="$APP_DIR/venv/bin/python"
 
 if [ ! -x "$APP_PY" ]; then
     echo "Не найден Python venv: $APP_PY" >&2
@@ -274,22 +279,43 @@ fi
 echo
 echo "== creating desktop shortcut =="
 
-cat > "$DESKTOP_PATH" <<DESKTOP
-[Desktop Entry]
-Type=Application
-Name=${APP_NAME}
-Name[ru]=${APP_NAME}
-Comment=${APP_COMMENT}
-Comment[ru]=Обновление и обслуживание информационных баз 1С на Linux
-Exec=${BIN_PATH}
-Icon=/opt/updater1c-linux/icons/updater1c.png
-Terminal=false
-StartupNotify=true
-Categories=Office;Development;Utility;
-Keywords=1C;1С;Updater;Обновлятор;Update;
-DESKTOP
+# Убираем старые варианты записей, чтобы после обновления оставался один ярлык.
+for old_desktop in \
+    /usr/share/applications/io.github.kerim.updater1clinux.desktop \
+    /usr/share/applications/io.github.kerim1c.updater1clinux.desktop \
+    /usr/share/applications/io.github.kerim1c.updater1clinux.gtk.desktop \
+    /usr/share/applications/updater1c-linux.desktop \
+    /usr/share/applications/updater1c-linux-gtk.desktop \
+    /usr/share/applications/updater1c-gtk.desktop; do
+    rm -f "$old_desktop"
+done
 
-chmod 0644 "$DESKTOP_PATH"
+install -m 0644 \
+    "$INSTALL_DIR/packaging/linux/io.github.kerim.updater1clinux.desktop" \
+    "$DESKTOP_PATH"
+
+# Создаём ярлык и для пользователя, который запустил установщик через pkexec.
+INSTALL_USER=""
+if [ -n "${PKEXEC_UID:-}" ]; then
+    INSTALL_USER="$(getent passwd "$PKEXEC_UID" | cut -d: -f1)"
+elif [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+    INSTALL_USER="$SUDO_USER"
+fi
+if [ -n "$INSTALL_USER" ]; then
+    USER_HOME="$(getent passwd "$INSTALL_USER" | cut -d: -f6)"
+    USER_DESKTOP_DIR="$USER_HOME/.local/share/applications"
+    install -d -o "$INSTALL_USER" -g "$(id -gn "$INSTALL_USER")" -m 0755 "$USER_DESKTOP_DIR"
+    install -o "$INSTALL_USER" -g "$(id -gn "$INSTALL_USER")" -m 0644 \
+        "$DESKTOP_PATH" "$USER_DESKTOP_DIR/${DESKTOP_ID}.desktop"
+    for old_id in \
+        io.github.kerim1c.updater1clinux.desktop \
+        io.github.kerim1c.updater1clinux.gtk.desktop \
+        updater1c-linux.desktop \
+        updater1c-linux-gtk.desktop \
+        updater1c-gtk.desktop; do
+        rm -f "$USER_DESKTOP_DIR/$old_id"
+    done
+fi
 
 if command -v desktop-file-validate >/dev/null 2>&1; then
     desktop-file-validate "$DESKTOP_PATH" || true
@@ -303,10 +329,11 @@ cat > "$INSTALL_DIR/uninstall-${APP_ID}.sh" <<'UNINSTALLER'
 set -Eeuo pipefail
 
 APP_ID="updater1c-linux"
+DESKTOP_ID="io.github.kerim.updater1clinux"
 APP_NAME="Обновлятор 1С Linux"
 INSTALL_DIR="/opt/${APP_ID}"
-BIN_PATH="/usr/bin/${APP_ID}"
-DESKTOP_PATH="/usr/share/applications/${APP_ID}.desktop"
+BIN_PATH="/usr/local/bin/${APP_ID}"
+DESKTOP_PATH="/usr/share/applications/${DESKTOP_ID}.desktop"
 LOG="/tmp/${APP_ID}-uninstall-$(date +%Y%m%d_%H%M%S).log"
 
 ask_confirm_user() {
@@ -356,7 +383,20 @@ echo
 echo "== removing files =="
 
 rm -f "$BIN_PATH"
-rm -f "$DESKTOP_PATH"
+rm -f "/usr/bin/${APP_ID}"
+for desktop_id in \
+    io.github.kerim.updater1clinux.desktop \
+    io.github.kerim1c.updater1clinux.desktop \
+    io.github.kerim1c.updater1clinux.gtk.desktop \
+    updater1c-linux.desktop \
+    updater1c-linux-gtk.desktop \
+    updater1c-gtk.desktop; do
+    rm -f "/usr/share/applications/$desktop_id"
+    for home_dir in /home/* /root; do
+        [ -d "$home_dir" ] || continue
+        rm -f "$home_dir/.local/share/applications/$desktop_id"
+    done
+done
 
 rm -f "/usr/share/icons/hicolor/scalable/apps/${APP_ID}.svg"
 rm -f "/usr/share/icons/hicolor/256x256/apps/${APP_ID}.png"
@@ -368,6 +408,11 @@ echo "== updating caches =="
 
 if command -v update-desktop-database >/dev/null 2>&1; then
     update-desktop-database /usr/share/applications 2>/dev/null || true
+fi
+if command -v kbuildsycoca6 >/dev/null 2>&1; then
+    kbuildsycoca6 >/dev/null 2>&1 || true
+elif command -v kbuildsycoca5 >/dev/null 2>&1; then
+    kbuildsycoca5 >/dev/null 2>&1 || true
 fi
 
 if command -v gtk-update-icon-cache >/dev/null 2>&1; then
@@ -389,6 +434,11 @@ echo "== updating desktop/icon caches =="
 
 if command -v update-desktop-database >/dev/null 2>&1; then
     update-desktop-database /usr/share/applications 2>/dev/null || true
+fi
+if command -v kbuildsycoca6 >/dev/null 2>&1; then
+    kbuildsycoca6 >/dev/null 2>&1 || true
+elif command -v kbuildsycoca5 >/dev/null 2>&1; then
+    kbuildsycoca5 >/dev/null 2>&1 || true
 fi
 
 if command -v gtk-update-icon-cache >/dev/null 2>&1; then
@@ -467,7 +517,7 @@ command -v pkexec >/dev/null 2>&1 || fail_gui "Не найден pkexec.\n\nУс
 command -v tar >/dev/null 2>&1 || fail_gui "Не найден tar."
 command -v awk >/dev/null 2>&1 || fail_gui "Не найден awk."
 
-ask_gui "Установить ${APP_NAME}?\n\nБудет выполнено:\n- установка системных зависимостей через apt;\n- установка приложения в /opt/updater1c-linux;\n- создание команды /usr/bin/updater1c-linux;\n- создание ярлыка в меню Ubuntu;\n- создание uninstaller.\n\nПрава администратора будут запрошены через системное окно Ubuntu." || exit 0
+ask_gui "Установить ${APP_NAME}?\n\nБудет выполнено:\n- установка системных зависимостей через apt;\n- установка приложения в /opt/updater1c-linux;\n- создание команды /usr/local/bin/updater1c-linux;\n- создание ярлыка в меню Ubuntu;\n- создание uninstaller.\n\nПрава администратора будут запрошены через системное окно Ubuntu." || exit 0
 
 TMP="$(mktemp -d)"
 cleanup() {
@@ -485,8 +535,24 @@ tail -n +"$ARCHIVE_LINE" "$0" | tar -xzf - -C "$TMP"
 
 chmod +x "$TMP/root-install.sh"
 
-if ! pkexec /bin/bash "$TMP/root-install.sh" "$TMP/app"; then
-    fail_gui "Установка не завершена.\n\nПроверь последний лог:\n/tmp/updater1c-linux-install-*.log"
+# При запуске из файлового менеджера stdout не виден. Открываем отдельный
+# терминал, чтобы были видны apt update, apt install и итоговый код установки.
+if [ -t 1 ]; then
+    if ! pkexec /bin/bash "$TMP/root-install.sh" "$TMP/app"; then
+        fail_gui "Установка не завершена. Проверьте лог /tmp/updater1c-linux-install-*.log"
+    fi
+elif command -v x-terminal-emulator >/dev/null 2>&1 || command -v konsole >/dev/null 2>&1 || command -v gnome-terminal >/dev/null 2>&1 || command -v xfce4-terminal >/dev/null 2>&1; then
+    TERM_BIN="$(command -v x-terminal-emulator || command -v konsole || command -v gnome-terminal || command -v xfce4-terminal)"
+    if [ "$(basename "$TERM_BIN")" = "gnome-terminal" ]; then
+        "$TERM_BIN" -- /bin/bash -c 'pkexec /bin/bash "$1" "$2"; rc=$?; echo; echo "Код установки: $rc"; echo "Нажмите Enter для закрытия..."; read -r' _ "$TMP/root-install.sh" "$TMP/app"
+    else
+        "$TERM_BIN" -e /bin/bash -c 'pkexec /bin/bash "$1" "$2"; rc=$?; echo; echo "Код установки: $rc"; echo "Нажмите Enter для закрытия..."; read -r' _ "$TMP/root-install.sh" "$TMP/app"
+    fi
+    [ -x /usr/local/bin/updater1c-linux ] && [ -f /usr/share/applications/io.github.kerim.updater1clinux.desktop ] || fail_gui "Установка не завершена. Проверьте лог /tmp/updater1c-linux-install-*.log"
+else
+    if ! pkexec /bin/bash "$TMP/root-install.sh" "$TMP/app"; then
+        fail_gui "Установка не завершена. Проверьте лог /tmp/updater1c-linux-install-*.log"
+    fi
 fi
 
 info_gui "Установка завершена.\n\nЗапуск из меню Ubuntu:\n${APP_NAME}\n\nЗапуск из терминала:\nupdater1c-linux\n\nУдаление:\n/opt/updater1c-linux/uninstall-updater1c-linux.sh"
@@ -511,48 +577,3 @@ echo "Installer:"
 echo "$OUT"
 echo
 ls -lh "$OUT"
-
-
-# UPDATER1C_ORANGE_ICON_FIX
-# Гарантированно ставим правильную оранжевую иконку и правим desktop-файл.
-install_orange_icon_fix() {
-  APP_DIR="${APP_DIR:-/opt/updater1c-linux}"
-  ICON_DIR="$APP_DIR/icons"
-  ICON_PATH="$ICON_DIR/updater1c.png"
-  DESKTOP_PATH="/usr/share/applications/io.github.kerim1c.updater1clinux.desktop"
-
-  mkdir -p "$ICON_DIR"
-
-  if [ -f "./assets/updater1c.png" ]; then
-    cp -f "./assets/updater1c.png" "$ICON_PATH"
-  elif [ -f "./icons/updater1c.png" ]; then
-    cp -f "./icons/updater1c.png" "$ICON_PATH"
-  else
-    cat > "$ICON_PATH" <<'SVG'
-<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
-  <defs>
-    <linearGradient id="g" x1="70" y1="70" x2="440" y2="440" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#ffb21a"/>
-      <stop offset="1" stop-color="#f36b00"/>
-    </linearGradient>
-  </defs>
-  <rect x="48" y="48" width="416" height="416" rx="92" fill="url(#g)"/>
-  <path d="M399 103c-70 5-126 33-164 75h77v57H196c-7 18-11 38-11 59 0 27 6 52 18 74l-61 35c-18-32-28-69-28-109 0-36 9-71 24-101H91l31-55h55c52-65 131-103 222-106v71z" fill="#fff" opacity=".92"/>
-  <text x="256" y="315" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="125" font-weight="800" fill="#fff">1C</text>
-  <path d="M350 178c36 30 59 75 59 126 0 91-74 165-165 165-42 0-80-16-109-41l43-49c18 15 41 24 66 24 55 0 99-44 99-99 0-31-14-59-37-77l44-49z" fill="#fff" opacity=".88"/>
-</svg>
-SVG
-  fi
-
-  chmod 644 "$ICON_PATH"
-
-  if [ -f "$DESKTOP_PATH" ]; then
-    sed -i "s#^Icon=.*#Icon=$ICON_PATH#g" "$DESKTOP_PATH"
-  fi
-
-  update-desktop-database /usr/share/applications >/dev/null 2>&1 || true
-  gtk-update-icon-cache -f /usr/share/icons/hicolor >/dev/null 2>&1 || true
-}
-install_orange_icon_fix || true
-# /UPDATER1C_ORANGE_ICON_FIX
-

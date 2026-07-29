@@ -1,13 +1,5 @@
 #!/usr/bin/env bash
-set -e
+set -Eeuo pipefail
 
-APP_DIR="/opt/updater1c-linux/app"
-APP_MAIN="$APP_DIR/gtk_port/updater1c_gtk.py"
-
-cd "$APP_DIR"
-
-export PYTHONPATH="$APP_DIR:${PYTHONPATH:-}"
-export PYTHONPATH="$APP_DIR/gtk_port:$PYTHONPATH"
-export GDK_BACKEND="${GDK_BACKEND:-x11}"
-
-exec python3 "$APP_MAIN" "$@"
+# Совместимое старое имя launcher: вся логика запуска находится в одном месте.
+exec /usr/local/bin/updater1c-linux "$@"

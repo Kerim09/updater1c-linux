@@ -22,8 +22,8 @@ import webbrowser
 import zipfile
 
 
-APP_ID = 'io.github.kerim1c.updater1clinux'
-APP_VERSION = "1.2.6"
+APP_ID = 'io.github.kerim.updater1clinux'
+APP_VERSION = "1.2.12"
 APP_NAME = 'Обновлятор 1c linux'
 
 
@@ -8580,9 +8580,9 @@ def main():
     # Цветной лог без замены layout: безопасная подсветка старого поля журнала.
     import structured_log_qt_inline
     structured_log_qt_inline.install_inline_log_tools()
-    app.setApplicationName('io.github.kerim1c.updater1clinux')
+    app.setApplicationName(APP_ID)
     app.setApplicationDisplayName('Обновлятор 1C Linux')
-    app.setDesktopFileName('io.github.kerim1c.updater1clinux')
+    app.setDesktopFileName(APP_ID)
     icon_path = app_icon_path()
     if icon_path:
         app.setWindowIcon(QIcon(icon_path))

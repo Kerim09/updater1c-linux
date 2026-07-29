@@ -83,9 +83,11 @@ class CredentialPersistenceTests(unittest.TestCase):
             self.assertEqual(self.module._stable_base_secret_id(base), self.module._stable_base_secret_id(renamed))
 
     def test_desktop_launcher_uses_full_contour(self):
-        launcher = (ROOT / "packaging/linux/updater1c-gtk-gui").read_text()
+        launcher = (ROOT / "packaging/linux/updater1c-linux").read_text()
         self.assertIn("gtk_port/updater1c_gtk.py", launcher)
         self.assertNotIn('APP_MAIN="$APP_DIR/main_gtk.py"', launcher)
+        compatibility_launcher = (ROOT / "packaging/linux/updater1c-gtk-gui").read_text()
+        self.assertIn("/usr/local/bin/updater1c-linux", compatibility_launcher)
 
 
 if __name__ == "__main__":

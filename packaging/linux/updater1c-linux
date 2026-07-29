@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+APP_DIR="/opt/updater1c-linux"
+APP_MAIN="$APP_DIR/gtk_port/updater1c_gtk.py"
+APP_PY="$APP_DIR/venv/bin/python"
+if [[ ! -f "$APP_MAIN" ]]; then
+  echo "Ошибка: не найден основной GTK-файл: $APP_MAIN" >&2
+  exit 1
+fi
+export PYTHONPATH="$APP_DIR/gtk_port:$APP_DIR${PYTHONPATH:+:$PYTHONPATH}"
+export GDK_BACKEND="${GDK_BACKEND:-x11}"
+# PyGObject обычно поставляется дистрибутивом; venv используется, если в нём
+# доступен GTK runtime, иначе launcher сохраняет совместимость с system Python.
+if [[ -x "$APP_PY" ]] && "$APP_PY" -c 'import gi' >/dev/null 2>&1; then
+  exec "$APP_PY" "$APP_MAIN" "$@"
+fi
+exec /usr/bin/python3 "$APP_MAIN" "$@"
