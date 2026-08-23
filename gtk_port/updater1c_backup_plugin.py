@@ -777,7 +777,7 @@ def _open_backup_dialog(parent, base: dict):
         mode_combo.append_text("Файловая база: архивировать 1Cv8.1CD в .zip")
     else:
         mode_combo.append_text("Серверная/веб база: выгрузка в .dt через 1С")
-        mode_combo.append_text("PostgreSQL: pg_dump")
+        mode_combo.append_text("PostgreSQL: серверный архив")
         mode_combo.append_text("Microsoft SQL Server: BACKUP DATABASE через sqlcmd")
 
     mode_combo.set_active(0)
@@ -811,7 +811,7 @@ def _open_backup_dialog(parent, base: dict):
     row += 1
 
     add_label("Параметры СУБД")
-    hint = Gtk.Label(label="Заполняются только для pg_dump/sqlcmd")
+    hint = Gtk.Label(label="Поля используются выбранным профилем СУБД")
     hint.set_xalign(0)
     grid.attach(hint, 1, row, 2, 1)
     row += 1
@@ -949,7 +949,7 @@ def _run_backup_thread(**kwargs):
 
         if "1Cv8.1CD" in mode or ".zip" in mode:
             out_file = _backup_file_zip(base, out_dir)
-        elif "pg_dump" in mode:
+        elif "pg_dump" in mode or "серверный архив" in mode:
             out_file = _backup_postgresql(
                 base,
                 out_dir,

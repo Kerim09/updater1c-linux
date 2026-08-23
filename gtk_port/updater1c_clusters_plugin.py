@@ -242,7 +242,7 @@ def _open_dialog(parent):
     scroll = Gtk.ScrolledWindow()
     scroll.add(tree)
     box.pack_start(scroll, True, True, 0)
-    hint = Gtk.Label(label="Проверка выполняет только TCP-подключение к host:port; управление через rac не имитируется.")
+    hint = Gtk.Label(label="Проверка выполняет TCP-подключение к host:port; действия запускаются из профиля кластера.")
     hint.set_xalign(0)
     box.pack_start(hint, False, False, 0)
 

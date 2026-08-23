@@ -7,11 +7,11 @@ from pathlib import Path
 
 
 APP_ID = "io.github.kerim.updater1clinux"
-APP_NAME = "Обновлятор 1С Linux GTK"
+APP_NAME = "Обновлятор 1С Linux"
 
 OPT_DIR = Path("/opt/updater1c-linux")
-APP_DIR = OPT_DIR / "app"
-ICON_PATH = OPT_DIR / "icons" / "updater1c.png"
+APP_DIR = OPT_DIR
+ICON_PATH = OPT_DIR / "updater1c.png"
 
 USER_CONFIG_DIR = Path.home() / ".config" / "updater1c-linux"
 SETTINGS_FILE = USER_CONFIG_DIR / "settings-gtk.json"
