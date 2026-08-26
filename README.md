@@ -1,7 +1,10 @@
-# Обновлятор 1c linux
+# Обновлятор 1С Linux
 
-**Версия:** 1.0  
-**App ID:** `io.github.kerim1c.updater1clinux`
+**Версия:** 1.2.14
+**App ID:** `io.github.kerim.updater1clinux`
+
+Основной runtime релиза — GTK 3 / PyGObject. Установщик размещает приложение в
+`/opt/updater1c-linux`, launcher — в `/usr/local/bin/updater1c-linux`.
 
 Приложение для Linux для групповой работы с информационными базами 1С: проверка настроек, определение версии конфигурации, скачивание обновлений и подготовка к пакетному обновлению.
 
@@ -33,8 +36,17 @@ https://helpme1s.ru/obnovlyator-1s-gruppovoe-paketnoe-obnovlenie-vsex-baz-za-odi
 - автоматическая проверка релиза перед скачиванием обновлений;
 - скачивание обновлений конфигураций;
 - подготовка к обновлению баз на Linux;
-- чистый Linux-интерфейс с App ID `io.github.kerim1c.updater1clinux`.
+- чистый GTK Linux-интерфейс с App ID `io.github.kerim.updater1clinux`.
+
+## Возможности версии 1.2.14
+
+- каталог релизов 1С через `releases.1c.ru`;
+- последовательность обновлений через `update-api.1c.ru`;
+- отдельная загрузка `.cfu` и полного `.cf` дистрибутива;
+- профили серверов СУБД и кластеров 1С;
+- хранение паролей через Secret Service;
+- миграция настроек и runtime-данных при обновлении установщика.
 
 ## Иконка
 
-Основная иконка проекта: `resources/icons/io.github.kerim1c.updater1clinux.svg`.
+Основная иконка проекта: `assets/updater1c-linux.svg`.

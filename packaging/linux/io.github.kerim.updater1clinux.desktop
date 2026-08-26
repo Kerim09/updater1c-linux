@@ -1,9 +1,11 @@
 [Desktop Entry]
 Type=Application
 Name=Обновлятор 1С Linux
+GenericName=Обновлятор 1С
+Comment=Обновление баз 1С в Linux
 Exec=/usr/local/bin/updater1c-linux
 Icon=updater1c-linux
 Terminal=false
 StartupWMClass=updater1c-linux
-Categories=Utility;
+Categories=Office;Utility;
 StartupNotify=true

@@ -948,7 +948,12 @@ def _selected_backup_from_report_combo() -> Path | None:
         return None
 
     base = _current_base()
-    root = Path("/mnt/DataStore/Updater1C/1c-backups")
+    settings = getattr(win, "settings", None) or {}
+    root = Path(
+        settings.get("backup_dir")
+        or settings.get("backups_dir")
+        or "/mnt/DataStore/Updater1C/1c-backups"
+    ).expanduser()
     base_name = _safe_name(base.get("name"), "")
 
     search_roots = []

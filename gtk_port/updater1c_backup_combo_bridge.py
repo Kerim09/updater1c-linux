@@ -305,6 +305,16 @@ def _settings_backup_root() -> Path:
         "backups_root",
     )
 
+    # В первую очередь используем настройки реально открытого MainWindow.
+    try:
+        win = _main_window()
+        settings = getattr(win, "settings", None) or {}
+        configured = settings.get("backup_dir") or settings.get("backups_dir")
+        if configured:
+            return Path(str(configured)).expanduser()
+    except Exception:
+        pass
+
     try:
         AppConfig = _G.get("AppConfig")
         if AppConfig:

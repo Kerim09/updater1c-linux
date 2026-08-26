@@ -11,6 +11,7 @@ import base64
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -63,15 +64,97 @@ datetime = _U1CDateTimeCompat()
 
 
 APP_NAME = "Обновлятор 1C Linux"
-APP_VERSION = "1.2.12"
+
+
+def read_application_version() -> str:
+    """Читает версию приложения из единственного файла VERSION."""
+    try:
+        version_file = Path(__file__).resolve().parents[1] / "VERSION"
+        version = version_file.read_text(encoding="utf-8").strip()
+        if version:
+            return version
+    except Exception:
+        pass
+    return "unknown"
+
+
+APP_VERSION = read_application_version()
 CONFIG_DIR = Path.home() / ".config" / "updater1c-linux"
 
 DEFAULT_1CESTART = "/opt/1cv8/common/1cestart"
 
 
 def save_json(path: Path, data: dict):
+    """Сохраняет JSON атомарно, не оставляя частично записанный конфиг."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    payload = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
+    old_mode = None
+    try:
+        old_mode = path.stat().st_mode & 0o777
+    except OSError:
+        pass
+
+    temp_name = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=str(path.parent),
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temp:
+            temp.write(payload)
+            temp.flush()
+            os.fsync(temp.fileno())
+            temp_name = temp.name
+
+        if old_mode is not None:
+            os.chmod(temp_name, old_mode)
+        else:
+            os.chmod(temp_name, 0o600)
+
+        os.replace(temp_name, path)
+    finally:
+        if temp_name:
+            try:
+                Path(temp_name).unlink(missing_ok=True)
+            except Exception:
+                pass
+
+
+def mask_sensitive_command_args(args):
+    """Возвращает копию аргументов 1С без открытых секретов."""
+    masked = []
+    mask_next = False
+
+    for raw in args or []:
+        value = str(raw)
+        low = value.casefold()
+
+        if mask_next:
+            masked.append("***")
+            mask_next = False
+            continue
+
+        if low in ("/p", "--password", "--pwd", "password", "pwd", "pass"):
+            masked.append("/P***" if low == "/p" else f"{value}=***" if "=" in value else f"{value}:***")
+            mask_next = True
+            continue
+
+        if low.startswith("/p") and len(value) > 2:
+            masked.append("/P***")
+            continue
+
+        value = re.sub(
+            r"(?i)((?:pwd|password|pass|secret|token|cookie)\s*[=:]\s*)([^\s;]+)",
+            r"\1***",
+            value,
+        )
+        value = re.sub(r'(?i)(Pwd|Password)="[^"]*"', r'\1="***"', value)
+        masked.append(value)
+
+    return masked
 
 
 def load_cluster_profiles() -> list[dict]:
@@ -730,15 +813,21 @@ class Ui:
 
 
 
-def http_json_post(url: str, body: dict, timeout: int = 120) -> dict:
+def http_json_post(url: str, body: dict, timeout: int = 120, login: str = "", password: str = "") -> dict:
     payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": f"updater1c-linux/{APP_VERSION}",
+        "Content-Type": "application/json",
+    }
+    if login or password:
+        token = base64.b64encode(f"{login}:{password}".encode("utf-8")).decode("ascii")
+        headers["Authorization"] = f"Basic {token}"
+
     req = urllib.request.Request(
         url,
         data=payload,
-        headers={
-            "Content-Type": "application/json",
-            "User-Agent": "1C+Enterprise/8.3",
-        },
+        headers=headers,
         method="POST",
     )
 
@@ -782,7 +871,12 @@ class GtkOneCUpdateApi:
             "updateType": update_type,
             "platformVersion": (platform_version or "").strip() or "8.3",
         }
-        return http_json_post(self.BASE_URL + self.UPDATE_INFO_PATH, body)
+        return http_json_post(
+            self.BASE_URL + self.UPDATE_INFO_PATH,
+            body,
+            login=self.login,
+            password=self.password,
+        )
 
     def check_conf_update(self, program: str, version: str, platform_version: str, allow_next_redaction: bool = False) -> dict:
         update_type = self.UPDATE_TYPE_PROGRAM_OR_REDACTION if allow_next_redaction else self.UPDATE_TYPE_WORKING
@@ -797,20 +891,21 @@ class GtkOneCUpdateApi:
             "login": self.login,
             "password": self.password,
         }
-        data = http_json_post(self.BASE_URL + self.UPDATE_PATH, body)
+        data = http_json_post(
+            self.BASE_URL + self.UPDATE_PATH,
+            body,
+            login=self.login,
+            password=self.password,
+        )
         return data.get("configurationUpdateDataList") or []
 
 
 def gtk_get_its_password(settings: dict) -> str:
-    # 1. Старый/plaintext вариант, если он есть.
-    value = settings.get("its_password") or ""
-    if value:
-        return value
-
-    # 2. Новый вариант через secret_store, если модуль рядом и пароль сохранён.
+    # Пароли не читаются из config.json/settings.json. Основное окно получает
+    # секрет через u1c_credentials_session после запуска приложения.
     try:
-        from secret_store import get_secret, its_password_account
-        return get_secret(its_password_account()) or ""
+        from u1c_credentials_session import _secret_tool_lookup, _stable_its_secret_id
+        return _secret_tool_lookup(_stable_its_secret_id(settings)) or ""
     except Exception:
         return ""
 
@@ -1127,25 +1222,6 @@ def download_config_update_file_with_fallback(item: dict, program: str, release:
                 progress_func=progress_func,
                 progress_label=f"{program} {release}",
             )
-            if progress_func:
-                try:
-                    progress_func(100, 0, 0, f"{program} {release}: распаковка")
-                    GLib.idle_add(
-                        self.idle_set_current_operation,
-                        {
-                            "base": name,
-                            "release": release,
-                            "step": "Распаковка",
-                            "action": "Распаковка архива обновления",
-                            "mode": "UNPACK",
-                            "status": f"{program} {release}: распаковка",
-                            "pid": "-",
-                            "started": getattr(self, "_download_operation_started", "-") or "-",
-                        },
-                    )
-                except Exception:
-                    pass
-
             downloaded = prepare_1c_downloaded_update_file(downloaded, dest, release, log_func)
 
             if progress_func:
@@ -1153,10 +1229,6 @@ def download_config_update_file_with_fallback(item: dict, program: str, release:
                     progress_func(100, 0, 0, f"{program} {release}: готово")
                 except Exception:
                     pass
-
-
-            downloaded = prepare_1c_downloaded_update_file(downloaded, dest, release, log_func)
-
             validate_downloaded_update_file(downloaded)
 
             if downloaded.stat().st_size < 1024 * 1024:
@@ -2222,8 +2294,8 @@ class BaseDialog(Gtk.Dialog):
         self.cluster_profile = Ui.combo(cluster_labels)
         combo_set_values(self.cluster_profile, cluster_labels, selected_cluster_label)
         self.cluster_hint = Ui.label(
-            "<small>Профиль задаёт подключение к кластеру. Автоматическая регистрация и управление через rac "
-            "пока ограничены и не имитируются.</small>"
+            "<small>Профиль задаёт подключение к кластеру. Проверка выполняется по адресу и порту агента; "
+            "действия запускаются из выбранного профиля.</small>"
         )
 
         kind, connect = normalize_base_kind_and_connect(self.base)
@@ -2969,23 +3041,10 @@ def fetch_platform_distribution_links(release_url: str, version: str, login: str
 
 
 def make_releases_platform_client(login: str, password: str, branch: str):
-    """
-    Используем готовый клиент из Qt/main.py, потому что там уже реализована
-    правильная ticket-авторизация login.1c.ru -> releases.1c.ru.
-    """
-    import sys
-    project_root = str(Path(__file__).resolve().parent.parent)
-    if project_root not in sys.path:
-        sys.path.insert(0, project_root)
+    from core.onec_releases_client import OneCReleasesClient
 
-    from main import OneCReleasesPlatformClient
-
-    client = OneCReleasesPlatformClient(login, password)
-
-    if str(branch or "").startswith("8.5"):
-        client.PROJECT_NICK = "Platform85"
-    else:
-        client.PROJECT_NICK = "Platform83"
+    nick = "Platform85" if str(branch or "").startswith("8.5") else "Platform83"
+    client = OneCReleasesClient(login, password, nick)
 
     return client
 
@@ -3004,7 +3063,7 @@ def fetch_platform_releases_with_client(branch: str, login: str, password: str):
         result.append({
             "version": version,
             "title": version,
-            "url": client._version_files_url(version),
+            "url": client.version_files_url(version),
             "client": client,
         })
 
@@ -3323,11 +3382,10 @@ class GtkLogWorkerAdapter:
 
 
 def make_gtk_releases_client(login: str, password: str, branch: str):
-    ensure_project_root_on_path()
-    from main import OneCReleasesPlatformClient
+    from core.onec_releases_client import OneCReleasesClient
 
-    client = OneCReleasesPlatformClient(login, password)
-    client.PROJECT_NICK = "Platform85" if str(branch or "").startswith("8.5") else "Platform83"
+    nick = "Platform85" if str(branch or "").startswith("8.5") else "Platform83"
+    client = OneCReleasesClient(login, password, nick)
     return client
 
 
@@ -4035,7 +4093,41 @@ def filename_from_content_disposition(headers) -> str:
 
 
 
-def download_by_releases_version_file(item: dict, dest_dir: Path, login: str, password: str, log_func, progress_func=None, cancel_checker=None):
+def config_project_nick(program: str) -> str:
+    """Сопоставление кода update-api с nick проекта releases.1c.ru."""
+    key = re.sub(r"[^A-Za-z0-9]", "", str(program or "")).casefold()
+    mapping = {
+        "accounting": "Accounting30",
+        "accountingbase": "Accounting30",
+        "accountingcorp": "Accounting30",
+        "trade": "Trade110",
+        "tradebase": "Trade110",
+        "retail": "Retail20",
+        "retailbase": "Retail20",
+        "hrm": "HRM30",
+        "hrmbase": "HRM30",
+        "hrmcorp": "HRM30",
+        "documentmanagement": "DocumentManagement20",
+        "docmng": "DocumentManagement20",
+        "enterprise20": "EnterpriseERP20",
+        "enterpriseerp20": "EnterpriseERP20",
+        "erp": "EnterpriseERP20",
+        "smallbusiness": "SmallBusiness30",
+        "smallbusinessbase": "SmallBusiness30",
+    }
+    return mapping.get(key, str(program or "").strip())
+
+
+def download_by_releases_version_file(
+    item: dict,
+    dest_dir: Path,
+    login: str,
+    password: str,
+    log_func,
+    progress_func=None,
+    cancel_checker=None,
+    project_nick: str = "",
+):
     import requests
     from urllib.parse import urlparse, unquote
 
@@ -4045,10 +4137,24 @@ def download_by_releases_version_file(item: dict, dest_dir: Path, login: str, pa
         except Exception:
             return False
 
-    s = releases_form_login_session(login, password, log_func)
+    # Используем тот же ticket/cookie-контур, что и список версий. Старый
+    # прямой form-login давал ложные 401/HTML вместо файла на releases.1c.ru.
+    from core.onec_releases_client import OneCReleasesClient
+    version = item.get("version") or extract_release_from_any(item.get("title") or "")
+    client = OneCReleasesClient(login, password, project_nick or releases_platform_nick(version))
+    client._ensure_auth()
+    s = client.session
 
-    guessed_urls = releases_version_file_urls(item)
-    discovered_urls = discover_releases_version_file_urls(s, item, log_func)
+    if project_nick:
+        guessed_urls = []
+        discovered_urls = [
+            candidate.get("url")
+            for candidate in client.version_files(version)
+            if isinstance(candidate, dict) and candidate.get("url")
+        ]
+    else:
+        guessed_urls = releases_version_file_urls(item)
+        discovered_urls = discover_releases_version_file_urls(s, item, log_func)
 
     urls = []
     for url in discovered_urls + guessed_urls:
@@ -4164,6 +4270,54 @@ def download_by_releases_version_file(item: dict, dest_dir: Path, login: str, pa
         return dest
 
     return None
+
+
+def download_full_configuration_distribution(
+    program: str,
+    version: str,
+    dest_dir: Path,
+    login: str,
+    password: str,
+    log_func,
+    progress_func=None,
+):
+    """Находит и скачивает полный .cf-дистрибутив конфигурации."""
+    from core.onec_releases_client import OneCReleasesClient
+
+    project_nick = config_project_nick(program)
+    client = OneCReleasesClient(login, password, project_nick)
+    files = client.version_files(version)
+    candidates = []
+    for candidate in files:
+        name = str(candidate.get("fileName") or candidate.get("title") or "").lower()
+        if ".cf" not in name or ".cfu" in name:
+            continue
+        score = 0
+        if name.endswith("1cv8.cf") or name.endswith("1cv8.zip"):
+            score += 100
+        if "полный" in name or "full" in name or "дистрибутив" in name:
+            score += 20
+        candidates.append((score, candidate))
+
+    if not candidates:
+        raise RuntimeError(
+            f"В проекте {project_nick} не найден полный файл .cf для версии {version}. "
+            "Проверьте доступ ИТС и выбранный код конфигурации."
+        )
+
+    candidates.sort(key=lambda pair: pair[0], reverse=True)
+    item = dict(candidates[0][1])
+    item["version"] = version
+    log_func(f"Полный дистрибутив: проект={project_nick}; файл={item.get('fileName') or item.get('title')}")
+    return download_by_releases_version_file(
+        item,
+        Path(dest_dir),
+        login,
+        password,
+        log_func,
+        progress_func=progress_func,
+        project_nick=project_nick,
+    )
 
 def open_folder_external(path_value):
     path = Path(str(path_value or "")).expanduser()
@@ -4510,37 +4664,44 @@ class PlatformDownloadDialog(Gtk.Dialog):
 
         self.available_store.append([f"Подготовка списка версий платформы {branch}..."])
 
-        # Пока список формируем локально, но только по опубликованным версиям,
-        # чтобы в очередь не попадали локально установленные, но нескачиваемые сборки.
-        versions = []
+        parent = self.get_transient_for()
+        login = ""
+        password = ""
+        try:
+            login = parent.settings.get("its_login") if parent is not None else ""
+            password = parent.get_its_password_for_update() if parent is not None else ""
+        except Exception:
+            pass
 
-        if branch.startswith("8.5"):
-            versions.extend([
-                "8.5.1.1343",
-                "8.5.1.1302",
-                "8.5.1.1236",
-                "8.5.1.1150",
-            ])
-        else:
-            versions.extend([
-                "8.3.27.2130",
-                "8.3.27.2074",
-                "8.3.27.1786",
-                "8.3.25.1394",
-                "8.3.24.1548",
-            ])
+        def finish(versions, error=""):
+            self.available_store.clear()
+            if error:
+                self.available_store.append([f"Ошибка releases.1c.ru: {error}"])
+                return False
+            if not versions:
+                self.available_store.append(["releases.1c.ru не вернул опубликованные версии."])
+                return False
+            for version in versions:
+                self.release_meta[version] = {
+                    "version": version,
+                    "title": version,
+                    "url": "",
+                }
+                self.available_store.append([version])
+            return False
 
-        versions = sorted(set(versions), key=version_key, reverse=True)
+        def load_versions():
+            try:
+                client = make_releases_platform_client(login, password, branch)
+                versions = [
+                    version for version in client.platform_versions()
+                    if version.startswith(branch + ".")
+                ]
+                GLib.idle_add(finish, versions, "")
+            except Exception as exc:
+                GLib.idle_add(finish, [], f"{type(exc).__name__}: {exc}")
 
-        self.available_store.clear()
-
-        for version in versions:
-            self.release_meta[version] = {
-                "version": version,
-                "title": version,
-                "url": "",
-            }
-            self.available_store.append([version])
+        threading.Thread(target=load_versions, daemon=True).start()
 
     def on_available_row_activated(self, tree, path, column):
         model = tree.get_model()
@@ -4984,6 +5145,11 @@ class MainWindow(Gtk.Window):
 
         self._base_password_runtime_cache = {}
         self._last_launch_guard = {"key": "", "time": 0.0}
+        self._settings_widgets = {}
+        self._active_process = None
+        self._active_process_lock = threading.RLock()
+        self._operation_cancel_requested = False
+        self._operation_state = "idle"
 
         try:
             self._global_1c_ld_preload = install_global_1c_libgcc_preload()
@@ -5169,13 +5335,16 @@ class MainWindow(Gtk.Window):
             ("▤  Свойства", self.on_edit_base),
             ("🔄  Проверить настройки", self.on_check_selected_base_real),
             ("▼  Скачать обновления", self.on_download_updates_real),
+            ("▣  Полный дистрибутив", self.on_download_full_configuration_distribution),
             ("◻  Скачать платформу", self.on_download_platform),
             ("🔍  Установить обновления", self.on_auto_update),
         ]
+        self._base_action_buttons = {}
         for title, handler in buttons:
             b = Ui.button(title)
             b.connect("clicked", handler)
             actions.pack_start(b, False, False, 0)
+            self._base_action_buttons[title] = b
 
         columns = ["", "База", "Тип", "Конфигурация", "Версия", "Путь / сервер", "Платформа", "DB"]
         self.base_store = Gtk.TreeStore(bool, str, str, str, str, str, str, str, int)
@@ -5220,6 +5389,7 @@ class MainWindow(Gtk.Window):
         bottom.pack_end(b3, False, False, 0)
 
         self._load_bases_tree()
+        self.update_base_action_sensitivity()
 
     def _build_base_columns(self, titles):
         renderer_toggle = Gtk.CellRendererToggle()
@@ -5506,15 +5676,47 @@ class MainWindow(Gtk.Window):
 
         current = bool(self.base_store[tree_iter][0])
         new_value = not current
-        self.base_store[tree_iter][0] = new_value
-
-        # Если это группа, применяем галочку ко всем дочерним строкам.
-        child = self.base_store.iter_children(tree_iter)
-        while child is not None:
-            self.base_store[child][0] = new_value
-            child = self.base_store.iter_next(child)
+        self.set_tree_iter_checked_recursive(tree_iter, new_value)
+        self.recalculate_group_checks()
 
         self.update_bases_status()
+
+    def set_tree_iter_checked_recursive(self, tree_iter, checked):
+        if tree_iter is None:
+            return
+
+        self.base_store[tree_iter][0] = bool(checked)
+        child = self.base_store.iter_children(tree_iter)
+        while child is not None:
+            self.set_tree_iter_checked_recursive(child, checked)
+            child = self.base_store.iter_next(child)
+
+    def _tree_iter_check_summary(self, tree_iter):
+        if tree_iter is None:
+            return 0, 0
+
+        if not self.base_store.iter_has_child(tree_iter):
+            return 1, 1 if bool(self.base_store[tree_iter][0]) else 0
+
+        total = 0
+        checked = 0
+        child = self.base_store.iter_children(tree_iter)
+        while child is not None:
+            child_total, child_checked = self._tree_iter_check_summary(child)
+            total += child_total
+            checked += child_checked
+            child = self.base_store.iter_next(child)
+        return total, checked
+
+    def recalculate_group_checks(self, parent_iter=None):
+        """Синхронизирует bool-состояние групп с leaf-базами."""
+        child = self.base_store.iter_children(parent_iter)
+        while child is not None:
+            if self.base_store.iter_has_child(child):
+                self.recalculate_group_checks(child)
+                total, checked = self._tree_iter_check_summary(child)
+                self.base_store[child][0] = bool(total and total == checked)
+            child = self.base_store.iter_next(child)
 
     def on_check_all_bases(self, *_):
         """Отметить все базы и группы."""
@@ -5527,6 +5729,7 @@ class MainWindow(Gtk.Window):
                 child = self.base_store.iter_next(child)
 
         walk(None)
+        self.recalculate_group_checks()
         self.update_bases_status()
 
     def on_uncheck_all_bases(self, *_):
@@ -5540,6 +5743,7 @@ class MainWindow(Gtk.Window):
                 child = self.base_store.iter_next(child)
 
         walk(None)
+        self.recalculate_group_checks()
         self.update_bases_status()
 
     def update_bases_status(self):
@@ -5569,6 +5773,36 @@ class MainWindow(Gtk.Window):
             w = getattr(self, attr, None)
             if w is not None and hasattr(w, "set_text"):
                 w.set_text(value)
+
+        self.update_base_action_sensitivity()
+
+    def update_base_action_sensitivity(self):
+        """Отражает контекст выбора в доступности верхних действий."""
+        buttons = getattr(self, "_base_action_buttons", {})
+        if not buttons:
+            return
+
+        vals = self.selected_base_values()
+        selected = bool(vals)
+        try:
+            has_targets = bool(self.gtk_operation_target_indices())
+        except Exception:
+            has_targets = selected and not bool(vals.get("is_group")) if vals else False
+
+        for title, enabled in (
+            ("▤  Свойства", selected),
+            ("🔄  Проверить настройки", has_targets),
+            ("▼  Скачать обновления", has_targets),
+            ("▣  Полный дистрибутив", has_targets),
+            ("◻  Скачать платформу", has_targets),
+            ("🔍  Установить обновления", has_targets),
+        ):
+            button = buttons.get(title)
+            if button is not None:
+                try:
+                    button.set_sensitive(bool(enabled))
+                except Exception:
+                    pass
 
     def selected_base_iter(self):
         selection = self.base_tree.get_selection()
@@ -6092,92 +6326,123 @@ class MainWindow(Gtk.Window):
         return real_base
 
     def on_check_selected_base_real(self, *_):
-        vals = self.selected_base_values()
-        base = self.require_current_base_dict()
-        if not base:
+        """Проверить отмеченные базы последовательно, пропуская строки групп.
+
+        Галочка группы является только способом отметить ее дочерние строки.
+        Сама группа не является информационной базой и не должна передаваться
+        в ``require_current_base_dict`` или ``detect_metadata_by_dump``.
+        """
+        # Сохраняем введенные реквизиты текущей листовой строки перед пакетной
+        # операцией. Для группы метод ничего не меняет.
+        try:
+            self.save_current_credentials_to_selected_base(silent=True)
+        except Exception:
+            pass
+
+        indexes = self.gtk_operation_target_indices()
+        targets = []
+
+        for idx in indexes:
+            if not (0 <= idx < len(self.bases)):
+                continue
+
+            source = self.bases[idx]
+            if not isinstance(source, dict):
+                continue
+
+            base = dict(source)
+            base["user"] = str(
+                source.get("user")
+                or source.get("username")
+                or source.get("login")
+                or ""
+            ).strip()
+            try:
+                base["password"] = self.get_base_password(source)
+            except Exception:
+                base["password"] = str(source.get("password") or "")
+
+            targets.append((idx, base))
+
+        if not targets:
+            dlg = Gtk.MessageDialog(
+                transient_for=self,
+                flags=0,
+                message_type=Gtk.MessageType.INFO,
+                buttons=Gtk.ButtonsType.OK,
+                text="Не выбраны базы для проверки",
+            )
+            dlg.format_secondary_text(
+                "Отметьте одну или несколько строк информационных баз. "
+                "Группа сама по себе проверяться не может."
+            )
+            dlg.run()
+            dlg.destroy()
             return
 
         def work(log):
-            log(f"--- Проверка базы: {base.get('name', '')} ---")
+            total = len(targets)
+            success = 0
+            failed = 0
 
-            kind, connect = normalize_base_kind_and_connect(base)
-            log(f"Тип: {kind}")
-            log(f"Подключение: {connect}")
-            log("Метод определения конфигурации: DumpConfigToFiles Configuration.xml")
+            for position, (idx, base) in enumerate(targets, 1):
+                base_name = base.get("name") or f"база #{idx + 1}"
+                log(f"--- Проверка базы {position}/{total}: {base_name} ---")
 
-            if kind == "file":
-                db_path = Path(connect)
+                try:
+                    kind, connect = normalize_base_kind_and_connect(base)
+                    log(f"Тип: {kind}")
+                    log(f"Подключение: {connect}")
+                    log("Метод определения конфигурации: DumpConfigToFiles Configuration.xml")
 
-                if db_path.is_file() and db_path.name.lower() == "1cv8.1cd":
-                    log(f"Файл базы найден: {db_path}")
-                    base["connect"] = str(db_path.parent)
-                elif db_path.is_dir() and (db_path / "1Cv8.1CD").exists():
-                    log(f"Файловая база найдена: {db_path / '1Cv8.1CD'}")
-                else:
-                    log(f"ОШИБКА: файловая база не найдена: {connect}")
-                    return
+                    if kind == "file":
+                        db_path = Path(connect)
 
-            result = detect_metadata_by_dump(base, self.settings, log)
+                        if db_path.is_file() and db_path.name.lower() == "1cv8.1cd":
+                            log(f"Файл базы найден: {db_path}")
+                            base["connect"] = str(db_path.parent)
+                        elif db_path.is_dir() and (db_path / "1Cv8.1CD").exists():
+                            log(f"Файловая база найдена: {db_path / '1Cv8.1CD'}")
+                        else:
+                            raise RuntimeError(f"Файловая база не найдена: {connect}")
 
-            name = result.get("config_name") or ""
-            synonym = result.get("config_synonym") or ""
-            version = result.get("config_version") or ""
+                    result = detect_metadata_by_dump(base, self.settings, log)
 
-            log(f"Определено: {name} / {synonym} / {version}")
+                    name = result.get("config_name") or ""
+                    synonym = result.get("config_synonym") or ""
+                    version = result.get("config_version") or ""
+                    guessed_program = self.guess_update_program_name_from_metadata(
+                        name, synonym, base.get("name")
+                    )
 
-            idx = vals.get("index", -1) if vals else -1
-            if 0 <= idx < len(self.bases):
-                base["config_name"] = name
-                base["config_synonym"] = synonym
-                base["config_version"] = version
-                if not base.get("update_program_name"):
-                    hay = (name + " " + synonym).lower()
+                    log(f"Определено: {name} / {synonym} / {version}")
 
-                    if "бухгалтер" in hay or "accounting" in hay:
-                        base["update_program_name"] = "Accounting"
+                    real_base = self.apply_checked_metadata_to_real_base(
+                        base,
+                        name,
+                        synonym,
+                        version,
+                        guessed_program,
+                    )
 
-                    elif (
-                        "управление торговлей" in hay
-                        or "управлениеторговлей" in hay.replace(" ", "")
-                        or "торговл" in hay
-                        or "trade" in hay
-                    ):
-                        base["update_program_name"] = "Trade"
+                    log(f"Текущая версия конфигурации: {version or '-'}")
+                    log(f"Код программы обновлений: {real_base.get('update_program_name') or '-'}")
+                    log("Проверка настроек: завершено")
+                    success += 1
 
-                    elif "документооборот" in hay or "document" in hay or "docmng" in hay:
-                        base["update_program_name"] = "DocumentManagement"
+                except Exception as error:
+                    failed += 1
+                    log(f"ОШИБКА проверки базы «{base_name}»: {type(error).__name__}: {error}")
 
-                    elif "зарплата" in hay or "зуп" in hay or "hrm" in hay or "salary" in hay:
-                        base["update_program_name"] = "HRM"
-
-                    elif "управление нашей фирмой" in hay or "унф" in hay or "smallbusiness" in hay:
-                        base["update_program_name"] = "SmallBusiness"
-
-                    elif "erp" in hay:
-                        base["update_program_name"] = "ERP"
-
-                self.config["bases"] = self.bases
-                save_json(self.config_path, self.config)
-                GLib.idle_add(self._load_bases_tree)
-
-                guessed_program = self.guess_update_program_name_from_metadata(name, synonym, base.get("name"))
-                if guessed_program:
-                    base["update_program_name"] = guessed_program
-
-            checked_base = self.apply_checked_metadata_to_real_base(
-                base,
-                name,
-                synonym,
-                version,
-                self.guess_update_program_name_from_metadata(name, synonym, base.get("name")),
+            log(
+                f"Проверка настроек завершена: успешно — {success}, "
+                f"с ошибками — {failed}, всего — {total}."
             )
 
-            log(f"Текущая версия конфигурации: {version or '-'}")
-            log(f"Код программы обновлений: {base.get('update_program_name') or '-'}")
-            GLib.idle_add(self.refresh_bases_tree_keep_selected, base)
-            log("Проверка настроек: завершено")
-
-        self.run_in_background("Проверка настроек", work)
+        self.run_in_background(
+            f"Проверка настроек ({len(targets)} баз)",
+            work,
+        )
 
     def on_run_base_real(self, *_):
         self.launch_selected_base("ENTERPRISE")
@@ -6337,19 +6602,7 @@ class MainWindow(Gtk.Window):
         return env
 
     def mask_1c_command_for_log(self, args):
-        import re
-        safe = []
-
-        for arg in args:
-            s = str(arg)
-
-            if s.startswith("/P") and len(s) > 2:
-                s = "/P***"
-
-            if "Pwd=" in s:
-                s = re.sub(r'Pwd="[^"]*"', 'Pwd="***"', s)
-
-            safe.append(s)
+        safe = mask_sensitive_command_args(args)
 
         try:
             return command_to_text(safe)
@@ -6978,6 +7231,7 @@ class MainWindow(Gtk.Window):
             ("Сохранить конфигурацию в cf", self.on_context_save_config_cf),
             ("Загрузить конфигурацию из cf", self.on_context_load_config_cf),
             ("Скачать обновления", self.on_download_updates_real),
+            ("Полный дистрибутив", self.on_download_full_configuration_distribution),
             ("Скачать платформу", self.on_download_platform),
             ("Установить обновления", self.on_auto_update),
             ("Очистить кэш", self.on_clear_cache_real),
@@ -7062,12 +7316,8 @@ class MainWindow(Gtk.Window):
         if tree_iter is None:
             return
 
-        self.base_store[tree_iter][0] = checked
-
-        child = self.base_store.iter_children(tree_iter)
-        while child is not None:
-            self.base_store[child][0] = checked
-            child = self.base_store.iter_next(child)
+        self.set_tree_iter_checked_recursive(tree_iter, checked)
+        self.recalculate_group_checks()
 
         self.update_bases_status()
 
@@ -10231,7 +10481,7 @@ class MainWindow(Gtk.Window):
                 else:
                     args.insert(1, "DESIGNER")
 
-        safe_args = []
+        safe_args = mask_sensitive_command_args(args)
         user_filled = False
         password_filled = False
 
@@ -10241,15 +10491,11 @@ class MainWindow(Gtk.Window):
             if s.startswith("/N") and len(s) > 2:
                 user_filled = True
 
-            if s.startswith("/P") and len(s) > 2:
+            if s.casefold() == "/p" or (s.casefold().startswith("/p") and len(s) > 2):
                 password_filled = True
-                s = "/P***"
 
-            if "Pwd=" in s:
+            if re.search(r"(?i)(?:pwd|password|pass|secret|token|cookie)\s*[=:]", s):
                 password_filled = True
-                s = re.sub(r'Pwd="[^"]*"', 'Pwd="***"', s)
-
-            safe_args.append(s)
 
         try:
             env = self.onec_launch_env()
@@ -10269,7 +10515,7 @@ class MainWindow(Gtk.Window):
         try:
             Path("/tmp/updater1c_last_launch_command.txt").write_text(
                 "SAFE_COMMAND=" + command_text + "\\n"
-                + "ARGS_REPR=" + repr(args) + "\\n"
+                + "ARGS_REPR=<redacted>\\n"
                 + "USER_FILLED=" + str(user_filled) + "\\n"
                 + "PASSWORD_FILLED=" + str(password_filled) + "\\n"
                 + "LD_PRELOAD=" + str(env.get("LD_PRELOAD", "")) + "\\n",
@@ -10278,7 +10524,22 @@ class MainWindow(Gtk.Window):
         except Exception:
             pass
 
-        subprocess.Popen(args, close_fds=True, env=env)
+        process = subprocess.Popen(args, close_fds=True, env=env, start_new_session=True)
+        with self._active_process_lock:
+            self._active_process = process
+            self._operation_state = "running"
+
+        def clear_launch_process():
+            try:
+                process.wait()
+            except Exception:
+                pass
+            with self._active_process_lock:
+                if self._active_process is process:
+                    self._active_process = None
+                    self._operation_state = "idle"
+
+        threading.Thread(target=clear_launch_process, daemon=True).start()
         self._append_log("Процесс 1С запущен.")
 
     def on_run_base_stub(self, *_):
@@ -10325,6 +10586,7 @@ class MainWindow(Gtk.Window):
         tab = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         tab.set_border_width(10)
         self.notebook.append_page(tab, Ui.label("▤  Настройки программы"))
+        self._settings_widgets.clear()
 
         inner = Gtk.Notebook()
         tab.pack_start(inner, True, True, 0)
@@ -10359,7 +10621,9 @@ class MainWindow(Gtk.Window):
         btn_save_settings.connect("clicked", self.on_save_settings_real)
         buttons.pack_start(btn_save_settings, False, False, 0)
 
-        buttons.pack_start(Ui.button("Найти платформы 1С"), False, False, 0)
+        find_platforms = Ui.button("Найти платформы 1С")
+        find_platforms.connect("clicked", self.on_find_platforms_from_settings)
+        buttons.pack_start(find_platforms, False, False, 0)
 
 
     def _build_its_tab(self):
@@ -10400,22 +10664,11 @@ class MainWindow(Gtk.Window):
 
         if password:
             saved = False
-
             try:
-                ensure_project_root_on_path()
-                from secret_store import set_secret, its_password_account
-                set_secret(its_password_account(), password)
-                saved = True
+                from u1c_credentials_session import _store_its
+                saved = _store_its(self, password)
             except Exception as e:
-                self._append_log(f"Внимание: не удалось сохранить ИТС пароль через secret_store: {type(e).__name__}: {e}")
-
-            if not saved:
-                try:
-                    import keyring
-                    keyring.set_password("updater1c-linux", "its_password", password)
-                    saved = True
-                except Exception as e:
-                    self._append_log(f"Внимание: не удалось сохранить ИТС пароль через keyring: {type(e).__name__}: {e}")
+                self._append_log(f"Внимание: не удалось сохранить ИТС пароль в Secret Service: {type(e).__name__}: {e}")
 
             if saved:
                 self.settings["its_password_saved"] = True
@@ -10444,39 +10697,55 @@ class MainWindow(Gtk.Window):
         except Exception:
             pass
 
-        direct = self.settings.get("its_password") or ""
-        if direct:
-            return direct
-
         try:
-            ensure_project_root_on_path()
-            from secret_store import get_secret, its_password_account
-            value = get_secret(its_password_account()) or ""
+            from u1c_credentials_session import _lookup_its
+            value = _lookup_its(self) or ""
             if value:
                 return value
         except Exception:
             pass
 
-        for service, account in [
-            ("updater1c-linux", "its_password"),
-            ("Обновлятор 1С", "its_password"),
-            ("updater1c", "its_password"),
-        ]:
-            try:
-                import keyring
-                value = keyring.get_password(service, account) or ""
-                if value:
-                    return value
-            except Exception:
-                pass
-
         return ""
 
     def on_save_settings_real(self, *_):
+        self.collect_settings_from_widgets()
         self.save_its_settings_to_store()
         self.config["settings"] = self.settings
         save_json(self.config_path, self.config)
         self._append_log("Настройки сохранены.")
+
+    def collect_settings_from_widgets(self):
+        """Считывает значения всех полей вкладки настроек перед сохранением."""
+        for key, widget in getattr(self, "_settings_widgets", {}).items():
+            try:
+                if hasattr(widget, "get_active_text"):
+                    value = widget.get_active_text()
+                    if value is None:
+                        continue
+                else:
+                    value = widget.get_text()
+                self.settings[key] = str(value or "").strip()
+            except Exception as error:
+                self._append_log(f"Не удалось прочитать настройку {key}: {type(error).__name__}: {error}")
+
+    def on_find_platforms_from_settings(self, *_):
+        """Открывает штатный диалог поиска/выбора платформы."""
+        try:
+            dialog = PlatformDownloadDialog(self)
+            response = dialog.run()
+            if response == Gtk.ResponseType.OK:
+                selected = getattr(dialog, "selected_version", "") or ""
+                if selected:
+                    self.settings["selected_platform"] = str(selected)
+                    widget = self._settings_widgets.get("selected_platform")
+                    if widget is not None and hasattr(widget, "set_active"):
+                        combo_set_values(widget, [str(selected)], str(selected))
+                    elif widget is not None:
+                        widget.set_text(str(selected))
+                    self._append_log(f"Выбрана платформа: {selected}. Нажмите «сохранить настройки»." )
+            dialog.destroy()
+        except Exception as error:
+            self._append_log(f"Не удалось открыть поиск платформ: {type(error).__name__}: {error}")
 
 
     def _form_tab(self, rows, combos=False, service=False):
@@ -10486,6 +10755,19 @@ class MainWindow(Gtk.Window):
         grid.set_column_spacing(12)
         grid.set_row_spacing(12)
         box.pack_start(grid, False, False, 0)
+
+        key_by_label = {
+            "1cestart:": "one_c_start",
+            "Папка обновлений конфигураций:": "updates_dir",
+            "Папка новых файловых баз:": "default_new_base_dir",
+            "Папка скачивания платформ:": "platform_download_dir",
+            "Папка резервных копий:": "backup_dir",
+            "Папка логов:": "reports_dir",
+            "Запуск web-баз:": "web_launch_mode",
+            "Платформа для запуска:": "selected_platform",
+            "Внешняя обработка проверки метаданных .epf:": "metadata_probe_path",
+            "Метод определения конфигурации:": "metadata_detection_method",
+        }
 
         for i, (label, value) in enumerate(rows):
             grid.attach(Ui.label(label), 0, i, 1, 1)
@@ -10502,6 +10784,10 @@ class MainWindow(Gtk.Window):
                 grid.attach(row, 1, i, 1, 1)
             else:
                 grid.attach(w, 1, i, 1, 1)
+
+            key = key_by_label.get(label)
+            if key:
+                self._settings_widgets[key] = w
         return box
 
     def _build_scripts_tab(self):
@@ -10511,7 +10797,7 @@ class MainWindow(Gtk.Window):
 
         tab.pack_start(Ui.label("Скрипты для выбранных баз"), False, False, 0)
         self.script_text = Gtk.TextView()
-        self.script_text.get_buffer().set_text("# Следующий этап: rac/ras — блокировка пользователей и регламентных заданий.\n")
+        self.script_text.get_buffer().set_text("# Команды обслуживания кластера выполняются из профиля «Кластеры 1С».\n")
         tab.pack_start(self._scrolled(self.script_text), True, True, 0)
 
 
@@ -10525,17 +10811,24 @@ class MainWindow(Gtk.Window):
 
         for text, handler in [
             ("▶ Запустить обновление", self.on_auto_update),
-            ("▼ Скачать обновления", self.on_stub),
+            ("▼ Скачать обновления", self.on_download_updates_real),
             ("◻ Скачать платформу", self.on_download_platform),
             ("🔍 Установить обновления", self.on_auto_update),
-            ("✖ Отменить", self.on_stub),
+            ("✖ Отменить", self.on_cancel_operation_real),
         ]:
             b = Ui.button(text)
             b.connect("clicked", handler)
             top.pack_start(b, False, False, 0)
+            if text == "✖ Отменить":
+                self.report_cancel_button = b
 
-        top.pack_end(Ui.button("💾 Сохранить лог"), False, False, 0)
-        top.pack_end(Ui.button("🧹 Очистить лог"), False, False, 0)
+        save_log = Ui.button("💾 Сохранить лог")
+        save_log.connect("clicked", self.on_save_current_log)
+        top.pack_end(save_log, False, False, 0)
+
+        clear_log = Ui.button("🧹 Очистить лог")
+        clear_log.connect("clicked", self.on_clear_current_log)
+        top.pack_end(clear_log, False, False, 0)
 
         status = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
         tab.pack_start(status, False, False, 0)
@@ -10558,7 +10851,9 @@ class MainWindow(Gtk.Window):
         b_reports.connect("clicked", self.open_reports_dir)
         links.pack_start(b_reports, False, False, 0)
 
-        links.pack_start(Ui.button("Открыть текущий лог"), False, False, 0)
+        open_current_log = Ui.button("Открыть текущий лог")
+        open_current_log.connect("clicked", self.on_open_current_log)
+        links.pack_start(open_current_log, False, False, 0)
 
         b_platforms = Ui.button("Открыть папку с платформами")
         b_platforms.connect("clicked", self.open_platform_download_dir)
@@ -10586,6 +10881,8 @@ class MainWindow(Gtk.Window):
         right.pack_start(Ui.label("<b>Аварийное завершение</b>\nПроцесс 1С может зависнуть и не завершиться автоматически.\nНажмите «Прервать», чтобы завершить его принудительно."), False, False, 0)
         abort = Ui.button("■  Прервать процесс сейчас")
         abort.get_style_context().add_class("danger")
+        abort.connect("clicked", self.on_cancel_operation_real)
+        self.report_abort_button = abort
         right.pack_start(abort, False, False, 0)
         right.pack_start(Ui.check("Автоматически предлагать откат после прерывания", True), False, False, 0)
 
@@ -11040,8 +11337,85 @@ class MainWindow(Gtk.Window):
 
         self._append_log("Очистка кэша 1С завершена.")
 
+    def _current_report_text(self):
+        try:
+            buf = self.report.get_buffer()
+            start, end = buf.get_bounds()
+            return buf.get_text(start, end, True)
+        except Exception:
+            return ""
+
+    def _reports_directory(self):
+        path = self.settings.get("reports_dir") or self.settings.get("report_dir")
+        return Path(path or (Path.home() / "1c-update-reports")).expanduser()
+
+    def on_clear_current_log(self, *_):
+        try:
+            self.report.get_buffer().set_text("")
+            self._append_log("Текущий лог очищен только в интерфейсе; сохранённые файлы не удалены.")
+        except Exception as error:
+            self._append_log(f"Не удалось очистить текущий лог: {type(error).__name__}: {error}")
+
+    def on_save_current_log(self, *_):
+        try:
+            directory = self._reports_directory()
+            directory.mkdir(parents=True, exist_ok=True)
+            path = directory / f"updater1c_report_{now_stamp()}.log"
+            path.write_text(self._current_report_text(), encoding="utf-8")
+            self._append_log(f"Лог сохранен: {path}")
+        except Exception as error:
+            self._append_log(f"Не удалось сохранить текущий лог: {type(error).__name__}: {error}")
+
+    def on_open_current_log(self, *_):
+        try:
+            directory = self._reports_directory()
+            directory.mkdir(parents=True, exist_ok=True)
+            logs = sorted(directory.glob("*.log"), key=lambda p: p.stat().st_mtime)
+            path = logs[-1] if logs else directory / f"updater1c_current_log_{now_stamp()}.log"
+            if not path.exists():
+                path.write_text(self._current_report_text(), encoding="utf-8")
+            open_folder_external(path)
+        except Exception as error:
+            self._append_log(f"Не удалось открыть текущий лог: {type(error).__name__}: {error}")
+
     def on_cancel_operation_real(self, *_):
-        self._append_log("Отмена: активная фоновая операция GTK сейчас не запущена.")
+        with self._active_process_lock:
+            process = self._active_process
+            self._operation_cancel_requested = True
+            self._operation_state = "cancelling" if process is not None else "idle"
+
+        # Также останавливаем циклы скачивания, если активна download-операция.
+        self.cancel_requested = True
+
+        if process is None or process.poll() is not None:
+            self._append_log("Отмена: активный процесс 1С не найден.")
+            return
+
+        self._append_log(f"Запрошена отмена процесса 1С (PID {process.pid}).")
+
+        def terminate_group():
+            try:
+                pgid = os.getpgid(process.pid)
+                os.killpg(pgid, signal.SIGTERM)
+                GLib.idle_add(self._append_log, "Процесс 1С получает SIGTERM.")
+            except Exception as error:
+                GLib.idle_add(self._append_log, f"Не удалось мягко остановить процесс: {type(error).__name__}: {error}")
+                return
+
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                if process.poll() is not None:
+                    break
+                time.sleep(0.15)
+
+            if process.poll() is None:
+                try:
+                    os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                    GLib.idle_add(self._append_log, "Процесс 1С не завершился после SIGTERM; отправлен SIGKILL.")
+                except Exception as error:
+                    GLib.idle_add(self._append_log, f"Не удалось принудительно завершить процесс: {type(error).__name__}: {error}")
+
+        threading.Thread(target=terminate_group, daemon=True).start()
 
 
     def on_stub(self, *_):
@@ -11147,6 +11521,7 @@ class MainWindow(Gtk.Window):
         if env.get("LD_PRELOAD"):
             log("LD_PRELOAD: " + env.get("LD_PRELOAD", ""))
 
+        self._operation_cancel_requested = False
         proc = subprocess.Popen(
             final_args,
             stdout=subprocess.PIPE,
@@ -11154,23 +11529,37 @@ class MainWindow(Gtk.Window):
             text=True,
             errors="replace",
             env=env,
+            start_new_session=True,
         )
+        with self._active_process_lock:
+            self._active_process = proc
+            self._operation_state = "running"
         try:
             out, _ = proc.communicate(timeout=max(1, int(timeout)))
         except subprocess.TimeoutExpired:
             try:
-                proc.kill()
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
             except Exception:
-                pass
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
             out, _ = proc.communicate()
             if out and out.strip():
                 log(out.strip()[-6000:])
             raise RuntimeError(f"Таймаут операции 1С: {timeout} сек.")
+        finally:
+            with self._active_process_lock:
+                if self._active_process is proc:
+                    self._active_process = None
+                    self._operation_state = "idle"
 
         if out and out.strip():
             log(out.strip()[-6000:])
 
         log(f"Код завершения: {proc.returncode}")
+        if self._operation_cancel_requested:
+            raise RuntimeError("Операция отменена пользователем")
         if proc.returncode != 0:
             raise RuntimeError(f"Команда завершилась с кодом {proc.returncode}")
 
@@ -11489,6 +11878,86 @@ class MainWindow(Gtk.Window):
                         raise
 
         self.run_in_background("Автообновление", work)
+
+    def on_download_full_configuration_distribution(self, *_):
+        """Скачать полный дистрибутив конфигурации (.cf), отдельно от .cfu."""
+        base = self.require_current_base_dict()
+        if not base:
+            return
+
+        program = self.guess_update_program_for_base(base)
+        version = str(
+            base.get("config_version")
+            or base.get("configuration_version")
+            or base.get("version")
+            or ""
+        ).strip()
+
+        if not program or not version:
+            self._append_log(
+                "ОШИБКА: для полного дистрибутива не определены код конфигурации или версия. "
+                "Сначала выполните «Проверить настройки»."
+            )
+            return
+
+        login = self.settings.get("its_login") or ""
+        password = self.get_its_password_for_update()
+        if not login or not password:
+            self._append_log(
+                "ОШИБКА: не заполнены логин/пароль ИТС. "
+                "Проверьте вкладку Настройки программы → ИТС."
+            )
+            return
+
+        base_name = str(base.get("name") or program)
+        destination = update_release_dir(
+            self.settings,
+            program,
+            f"full_{version}",
+        )
+
+        def work(log):
+            log(f"База: {base_name}")
+            log(f"Код конфигурации: {program}")
+            log(f"Версия полного дистрибутива: {version}")
+            log(f"Папка назначения: {destination}")
+
+            def progress(percent, done, total, text):
+                GLib.idle_add(
+                    self.set_download_operation_progress,
+                    percent,
+                    text,
+                    base_name,
+                    version,
+                    "-",
+                    "Загрузка полного дистрибутива",
+                )
+
+            downloaded = download_full_configuration_distribution(
+                program,
+                version,
+                destination,
+                login,
+                password,
+                log,
+                progress_func=progress,
+            )
+            if downloaded:
+                log(f"Полный дистрибутив скачан: {downloaded}")
+            else:
+                log("ОШИБКА: полный дистрибутив не найден или не скачан.")
+
+        self._download_operation_started = ""
+        GLib.idle_add(
+            self.set_download_operation_progress,
+            0,
+            "Подготовка полного дистрибутива",
+            base_name,
+            version,
+            "-",
+            "Загрузка полного дистрибутива",
+        )
+        self.run_in_background("Скачивание полного дистрибутива", work)
 
     def on_download_platform(self, *_):
         dlg = PlatformDownloadDialog(self)
@@ -12978,6 +13447,17 @@ try:
         return pages
 
     def _u1c_report_default_reports_dir():
+        try:
+            for win in _u1c_report_Gtk.Window.list_toplevels():
+                settings = getattr(win, "settings", None) or {}
+                configured = settings.get("reports_dir") or settings.get("report_dir")
+                if configured:
+                    path = _u1c_report_Path(str(configured)).expanduser()
+                    path.mkdir(parents=True, exist_ok=True)
+                    return path
+        except Exception:
+            pass
+
         candidates = [
             _u1c_report_Path.home() / "Документы" / "Updater1C" / "1c-update-reports",
             _u1c_report_Path.home() / "Documents" / "Updater1C" / "1c-update-reports",
@@ -13369,6 +13849,11 @@ try:
         return row
 
     def _u1c_report_action_cancel(button, page):
+        parent = _u1c_report_parent(button)
+        if parent is not None and hasattr(parent, "on_cancel_operation_real"):
+            parent.on_cancel_operation_real(button)
+            return
+
         source_buttons = _u1c_report_find_buttons_in_page(page)
         cancel = source_buttons.get("cancel")
 

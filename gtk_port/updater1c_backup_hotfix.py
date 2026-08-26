@@ -280,7 +280,9 @@ def _open_backup_dialog_fixed(mod, parent, base: dict):
     base_path = str(base.get("path") or "")
     release = _release_from_base(base)
 
-    default_dir = Path("/mnt/DataStore/Updater1C/1c-backups") / base_name
+    settings = getattr(parent, "settings", None) or {}
+    backup_root = settings.get("backup_dir") or settings.get("backups_dir") or "/mnt/DataStore/Updater1C/1c-backups"
+    default_dir = Path(backup_root).expanduser() / base_name
     default_dir.mkdir(parents=True, exist_ok=True)
 
     profiles, _unused, dbms = _load_dbms_profiles()
@@ -340,7 +342,7 @@ def _open_backup_dialog_fixed(mod, parent, base: dict):
         mode_combo.append_text("Файловая база: архивировать 1Cv8.1CD в .zip")
     else:
         mode_combo.append_text("Серверная/веб база: выгрузка в .dt через 1С")
-        mode_combo.append_text("PostgreSQL: pg_dump")
+        mode_combo.append_text("PostgreSQL: серверный архив")
         mode_combo.append_text("Microsoft SQL Server: BACKUP DATABASE через sqlcmd")
     mode_combo.set_active(0)
     grid.attach(mode_combo, 1, row, 2, 1)
@@ -443,6 +445,9 @@ def _open_backup_dialog_fixed(mod, parent, base: dict):
     def apply_profile(_combo=None):
         p = selected_profile()
         if not p:
+            for widget in (db_host_entry, db_port_entry, db_name_entry, db_user_entry, db_pwd_entry):
+                widget.set_text("")
+            mode_combo.set_active(0)
             return
 
         db_host_entry.set_text(p.get("ops_address") or "")
@@ -461,6 +466,21 @@ def _open_backup_dialog_fixed(mod, parent, base: dict):
             _combo_set_by_contains(mode_combo, "Microsoft SQL")
 
     profile_combo.connect("changed", apply_profile)
+
+    db_widgets = [db_host_entry, db_port_entry, db_name_entry, db_user_entry, db_pwd_entry]
+
+    def update_db_fields(_combo=None):
+        mode_text = (mode_combo.get_active_text() or "").casefold()
+        enabled = "postgresql" in mode_text or "microsoft sql" in mode_text
+        for widget in db_widgets:
+            try:
+                widget.set_sensitive(enabled)
+            except Exception:
+                pass
+
+    mode_combo.connect("changed", update_db_fields)
+    update_db_fields()
+
     if matched:
         apply_profile()
 

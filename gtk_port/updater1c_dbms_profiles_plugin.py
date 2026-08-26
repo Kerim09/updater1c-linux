@@ -992,7 +992,7 @@ def _enhanced_backup_dialog(backup_mod, parent, base: dict):
         mode_combo.append_text("Файловая база: архивировать 1Cv8.1CD в .zip")
     else:
         mode_combo.append_text("Серверная/веб база: выгрузка в .dt через 1С")
-        mode_combo.append_text("PostgreSQL: pg_dump")
+        mode_combo.append_text("PostgreSQL: серверный архив")
         mode_combo.append_text("Microsoft SQL Server: BACKUP DATABASE через sqlcmd")
 
     mode_combo.set_active(0)

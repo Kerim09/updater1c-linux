@@ -730,7 +730,9 @@ def _open_backup_dialog(parent, base: dict):
     base_type = (base.get("type") or "").lower()
     base_path = base.get("path") or ""
 
-    default_dir = Path("/mnt/DataStore/Updater1C/1c-backups") / base_name
+    settings = getattr(parent, "settings", None) or {}
+    backup_root = settings.get("backup_dir") or settings.get("backups_dir") or "/mnt/DataStore/Updater1C/1c-backups"
+    default_dir = Path(backup_root).expanduser() / base_name
     default_dir.mkdir(parents=True, exist_ok=True)
 
     dlg = Gtk.Dialog(
@@ -777,7 +779,7 @@ def _open_backup_dialog(parent, base: dict):
         mode_combo.append_text("Файловая база: архивировать 1Cv8.1CD в .zip")
     else:
         mode_combo.append_text("Серверная/веб база: выгрузка в .dt через 1С")
-        mode_combo.append_text("PostgreSQL: pg_dump")
+        mode_combo.append_text("PostgreSQL: серверный архив")
         mode_combo.append_text("Microsoft SQL Server: BACKUP DATABASE через sqlcmd")
 
     mode_combo.set_active(0)
@@ -811,7 +813,7 @@ def _open_backup_dialog(parent, base: dict):
     row += 1
 
     add_label("Параметры СУБД")
-    hint = Gtk.Label(label="Заполняются только для pg_dump/sqlcmd")
+    hint = Gtk.Label(label="Поля используются выбранным профилем СУБД")
     hint.set_xalign(0)
     grid.attach(hint, 1, row, 2, 1)
     row += 1
@@ -839,6 +841,20 @@ def _open_backup_dialog(parent, base: dict):
     except Exception:
         pass
     row += 1
+
+    db_widgets = [db_host_entry, db_port_entry, db_name_entry, db_user_entry, db_pwd_entry]
+
+    def update_db_fields(_combo=None):
+        mode_text = (mode_combo.get_active_text() or "").casefold()
+        enabled = "postgresql" in mode_text or "microsoft sql" in mode_text
+        for widget in db_widgets:
+            try:
+                widget.set_sensitive(enabled)
+            except Exception:
+                pass
+
+    mode_combo.connect("changed", update_db_fields)
+    update_db_fields()
 
     area.show_all()
 
@@ -949,7 +965,7 @@ def _run_backup_thread(**kwargs):
 
         if "1Cv8.1CD" in mode or ".zip" in mode:
             out_file = _backup_file_zip(base, out_dir)
-        elif "pg_dump" in mode:
+        elif "pg_dump" in mode or "серверный архив" in mode:
             out_file = _backup_postgresql(
                 base,
                 out_dir,

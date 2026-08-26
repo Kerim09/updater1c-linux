@@ -380,10 +380,7 @@ def _lookup_base(
         if cache.get(secret_id):
             value = str(cache[secret_id])
         else:
-            value = (
-                _secret_tool_lookup(secret_id)
-                or _python_keyring_lookup(secret_id)
-            )
+            value = _secret_tool_lookup(secret_id)
 
         if not value:
             continue
@@ -425,12 +422,6 @@ def _store_base(
         f"Обновлятор 1С — {base.get('name') or 'база 1С'}",
     )
 
-    if not stored:
-        stored = _python_keyring_store(
-            secret_id,
-            password,
-        )
-
     base["password_secret_id"] = secret_id
     base["password_saved"] = bool(stored)
 
@@ -463,10 +454,7 @@ def _lookup_its(window: Any) -> str:
     value = ""
 
     for account in candidates:
-        value = (
-            _secret_tool_lookup(account)
-            or _python_keyring_lookup(account)
-        )
+        value = _secret_tool_lookup(account)
 
         if value:
             if account != stable:
@@ -476,16 +464,6 @@ def _lookup_its(window: Any) -> str:
                     "Обновлятор 1С — пароль ИТС",
                 )
             break
-
-    if not value:
-        value = _legacy_its_lookup()
-
-        if value:
-            _secret_tool_store(
-                stable,
-                value,
-                "Обновлятор 1С — пароль ИТС",
-            )
 
     if value:
         window._its_password_runtime_cache = value
@@ -519,12 +497,6 @@ def _store_its(
             "Обновлятор 1С — пароль ИТС",
         )
 
-    if not stored:
-        stored = _python_keyring_store(
-            stable,
-            password,
-        )
-
     window.settings["its_password_saved"] = bool(stored)
 
     return stored
@@ -544,7 +516,7 @@ def install(main_window_class: Any) -> None:
         cache = _base_cache(self)
         if cache.get(secret_id):
             return str(cache[secret_id])
-        value = _secret_tool_lookup(secret_id) or _python_keyring_lookup(secret_id)
+        value = _secret_tool_lookup(secret_id)
         if value:
             cache[secret_id] = value
         return value
@@ -556,14 +528,7 @@ def install(main_window_class: Any) -> None:
             return False
         _base_cache(self)[secret_id] = password
         if password:
-            return (
-                _secret_tool_store(
-                    secret_id,
-                    password,
-                    "Обновлятор 1С — пароль базы",
-                )
-                or _python_keyring_store(secret_id, password)
-            )
+            return _secret_tool_store(secret_id, password, "Обновлятор 1С — пароль базы")
         return _secret_tool_clear(secret_id) or _python_keyring_clear(secret_id)
 
     def get_base_password(self, base):
@@ -702,6 +667,10 @@ def install(main_window_class: Any) -> None:
             self.base_password.set_text(password)
         finally:
             self._loading_base_credentials = False
+            try:
+                self.update_base_action_sensitivity()
+            except Exception:
+                pass
 
     def current_base_dict(self):
         vals = self.selected_base_values()
@@ -731,11 +700,6 @@ def install(main_window_class: Any) -> None:
                 return typed
         except Exception:
             pass
-
-        direct = str(self.settings.get("its_password") or "")
-        if direct:
-            self._its_password_runtime_cache = direct
-            return direct
 
         return _lookup_its(self)
 
