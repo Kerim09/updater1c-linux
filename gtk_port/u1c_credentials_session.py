@@ -13,6 +13,11 @@ from typing import Any
 import gi
 gi.require_version("Gtk", "3.0")
 from gi.repository import GLib
+from u1c_secret_service import clear as secret_clear
+from u1c_secret_service import lookup as secret_lookup
+from u1c_secret_service import persistent_collection as _shared_persistent_collection
+from u1c_secret_service import status as secret_service_status
+from u1c_secret_service import store as secret_store
 
 PATCH_ID = "UPDATER1C_CREDENTIAL_PERSISTENT_20260724_V4"
 SERVICE = "updater1c-linux"
@@ -61,71 +66,11 @@ def _is_session_collection(collection):
 
 
 def _persistent_collection():
-    import secretstorage
-
-    bus = secretstorage.dbus_init()
-    collections = list(secretstorage.get_all_collections(bus))
-
-    candidates = []
-
-    try:
-        default = secretstorage.get_default_collection(bus)
-        if default is not None:
-            candidates.append(default)
-    except Exception:
-        pass
-
-    for collection in collections:
-        if collection not in candidates:
-            candidates.append(collection)
-
-    chosen = None
-
-    for collection in candidates:
-        if _is_session_collection(collection):
-            continue
-
-        label = _collection_label(collection).strip().casefold()
-        path_value = _collection_path(collection).strip().casefold()
-
-        if (
-            label in ("login", "вход", "default", "по умолчанию")
-            or path_value.endswith("/login")
-            or "/login/" in path_value
-        ):
-            chosen = collection
-            break
-
-    if chosen is None:
-        raise RuntimeError(
-            "Постоянная login-коллекция Secret Service не найдена."
-        )
-
-    if chosen.is_locked():
-        try:
-            chosen.unlock()
-        except Exception as exc:
-            raise RuntimeError("Постоянная login-коллекция заблокирована.") from exc
-        if chosen.is_locked():
-            raise RuntimeError("Постоянная login-коллекция заблокирована.")
-
-    if _is_session_collection(chosen):
-        raise RuntimeError(
-            "Выбрана временная сессионная коллекция."
-        )
-
-    return chosen
+    return _shared_persistent_collection()
 
 
 def _persistent_collection_status():
-    try:
-        collection = _persistent_collection()
-        return (
-            f"{_collection_label(collection) or '<без имени>'} "
-            f"({_collection_path(collection) or '<без пути>'})"
-        )
-    except Exception as exc:
-        return f"недоступно: {type(exc).__name__}: {exc}"
+    return secret_service_status()
 
 
 def _normalize_base_for_secret(base):
@@ -187,44 +132,7 @@ def _stable_its_secret_id(window):
 
 
 def _secret_tool_lookup(account: str) -> str:
-    if not account:
-        return ""
-
-    try:
-        collection = _persistent_collection()
-        items = collection.search_items(
-            {
-                "service": SERVICE,
-                "account": account,
-            }
-        )
-
-        for item in items:
-            try:
-                if item.is_locked():
-                    item.unlock()
-            except Exception:
-                pass
-
-            try:
-                value = item.get_secret()
-            except Exception:
-                continue
-
-            if isinstance(value, bytes):
-                value = value.decode(
-                    "utf-8",
-                    errors="replace",
-                )
-            else:
-                value = str(value or "")
-
-            if value:
-                return value
-    except Exception:
-        pass
-
-    return ""
+    return secret_lookup(account)
 
 
 
@@ -237,21 +145,7 @@ def _secret_tool_store(
     if not account or not password:
         return False
 
-    try:
-        collection = _persistent_collection()
-        collection.create_item(
-            str(label or "Обновлятор 1С Linux"),
-            {
-                "service": SERVICE,
-                "account": account,
-            },
-            password,
-            replace=True,
-        )
-    except Exception:
-        return False
-
-    return _secret_tool_lookup(account) == password
+    return secret_store(account, password, label)
 
 
 
@@ -260,27 +154,7 @@ def _secret_tool_clear(account: str) -> bool:
     if not account:
         return False
 
-    changed = False
-
-    try:
-        collection = _persistent_collection()
-        items = collection.search_items(
-            {
-                "service": SERVICE,
-                "account": account,
-            }
-        )
-
-        for item in items:
-            try:
-                item.delete()
-                changed = True
-            except Exception:
-                pass
-    except Exception:
-        pass
-
-    return changed
+    return secret_clear(account)
 
 
 

@@ -59,7 +59,8 @@ echo "[4/6] Проверка GTK и Python"
 PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile \
   "$ROOT/gtk_port/updater1c_gtk.py" \
   "$ROOT/core/onec_releases_client.py" \
-  "$ROOT/gtk_port/u1c_credentials_session.py"
+  "$ROOT/gtk_port/u1c_credentials_session.py" \
+  "$ROOT/gtk_port/u1c_secret_service.py"
 bash -n "$ROOT/packaging/linux/updater1c-linux"
 
 echo "[5/6] Формирование self-extracting installer"
@@ -198,7 +199,10 @@ step "Финальная проверка"
 [[ -f "$DESKTOP_PATH" ]] || fail "Не установлен desktop-файл: $DESKTOP_PATH"
 [[ "$(find /usr/share/applications -maxdepth 1 -type f -name '*.desktop' -printf '%f\n' | grep -E '^(updater1c|io\.github\.kerim)' | sort | wc -l)" -eq 1 ]] \
   || fail "В системном каталоге остались дублирующие ярлыки Updater1C"
-PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile "$INSTALL_DIR/gtk_port/updater1c_gtk.py"
+PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile \
+  "$INSTALL_DIR/gtk_port/updater1c_gtk.py" \
+  "$INSTALL_DIR/gtk_port/u1c_credentials_session.py" \
+  "$INSTALL_DIR/gtk_port/u1c_secret_service.py"
 
 echo
 echo "Установка завершена: $APP_NAME $(<"$INSTALL_DIR/VERSION")"

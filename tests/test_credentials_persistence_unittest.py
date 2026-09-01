@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).parents[1]
 MODULE_PATH = ROOT / "gtk_port" / "u1c_credentials_session.py"
+GTK_PORT = str(ROOT / "gtk_port")
 
 
 def load_module():
@@ -16,7 +17,9 @@ def load_module():
     repository = types.ModuleType("gi.repository")
     repository.GLib = types.SimpleNamespace()
     gi.repository = repository
-    with patch.dict(sys.modules, {"gi": gi, "gi.repository": repository}):
+    with patch.dict(sys.modules, {"gi": gi, "gi.repository": repository}), patch.object(
+        sys, "path", [GTK_PORT, *sys.path]
+    ):
         spec = importlib.util.spec_from_file_location("credentials_under_test", MODULE_PATH)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
@@ -48,17 +51,16 @@ class CredentialPersistenceTests(unittest.TestCase):
         service.get_default_collection = lambda _bus: default
         return service
 
-    def test_requires_explicit_login_collection(self):
+    def test_accepts_nonstandard_persistent_collection(self):
         session = Collection("Session", "/org/freedesktop/secrets/collection/session")
         other = Collection("Other", "/org/freedesktop/secrets/collection/other")
         with patch.dict(sys.modules, {"secretstorage": self.secretstorage([session, other], other)}):
-            with self.assertRaisesRegex(RuntimeError, "login"):
-                self.module._persistent_collection()
+            self.assertIs(self.module._persistent_collection(), other)
 
     def test_locked_login_collection_is_reported(self):
         login = Collection("Login", "/org/freedesktop/secrets/collection/login", True)
         with patch.dict(sys.modules, {"secretstorage": self.secretstorage([login], login)}):
-            with self.assertRaisesRegex(RuntimeError, "заблокирована"):
+            with self.assertRaisesRegex(RuntimeError, "заблокированы"):
                 self.module._persistent_collection()
 
     def test_its_id_does_not_depend_on_login(self):

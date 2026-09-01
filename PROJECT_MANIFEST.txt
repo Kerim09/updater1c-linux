@@ -1,21 +1,21 @@
 Проект: updater1c-linux
-Текущий релиз: 1.2.14
-Основание релиза: исправления P0–P1 и стабилизация поведения интерфейса
-Дата формирования: 2026-08-22T14:12:35+03:00
-
+Текущий релиз: 1.2.15
+Основание релиза: универсальная поддержка freedesktop.org Secret Service
+Дата формирования: 2026-09-01
 
 === Файлы проекта ===
 assets/updater1c-linux.svg
 assets/updater1c.png
+core/__init__.py
 core/bases.py
 core/diagnostics.py
-core/__init__.py
 core/onec_releases_client.py
 core/runtime.py
 core/settings.py
 gtk_port/u1c_credentials_session.py
 gtk_port/u1c_headless.py
 gtk_port/u1c_ibases_bidirectional.py
+gtk_port/u1c_secret_service.py
 gtk_port/updater1c_backup_combo_bridge.py
 gtk_port/updater1c_backup_hotfix.py
 gtk_port/updater1c_backup_plugin.py
@@ -26,10 +26,6 @@ gtk_port/updater1c_ops_ui_bridge.py
 gtk_port/updater1c_restore_plugin.py
 gtk_port/updater1c_update_chain_patch.py
 make_updater1c_gtk_installer.sh
-mcp-server.log
-mcp-server.log.2026-08-06.0.gz
-mcp-server.log.2026-08-07.0.gz
-mcp-server.log.2026-08-08.0.gz
 packaging/linux/io.github.kerim1c.updater1clinux.desktop
 packaging/linux/io.github.kerim1c.updater1clinux.gtk.desktop
 packaging/linux/io.github.kerim.updater1clinux.desktop
@@ -37,11 +33,21 @@ packaging/linux/uninstall-updater1c-linux.sh
 packaging/linux/updater1c-gtk-gui
 packaging/linux/updater1c-linux
 packaging/linux/updater1c-linux.desktop
+P0_P1_CHANGELOG.md
+P0_P1_WORK_PLAN.md
+PUBLISH_RELEASE_1.2.14.md
+PUBLISH_RELEASE_1.2.15.md
 README.md
 RELEASE_NOTES_v1.2.12.md
+RELEASE_NOTES_v1.2.13.md
+RELEASE_NOTES_v1.2.14.md
+RELEASE_NOTES_v1.2.15.md
 requirements.txt
 tests/run_credentials_tests.sh
 tests/test_credentials_persistence_unittest.py
 tests/test_onec_releases_client.py
+tests/test_p0_p1_interface.py
 tests/test_release_1_2_12_gtk_plugins.py
+tests/test_release_1_2_13_batch_check.py
+tests/test_secret_service_backends.py
 VERSION

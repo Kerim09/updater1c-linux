@@ -1,6 +1,6 @@
 # Обновлятор 1С Linux
 
-**Версия:** 1.2.14
+**Версия:** 1.2.15
 **App ID:** `io.github.kerim.updater1clinux`
 
 Основной runtime релиза — GTK 3 / PyGObject. Установщик размещает приложение в
@@ -38,7 +38,13 @@ https://helpme1s.ru/obnovlyator-1s-gruppovoe-paketnoe-obnovlenie-vsex-baz-za-odi
 - подготовка к обновлению баз на Linux;
 - чистый GTK Linux-интерфейс с App ID `io.github.kerim.updater1clinux`.
 
-## Возможности версии 1.2.14
+## Возможности версии 1.2.15
+
+- Универсальная работа с freedesktop.org Secret Service: GNOME Keyring,
+  KWallet, KeePassXC и совместимые службы без привязки к имени коллекции.
+- Резервные backend-механизмы через Python keyring и secret-tool.
+- Поиск старых записей во всех доступных коллекциях и автоматическая миграция
+  в текущую постоянную коллекцию.
 
 - каталог релизов 1С через `releases.1c.ru`;
 - последовательность обновлений через `update-api.1c.ru`;

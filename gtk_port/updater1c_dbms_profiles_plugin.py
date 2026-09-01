@@ -17,6 +17,9 @@ import os
 import re
 import shutil
 import subprocess
+from u1c_secret_service import clear as secret_clear
+from u1c_secret_service import lookup as secret_lookup
+from u1c_secret_service import store as secret_store
 import sys
 import threading
 import uuid
@@ -149,60 +152,19 @@ def _secret_store(profile_id: str, password: str) -> bool:
     if not password:
         return _secret_clear(profile_id)
 
-    if not shutil.which("secret-tool"):
-        print("UPDATER1C_DBMS_SECRET_TOOL_NOT_FOUND")
-        return False
-
     label = f"Обновлятор 1C Linux — пароль СУБД {profile_id}"
-
-    try:
-        result = subprocess.run(
-            ["secret-tool", "store", "--label", label] + _secret_attrs(profile_id),
-            input=password,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        if result.returncode != 0:
-            print("UPDATER1C_DBMS_SECRET_STORE_ERROR:", result.stderr)
-            return False
-        return True
-    except Exception as e:
-        print("UPDATER1C_DBMS_SECRET_STORE_EXCEPTION:", repr(e))
-        return False
+    attrs = dict(zip(_secret_attrs(profile_id)[::2], _secret_attrs(profile_id)[1::2]))
+    return secret_store(f"dbms:{profile_id}", password, label, attributes=attrs)
 
 
 def _secret_lookup(profile_id: str) -> str:
-    if not shutil.which("secret-tool"):
-        return ""
-
-    try:
-        result = subprocess.run(
-            ["secret-tool", "lookup"] + _secret_attrs(profile_id),
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        if result.returncode != 0:
-            return ""
-        return result.stdout.rstrip("\n")
-    except Exception:
-        return ""
+    attrs = dict(zip(_secret_attrs(profile_id)[::2], _secret_attrs(profile_id)[1::2]))
+    return secret_lookup(f"dbms:{profile_id}", attributes=attrs)
 
 
 def _secret_clear(profile_id: str) -> bool:
-    if not shutil.which("secret-tool"):
-        return True
-
-    try:
-        subprocess.run(
-            ["secret-tool", "clear"] + _secret_attrs(profile_id),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        return True
-    except Exception:
-        return False
+    attrs = dict(zip(_secret_attrs(profile_id)[::2], _secret_attrs(profile_id)[1::2]))
+    return secret_clear(f"dbms:{profile_id}", attributes=attrs)
 
 
 def _safe_text(text: str) -> str:

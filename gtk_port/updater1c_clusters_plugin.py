@@ -7,6 +7,8 @@ import json
 import shutil
 import socket
 import subprocess
+from u1c_secret_service import clear as secret_clear
+from u1c_secret_service import store as secret_store
 import threading
 import uuid
 from pathlib import Path
@@ -96,27 +98,20 @@ def _secret_attrs(profile_id: str):
 
 
 def _secret_store(profile_id: str, password: str) -> bool:
-    binary = shutil.which("secret-tool")
-    if not binary:
-        return False
     if not password:
         return _secret_clear(profile_id)
-    result = subprocess.run(
-        [binary, "store", "--label", f"Обновлятор 1С Linux — кластер {profile_id}"] + _secret_attrs(profile_id),
-        input=password, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    attrs_list = _secret_attrs(profile_id)
+    attrs = dict(zip(attrs_list[::2], attrs_list[1::2]))
+    return secret_store(
+        f"cluster:{profile_id}", password,
+        f"Обновлятор 1С Linux — кластер {profile_id}", attributes=attrs,
     )
-    return result.returncode == 0
 
 
 def _secret_clear(profile_id: str) -> bool:
-    binary = shutil.which("secret-tool")
-    if not binary:
-        return True
-    result = subprocess.run(
-        [binary, "clear"] + _secret_attrs(profile_id),
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-    )
-    return result.returncode == 0
+    attrs_list = _secret_attrs(profile_id)
+    attrs = dict(zip(attrs_list[::2], attrs_list[1::2]))
+    return secret_clear(f"cluster:{profile_id}", attributes=attrs)
 
 
 def _children(widget):
@@ -216,7 +211,7 @@ def _edit_dialog(parent, cluster):
         result["password_saved"] = _secret_store(cluster["id"], password)
         if not result["password_saved"]:
             _message(dialog, "Пароль не сохранён",
-                     "Secret Service/secret-tool недоступен. Пароль не записан в JSON.", True)
+                     "Системное защищённое хранилище недоступно. Пароль не записан в JSON.", True)
     dialog.destroy()
     return _normalize_cluster(result)
 

@@ -2,6 +2,7 @@ import importlib.util
 import json
 import tempfile
 import unittest
+import sys
 from pathlib import Path
 from unittest.mock import patch
 
@@ -11,9 +12,10 @@ ROOT = Path(__file__).parents[1]
 
 def load_plugin(filename):
     path = ROOT / "gtk_port" / filename
-    spec = importlib.util.spec_from_file_location(filename.removesuffix(".py") + "_test", path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    with patch.object(sys, "path", [str(ROOT / "gtk_port"), *sys.path]):
+        spec = importlib.util.spec_from_file_location(filename.removesuffix(".py") + "_test", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
     return module
 
 
