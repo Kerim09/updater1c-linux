@@ -59,3 +59,6 @@ legacy/patch_backups/
 *.before_*
 *.backup
 *.backup_*
+mcp-server.log
+mcp-server.log.*
+*.before-*
