@@ -13,8 +13,8 @@ class ReleaseGtkBatchCheckTests(unittest.TestCase):
         cls.source_text = SOURCE.read_text(encoding="utf-8")
         cls.tree = ast.parse(cls.source_text, filename=str(SOURCE))
 
-    def test_version_is_1_2_15(self):
-        self.assertEqual((ROOT / "VERSION").read_text(encoding="utf-8").strip(), "1.2.15")
+    def test_version_is_current_release(self):
+        self.assertEqual((ROOT / "VERSION").read_text(encoding="utf-8").strip(), "1.2.17")
 
     def test_runtime_version_is_not_hardcoded_to_previous_release(self):
         self.assertIn("APP_VERSION = read_application_version()", self.source_text)

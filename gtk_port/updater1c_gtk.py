@@ -727,35 +727,15 @@ def u1c_fix_1c_public_download_url(url):
 
 
 def u1c_download_url_variants(url):
-    """Возвращает варианты URL скачивания файла 1С.
+    """Возвращает только URL, полученный от update-api.
 
-    update-api для обновлений конфигураций иногда отдает:
-      /public/file/tmplts/get/<uuid>
-
-    Но рабочий endpoint у dl*.1c.ru часто:
-      /public/file/get/<uuid>
-
-    Поэтому пробуем оба варианта.
+    Нельзя автоматически преобразовывать:
+        /public/file/tmplts/get/<uuid>
+    в:
+        /public/file/get/<uuid>
     """
     url = str(url or "").strip()
-    if not url:
-        return []
-
-    variants = []
-
-    def add(u):
-        if u and u not in variants:
-            variants.append(u)
-
-    add(url)
-
-    add(url.replace("/public/file/tmplts/get/", "/public/file/get/"))
-    add(url.replace("/public/file/tmplts/get", "/public/file/get"))
-
-    add(url.replace("/public/file/get/", "/public/file/tmplts/get/"))
-    add(url.replace("/public/file/get", "/public/file/tmplts/get"))
-
-    return variants
+    return [url] if url else []
 
 
 def u1c_normalize_first_download_url(url):
@@ -973,14 +953,16 @@ def download_url_to_file(
     password: str = "",
     progress_func=None,
     progress_label: str = "",
+    download_session=None,
 ):
-    """Скачать файл обновления 1С через requests с Basic Auth.
+    """Скачать файл обновления 1С через авторизованную cookie-сессию.
 
     Проценты не пишем в текстовый лог. Прогресс передаём в progress_func,
     чтобы GTK показывал его через ProgressBar.
     """
-    import requests
     import time
+
+    from core.onec_download_client import OneCDownloadSession
 
     dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -989,12 +971,7 @@ def download_url_to_file(
     if tmp.exists():
         tmp.unlink()
 
-    headers = {
-        "User-Agent": "1C+Enterprise/8.3",
-        "Accept": "*/*",
-    }
-
-    auth = (login, password) if (login or password) else None
+    download_session = download_session or OneCDownloadSession(login, password)
 
     def progress(percent: int, done: int = 0, total: int = 0, text: str = ""):
         if progress_func:
@@ -1006,14 +983,7 @@ def download_url_to_file(
     log_func(f"Скачивание через requests: {url}")
     progress(0, 0, 0, progress_label or "Скачивание: подготовка")
 
-    with requests.get(
-        url,
-        headers=headers,
-        auth=auth,
-        timeout=120,
-        stream=True,
-        allow_redirects=True,
-    ) as r:
+    with download_session.get(url, stream=True, timeout=180) as r:
         content_type = (r.headers.get("Content-Type") or "").lower()
         total = int(r.headers.get("Content-Length") or 0)
 
@@ -1164,17 +1134,13 @@ def u1c_config_download_candidate_urls(item: dict, program: str, release: str, p
     for url in u1c_download_url_variants(primary_url):
         add(url)
 
-    # Потом прямой старый механизм downloads.v8.1c.ru/tmplts.
-    for template_path in u1c_config_template_paths(item, program, release):
-        for filename in u1c_config_candidate_filenames(item):
-            add(f"https://downloads.v8.1c.ru/tmplts/{template_path}/{filename}")
-            add(f"http://downloads.v8.1c.ru/tmplts/{template_path}/{filename}")
-
     return result
 
 
 def download_config_update_file_with_fallback(item: dict, program: str, release: str, primary_url: str, dest: Path, login: str, password: str, log_func, progress_func=None):
     import zipfile
+
+    from core.onec_download_client import OneCDownloadSession
 
     dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -1186,6 +1152,7 @@ def download_config_update_file_with_fallback(item: dict, program: str, release:
         raise RuntimeError("Нет URL-кандидатов для скачивания обновления.")
 
     log_func(f"Кандидатов скачивания: {len(candidates)}")
+    download_session = OneCDownloadSession(login, password)
 
     for candidate in candidates:
         candidate_name = Path(candidate.split("?", 1)[0]).name
@@ -1221,6 +1188,7 @@ def download_config_update_file_with_fallback(item: dict, program: str, release:
                 password,
                 progress_func=progress_func,
                 progress_label=f"{program} {release}",
+                download_session=download_session,
             )
             downloaded = prepare_1c_downloaded_update_file(downloaded, dest, release, log_func)
 
@@ -11056,24 +11024,165 @@ class MainWindow(Gtk.Window):
         return []
 
     def on_download_updates_real(self, *_):
+        """Скачивает обновления конфигураций вне GTK main thread.
+
+        Worker выполняет только файловые/HTTP операции и пишет события
+        в queue.Queue. GTK обновляется одним GLib.timeout_add() в main
+        thread, поэтому worker никогда не вызывает Gtk/GLib напрямую.
+        """
+        import queue
+
         self.switch_to_report_tab()
+
+        if getattr(self, "_download_updates_running", False):
+            self._append_log(
+                "ПРОПУСК: скачивание обновлений уже выполняется."
+            )
+            return
+
         indexes = self.gtk_operation_target_indices()
+
         if not indexes:
-            self._append_log("ОШИБКА: не выбраны базы для скачивания обновлений.")
+            self._append_log(
+                "ОШИБКА: не выбраны базы для скачивания обновлений."
+            )
             return
 
         login = self.settings.get("its_login") or ""
         password = self.get_its_password_for_update()
 
         if not login or not password:
-            self._append_log("ОШИБКА: не заполнены логин/пароль ИТС. Проверьте вкладку Настройки программы → ИТС.")
+            self._append_log(
+                "ОШИБКА: не заполнены логин/пароль ИТС. "
+                "Проверьте вкладку Настройки программы → ИТС."
+            )
             return
 
-        api = GtkOneCUpdateApi(login, password)
+        # Всё, что относится к GTK/self, подготавливаем до запуска worker.
+        jobs = []
 
+        for idx in indexes:
+            if not (0 <= idx < len(self.bases)):
+                continue
+
+            base = self.bases[idx]
+
+            name = (
+                base.get("name")
+                or f"base_{idx}"
+            )
+
+            program = self.guess_update_program_for_base(base)
+
+            version = (
+                base.get("config_version")
+                or ""
+            )
+
+            platform_version = (
+                base.get("platform_version")
+                or "8.3"
+            )
+
+            if not program:
+                hay = " ".join(
+                    [
+                        str(base.get("config_name") or ""),
+                        str(base.get("config_synonym") or ""),
+                        str(base.get("name") or ""),
+                    ]
+                ).lower()
+
+                compact = (
+                    hay.replace(" ", "")
+                    .replace("_", "")
+                    .replace("-", "")
+                )
+
+                if (
+                    ("бухгалтер" in hay and "базов" in hay)
+                    or "accountingbase" in compact
+                ):
+                    program = "AccountingBase"
+
+                elif (
+                    "бухгалтер" in hay
+                    or "accounting" in hay
+                ):
+                    program = "Accounting"
+
+                elif (
+                    "управление торговлей" in hay
+                    or "управлениеторговлей" in compact
+                    or "торговл" in hay
+                    or "trade" in hay
+                ):
+                    program = "Trade"
+
+                elif (
+                    "документооборот" in hay
+                    or "document" in hay
+                    or "docmng" in hay
+                ):
+                    program = "DocumentManagement"
+
+                elif (
+                    "зарплата" in hay
+                    or "зуп" in hay
+                    or "hrm" in hay
+                    or "salary" in hay
+                ):
+                    program = "HRM"
+
+                elif (
+                    "управление нашей фирмой" in hay
+                    or "унф" in hay
+                    or "smallbusiness" in hay
+                ):
+                    program = "SmallBusiness"
+
+                elif "erp" in hay:
+                    program = "ERP"
+
+                if program:
+                    base["update_program_name"] = program
+
+                    try:
+                        self.config["bases"] = self.bases
+                        save_json(
+                            self.config_path,
+                            self.config,
+                        )
+                    except Exception:
+                        pass
+
+            jobs.append(
+                {
+                    "name": name,
+                    "program": program or "",
+                    "version": version,
+                    "platform_version": (
+                        platform_version
+                        or "8.3"
+                    ),
+                }
+            )
+
+        if not jobs:
+            self._append_log(
+                "ОШИБКА: нет корректных баз для обработки."
+            )
+            return
+
+        # Worker получает только простые immutable/snapshot данные.
+        settings_snapshot = dict(self.settings)
+
+        event_queue = queue.Queue()
+
+        self._download_updates_running = True
         self._download_operation_started = ""
-        GLib.idle_add(
-            self.set_download_operation_progress,
+
+        self.set_download_operation_progress(
             0,
             "Скачивание обновлений: подготовка",
             "-",
@@ -11081,213 +11190,578 @@ class MainWindow(Gtk.Window):
             "Подготовка",
             "Скачивание обновлений",
         )
-        self._append_log("=== Скачивание обновлений конфигураций ===")
-        self._append_log(f"Баз к обработке: {len(indexes)}")
 
-        for pos, idx in enumerate(indexes, 1):
-            if not (0 <= idx < len(self.bases)):
-                continue
+        self._append_log(
+            "=== Скачивание обновлений конфигураций ==="
+        )
 
-            base = self.bases[idx]
-            name = base.get("name") or f"base_{idx}"
-            program = self.guess_update_program_for_base(base)
-            version = base.get("config_version") or ""
-            platform_version = base.get("platform_version") or "8.3"
+        self._append_log(
+            f"Баз к обработке: {len(jobs)}"
+        )
 
-            if not program:
-                hay = " ".join([
-                    str(base.get("config_name") or ""),
-                    str(base.get("config_synonym") or ""),
-                    str(base.get("name") or ""),
-                ]).lower()
-
-                if ("бухгалтер" in hay and "базов" in hay) or "accountingbase" in hay.replace(" ", "").replace("_", "").replace("-", ""):
-                    program = "AccountingBase"
-                elif "бухгалтер" in hay or "accounting" in hay:
-                    program = "Accounting"
-                elif (
-                    "управление торговлей" in hay
-                    or "управлениеторговлей" in hay.replace(" ", "")
-                    or "торговл" in hay
-                    or "trade" in hay
-                ):
-                    program = "Trade"
-                elif "документооборот" in hay or "document" in hay or "docmng" in hay:
-                    program = "DocumentManagement"
-                elif "зарплата" in hay or "зуп" in hay or "hrm" in hay or "salary" in hay:
-                    program = "HRM"
-                elif "управление нашей фирмой" in hay or "унф" in hay or "smallbusiness" in hay:
-                    program = "SmallBusiness"
-                elif "erp" in hay:
-                    program = "ERP"
-
-                if program:
-                    base["update_program_name"] = program
-                    try:
-                        self.config["bases"] = self.bases
-                        save_json(self.config_path, self.config)
-                    except Exception:
-                        pass
-
-            self._append_log("")
-            self._append_log(f"[{pos}/{len(indexes)}]")
-            self._append_log(f"--- Скачивание обновлений для базы: {name} ---")
-            self._append_log(f"Текущая версия конфигурации: {version or '-'}")
-            self._append_log(f"Код программы обновлений: {program or '-'}")
-            self._append_log(f"Версия платформы для update-api: {platform_version or '8.3'}")
-
-            if not program or not version:
-                self._append_log("ПРОПУСК: не заполнены код программы обновлений или версия конфигурации. Сначала выполните Проверить настройки.")
-                continue
-
-            try:
-                info = api.check_conf_update(program, version, platform_version)
-
-                if not info:
-                    self._append_log("Обновления не найдены или update-api не вернул configurationUpdateResponse.")
-                    continue
-
-                target_version = (
-                    info.get("targetVersionNumber")
-                    or info.get("newVersionNumber")
-                    or info.get("versionNumber")
-                    or info.get("configurationVersion")
-                    or ""
+        def emit_log(message):
+            event_queue.put(
+                (
+                    "log",
+                    str(message),
                 )
+            )
 
-                platform_required = (
-                    info.get("platformVersion")
-                    or info.get("requiredPlatformVersion")
-                    or info.get("minimalPlatformVersion")
-                    or ""
-                )
-
-                size = info.get("size") or info.get("totalSize") or info.get("updateSize") or ""
-                upgrade_sequence = info.get("upgradeSequence") or []
-
-                program_uin = (
-                    info.get("programVersionUin")
-                    or info.get("configurationVersionUin")
-                    or info.get("uin")
-                    or ""
-                )
-
-                self._append_log(f"Целевая версия: {target_version or '-'}")
-                self._append_log(f"Минимальная/требуемая платформа по ответу API: {platform_required or '-'}")
-                if size:
-                    self._append_log(f"Размер по ответу API: {size}")
-                self._append_log(f"Последовательность обновлений: {upgrade_sequence}")
-
-                program_root = update_program_dir(self.settings, program)
-                metadata_dir = program_root / "_metadata"
-                metadata_dir.mkdir(parents=True, exist_ok=True)
-
-                (metadata_dir / f"update_info_{now_stamp()}.json").write_text(
-                    json.dumps({"info": info}, ensure_ascii=False, indent=2),
-                    encoding="utf-8",
-                )
-
-                if not upgrade_sequence:
-                    self._append_log("ПРОПУСК: update-api не вернул upgradeSequence.")
-                    continue
-
-                if not program_uin:
-                    self._append_log("ПРОПУСК: update-api не вернул programVersionUin/configurationVersionUin.")
-                    self._append_log(json.dumps(info, ensure_ascii=False, indent=2)[:3000])
-                    continue
-
-                files = api.get_conf_download_data(upgrade_sequence, program_uin)
-
-                (metadata_dir / f"download_data_{now_stamp()}.json").write_text(
-                    json.dumps({"info": info, "files": files}, ensure_ascii=False, indent=2),
-                    encoding="utf-8",
-                )
-
-                if not files:
-                    self._append_log("ПРОПУСК: update-api не вернул configurationUpdateDataList.")
-                    continue
-
-                for n, item in enumerate(files, 1):
-                    release = update_item_release_version(item, target_version) or target_version or f"step_{n}"
-                    release_dir = update_release_dir(self.settings, program, release)
-
-                    url = update_item_url(item) or find_download_url_recursive(item)
-                    if not url:
-                        self._append_log(f"ПРОПУСК: для файла {n} нет URL скачивания.")
-                        self._append_log(json.dumps(item, ensure_ascii=False, indent=2)[:2000])
-                        continue
-
-                    filename = update_item_filename(item, url, fallback=f"{safe_name(release)}.zip")
-                    dest = release_dir / filename
-
-                    self._append_log(f"Скачивание {n}/{len(files)}:")
-                    self._append_log(f"Версия релиза: {release}")
-                    self._append_log(f"Имя файла: {filename}")
-                    self._append_log(f"Папка релиза: {release_dir}")
-                    _old_url = url
-                    url = u1c_fix_1c_public_download_url(url)
-                    if url != _old_url:
-                        self._append_log(f"URL нормализован: {url}")
-                    self._append_log(f"URL: {url}")
-
-                    _old_url = url
-                    url = u1c_normalize_first_download_url(url)
-                    if url != _old_url:
-                        self._append_log(f"URL нормализован: {url}")
-                    if dest.exists() and dest.stat().st_size > 0:
-                        try:
-                            validate_downloaded_update_file(dest)
-                            if dest.stat().st_size > 1024 * 1024:
-                                self._append_log(f"Файл уже есть: {dest}")
-                            else:
-                                self._append_log(f"Файл обновления слишком маленький, удаляю: {dest}")
-                                dest.unlink()
-                        except Exception as e:
-                            self._append_log(f"Найден битый файл обновления, удаляю: {dest}")
-                            self._append_log(str(e))
-                            try:
-                                dest.unlink()
-                            except Exception:
-                                pass
-
-                    if not dest.exists():
-                        download_config_update_file_with_fallback(
-                            item=item,
-                            program=program,
-                            release=release,
-                            primary_url=url,
-                            dest=dest,
-                            login=login,
-                            password=password,
-                            log_func=self._append_log,
-                            progress_func=lambda percent, done=0, total=0, text="": GLib.idle_add(
-                                self.set_download_operation_progress,
-                                percent,
-                                text or f"{program} {release}: {percent}%",
-                                name,
-                                release,
-                                "Скачивание",
-                                "Скачивание файла обновления",
-                            ),
-                        )
-                self._append_log(f"Скачивание обновлений: база {name} завершено")
-                GLib.idle_add(
-                    self.idle_set_current_operation,
+        def emit_progress(
+            percent,
+            done=0,
+            total=0,
+            text="",
+            *,
+            base="-",
+            release="-",
+            step="Скачивание",
+            action="Скачивание файла обновления",
+        ):
+            event_queue.put(
+                (
+                    "progress",
                     {
-                        "base": name,
-                        "release": release if "release" in locals() else "-",
-                        "step": "Готово",
-                        "action": "Скачивание обновлений",
-                        "mode": "DOWNLOAD",
-                        "status": "Скачивание завершено",
-                        "pid": "-",
-                        "started": getattr(self, "_download_operation_started", "-") or "-",
+                        "percent": percent,
+                        "done": done,
+                        "total": total,
+                        "text": text,
+                        "base": base,
+                        "release": release,
+                        "step": step,
+                        "action": action,
                     },
                 )
-                GLib.idle_add(self.set_report_progress, 100, f"Скачивание обновлений: {name} завершено")
+            )
 
-            except Exception as e:
-                self._append_log(f"ОШИБКА скачивания обновлений для {name}: {type(e).__name__}: {e}")
+        def worker():
+            # ВАЖНО:
+            # здесь нельзя использовать self, Gtk или GLib.
+            had_errors = False
+            last_base = "-"
+            last_release = "-"
+
+            try:
+                api = GtkOneCUpdateApi(
+                    login,
+                    password,
+                )
+
+                for pos, job in enumerate(jobs, 1):
+                    name = job["name"]
+                    program = job["program"]
+                    version = job["version"]
+                    platform_version = job["platform_version"]
+
+                    last_base = name
+                    last_release = "-"
+
+                    emit_log("")
+                    emit_log(
+                        f"[{pos}/{len(jobs)}]"
+                    )
+                    emit_log(
+                        f"--- Скачивание обновлений для базы: "
+                        f"{name} ---"
+                    )
+                    emit_log(
+                        "Текущая версия конфигурации: "
+                        f"{version or '-'}"
+                    )
+                    emit_log(
+                        "Код программы обновлений: "
+                        f"{program or '-'}"
+                    )
+                    emit_log(
+                        "Версия платформы для update-api: "
+                        f"{platform_version or '8.3'}"
+                    )
+
+                    if not program or not version:
+                        emit_log(
+                            "ПРОПУСК: не заполнены код программы "
+                            "обновлений или версия конфигурации. "
+                            "Сначала выполните Проверить настройки."
+                        )
+                        continue
+
+                    try:
+                        info = api.check_conf_update(
+                            program,
+                            version,
+                            platform_version,
+                        )
+
+                        if not info:
+                            emit_log(
+                                "Обновления не найдены или update-api "
+                                "не вернул configurationUpdateResponse."
+                            )
+                            continue
+
+                        target_version = (
+                            info.get("targetVersionNumber")
+                            or info.get("newVersionNumber")
+                            or info.get("versionNumber")
+                            or info.get("configurationVersion")
+                            or ""
+                        )
+
+                        platform_required = (
+                            info.get("platformVersion")
+                            or info.get("requiredPlatformVersion")
+                            or info.get("minimalPlatformVersion")
+                            or ""
+                        )
+
+                        size = (
+                            info.get("size")
+                            or info.get("totalSize")
+                            or info.get("updateSize")
+                            or ""
+                        )
+
+                        upgrade_sequence = (
+                            info.get("upgradeSequence")
+                            or []
+                        )
+
+                        program_uin = (
+                            info.get("programVersionUin")
+                            or info.get("configurationVersionUin")
+                            or info.get("uin")
+                            or ""
+                        )
+
+                        emit_log(
+                            f"Целевая версия: "
+                            f"{target_version or '-'}"
+                        )
+
+                        emit_log(
+                            "Минимальная/требуемая платформа "
+                            "по ответу API: "
+                            f"{platform_required or '-'}"
+                        )
+
+                        if size:
+                            emit_log(
+                                f"Размер по ответу API: {size}"
+                            )
+
+                        emit_log(
+                            "Последовательность обновлений: "
+                            f"{upgrade_sequence}"
+                        )
+
+                        program_root = update_program_dir(
+                            settings_snapshot,
+                            program,
+                        )
+
+                        metadata_dir = (
+                            program_root
+                            / "_metadata"
+                        )
+
+                        metadata_dir.mkdir(
+                            parents=True,
+                            exist_ok=True,
+                        )
+
+                        (
+                            metadata_dir
+                            / f"update_info_{now_stamp()}.json"
+                        ).write_text(
+                            json.dumps(
+                                {
+                                    "info": info,
+                                },
+                                ensure_ascii=False,
+                                indent=2,
+                            ),
+                            encoding="utf-8",
+                        )
+
+                        if not upgrade_sequence:
+                            emit_log(
+                                "ПРОПУСК: update-api не вернул "
+                                "upgradeSequence."
+                            )
+                            continue
+
+                        if not program_uin:
+                            emit_log(
+                                "ПРОПУСК: update-api не вернул "
+                                "programVersionUin/"
+                                "configurationVersionUin."
+                            )
+
+                            emit_log(
+                                json.dumps(
+                                    info,
+                                    ensure_ascii=False,
+                                    indent=2,
+                                )[:3000]
+                            )
+                            continue
+
+                        files = api.get_conf_download_data(
+                            upgrade_sequence,
+                            program_uin,
+                        )
+
+                        (
+                            metadata_dir
+                            / f"download_data_{now_stamp()}.json"
+                        ).write_text(
+                            json.dumps(
+                                {
+                                    "info": info,
+                                    "files": files,
+                                },
+                                ensure_ascii=False,
+                                indent=2,
+                            ),
+                            encoding="utf-8",
+                        )
+
+                        if not files:
+                            emit_log(
+                                "ПРОПУСК: update-api не вернул "
+                                "configurationUpdateDataList."
+                            )
+                            continue
+
+                        for n, item in enumerate(files, 1):
+                            release = (
+                                update_item_release_version(
+                                    item,
+                                    target_version,
+                                )
+                                or target_version
+                                or f"step_{n}"
+                            )
+
+                            last_release = release
+
+                            release_dir = update_release_dir(
+                                settings_snapshot,
+                                program,
+                                release,
+                            )
+
+                            url = (
+                                update_item_url(item)
+                                or find_download_url_recursive(item)
+                            )
+
+                            if not url:
+                                emit_log(
+                                    f"ПРОПУСК: для файла {n} "
+                                    "нет URL скачивания."
+                                )
+
+                                emit_log(
+                                    json.dumps(
+                                        item,
+                                        ensure_ascii=False,
+                                        indent=2,
+                                    )[:2000]
+                                )
+                                continue
+
+                            filename = update_item_filename(
+                                item,
+                                url,
+                                fallback=(
+                                    f"{safe_name(release)}.zip"
+                                ),
+                            )
+
+                            dest = (
+                                release_dir
+                                / filename
+                            )
+
+                            emit_log(
+                                f"Скачивание {n}/{len(files)}:"
+                            )
+                            emit_log(
+                                f"Версия релиза: {release}"
+                            )
+                            emit_log(
+                                f"Имя файла: {filename}"
+                            )
+                            emit_log(
+                                f"Папка релиза: {release_dir}"
+                            )
+
+                            old_url = url
+
+                            url = u1c_fix_1c_public_download_url(
+                                url
+                            )
+
+                            if url != old_url:
+                                emit_log(
+                                    f"URL нормализован: {url}"
+                                )
+
+                            emit_log(
+                                f"URL: {url}"
+                            )
+
+                            old_url = url
+
+                            url = u1c_normalize_first_download_url(
+                                url
+                            )
+
+                            if url != old_url:
+                                emit_log(
+                                    f"URL нормализован: {url}"
+                                )
+
+                            if (
+                                dest.exists()
+                                and dest.stat().st_size > 0
+                            ):
+                                try:
+                                    validate_downloaded_update_file(
+                                        dest
+                                    )
+
+                                    if (
+                                        dest.stat().st_size
+                                        > 1024 * 1024
+                                    ):
+                                        emit_log(
+                                            f"Файл уже есть: {dest}"
+                                        )
+                                    else:
+                                        emit_log(
+                                            "Файл обновления слишком "
+                                            "маленький, удаляю: "
+                                            f"{dest}"
+                                        )
+                                        dest.unlink()
+
+                                except Exception as exc:
+                                    emit_log(
+                                        "Найден битый файл обновления, "
+                                        f"удаляю: {dest}"
+                                    )
+
+                                    emit_log(
+                                        str(exc)
+                                    )
+
+                                    try:
+                                        dest.unlink()
+                                    except Exception:
+                                        pass
+
+                            if not dest.exists():
+                                def progress_callback(
+                                    percent,
+                                    done=0,
+                                    total=0,
+                                    text="",
+                                    *,
+                                    _base=name,
+                                    _release=release,
+                                    _program=program,
+                                ):
+                                    emit_progress(
+                                        percent,
+                                        done,
+                                        total,
+                                        (
+                                            text
+                                            or (
+                                                f"{_program} "
+                                                f"{_release}: "
+                                                f"{percent}%"
+                                            )
+                                        ),
+                                        base=_base,
+                                        release=_release,
+                                        step="Скачивание",
+                                        action=(
+                                            "Скачивание файла "
+                                            "обновления"
+                                        ),
+                                    )
+
+                                download_config_update_file_with_fallback(
+                                    item=item,
+                                    program=program,
+                                    release=release,
+                                    primary_url=url,
+                                    dest=dest,
+                                    login=login,
+                                    password=password,
+                                    log_func=emit_log,
+                                    progress_func=progress_callback,
+                                )
+
+                        emit_log(
+                            "Скачивание обновлений: "
+                            f"база {name} завершено"
+                        )
+
+                        emit_progress(
+                            100,
+                            0,
+                            0,
+                            (
+                                "Скачивание обновлений: "
+                                f"{name} завершено"
+                            ),
+                            base=name,
+                            release=last_release,
+                            step="Готово",
+                            action="Скачивание обновлений",
+                        )
+
+                    except Exception as exc:
+                        had_errors = True
+
+                        emit_log(
+                            "ОШИБКА скачивания обновлений "
+                            f"для {name}: "
+                            f"{type(exc).__name__}: {exc}"
+                        )
+
+            except Exception as exc:
+                had_errors = True
+
+                emit_log(
+                    "ОШИБКА фонового скачивания: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+
+            finally:
+                emit_log(
+                    "=== Скачивание обновлений "
+                    "конфигураций завершено ==="
+                )
+
+                event_queue.put(
+                    (
+                        "finished",
+                        {
+                            "had_errors": had_errors,
+                            "base": last_base,
+                            "release": last_release,
+                        },
+                    )
+                )
+
+        def drain_events():
+            # Эта функция вызывается GLib только в GTK main thread.
+            log_lines = []
+            latest_progress = None
+            finished = None
+
+            # Даже если worker выдал много событий, GTK получает
+            # не сотни callbacks, а максимум один пакет за timer tick.
+            for _event_no in range(250):
+                try:
+                    event_type, payload = (
+                        event_queue.get_nowait()
+                    )
+                except queue.Empty:
+                    break
+
+                if event_type == "log":
+                    log_lines.append(
+                        str(payload)
+                    )
+
+                elif event_type == "progress":
+                    # Промежуточные проценты в одном tick
+                    # можно безопасно схлопнуть до последнего.
+                    latest_progress = payload
+
+                elif event_type == "finished":
+                    finished = payload
+
+            if log_lines:
+                # Одна операция GtkTextBuffer вместо множества
+                # insert/idle callbacks.
+                self._append_log(
+                    "\n".join(log_lines)
+                )
+
+            if latest_progress is not None:
+                self.set_download_operation_progress(
+                    latest_progress["percent"],
+                    latest_progress["text"],
+                    latest_progress["base"],
+                    latest_progress["release"],
+                    latest_progress["step"],
+                    latest_progress["action"],
+                )
+
+            if finished is not None:
+                self._download_updates_running = False
+
+                had_errors = bool(
+                    finished.get("had_errors")
+                )
+
+                status = (
+                    "Завершено с ошибками"
+                    if had_errors
+                    else "Скачивание завершено"
+                )
+
+                self.set_current_operation(
+                    base=finished.get("base") or "-",
+                    release=(
+                        finished.get("release")
+                        or "-"
+                    ),
+                    step="Готово",
+                    action="Скачивание обновлений",
+                    mode="DOWNLOAD",
+                    status=status,
+                    pid="-",
+                    started=(
+                        getattr(
+                            self,
+                            "_download_operation_started",
+                            "-",
+                        )
+                        or "-"
+                    ),
+                )
+
+                if not had_errors:
+                    self.set_report_progress(
+                        100,
+                        "Скачивание обновлений завершено",
+                    )
+
+                return False
+
+            return True
+
+        # Ровно один GTK timer на всю операцию.
+        GLib.timeout_add(
+            150,
+            drain_events,
+        )
+
+        thread = threading.Thread(
+            target=worker,
+            daemon=True,
+            name="updater1c-config-download",
+        )
+
+        thread.start()
 
     def on_clear_cache_real(self, *_):
         dlg = Gtk.MessageDialog(

@@ -1,6 +1,6 @@
 Проект: updater1c-linux
-Текущий релиз: 1.2.15
-Основание релиза: универсальная поддержка freedesktop.org Secret Service
+Текущий релиз: 1.2.17
+Основание релиза: исправление авторизованного скачивания обновлений с dl*.1c.ru
 Дата формирования: 2026-09-01
 
 === Файлы проекта ===
@@ -9,6 +9,7 @@ assets/updater1c.png
 core/__init__.py
 core/bases.py
 core/diagnostics.py
+core/onec_download_client.py
 core/onec_releases_client.py
 core/runtime.py
 core/settings.py
@@ -37,14 +38,17 @@ P0_P1_CHANGELOG.md
 P0_P1_WORK_PLAN.md
 PUBLISH_RELEASE_1.2.14.md
 PUBLISH_RELEASE_1.2.15.md
+PUBLISH_RELEASE_1.2.17.md
 README.md
 RELEASE_NOTES_v1.2.12.md
 RELEASE_NOTES_v1.2.13.md
 RELEASE_NOTES_v1.2.14.md
 RELEASE_NOTES_v1.2.15.md
+RELEASE_NOTES_v1.2.17.md
 requirements.txt
 tests/run_credentials_tests.sh
 tests/test_credentials_persistence_unittest.py
+tests/test_onec_download_client.py
 tests/test_onec_releases_client.py
 tests/test_p0_p1_interface.py
 tests/test_release_1_2_12_gtk_plugins.py

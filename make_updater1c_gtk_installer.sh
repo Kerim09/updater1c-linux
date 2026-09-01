@@ -16,6 +16,7 @@ need_file() { [[ -f "$ROOT/$1" ]] || fail "Не найден обязатель�
 need_file VERSION
 need_file gtk_port/updater1c_gtk.py
 need_file core/onec_releases_client.py
+need_file core/onec_download_client.py
 need_file assets/updater1c.png
 need_file packaging/linux/updater1c-linux
 need_file packaging/linux/io.github.kerim.updater1clinux.desktop
@@ -59,6 +60,7 @@ echo "[4/6] Проверка GTK и Python"
 PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile \
   "$ROOT/gtk_port/updater1c_gtk.py" \
   "$ROOT/core/onec_releases_client.py" \
+  "$ROOT/core/onec_download_client.py" \
   "$ROOT/gtk_port/u1c_credentials_session.py" \
   "$ROOT/gtk_port/u1c_secret_service.py"
 bash -n "$ROOT/packaging/linux/updater1c-linux"
@@ -201,6 +203,7 @@ step "Финальная проверка"
   || fail "В системном каталоге остались дублирующие ярлыки Updater1C"
 PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile \
   "$INSTALL_DIR/gtk_port/updater1c_gtk.py" \
+  "$INSTALL_DIR/core/onec_download_client.py" \
   "$INSTALL_DIR/gtk_port/u1c_credentials_session.py" \
   "$INSTALL_DIR/gtk_port/u1c_secret_service.py"
 
